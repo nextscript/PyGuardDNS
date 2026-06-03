@@ -4079,10 +4079,17 @@ def profiles_page():
     data = client_manager.get_profiles() if client_manager else []
     blists = (blocklist_manager.get_all() if blocklist_manager else [])
     blist_opts = "".join(f"<option value='{b['id']}'>{b['name']}</option>" for b in blists)
+    services = client_manager.get_services() if client_manager else []
     cards = ""
     for p in data:
         rules = client_manager.get_profile_rules(p["id"]) if client_manager else []
         pbl = client_manager.get_profile_blocklists(p["id"]) if client_manager else []
+        pservices = client_manager.get_profile_services(p["id"]) if client_manager else []
+        service_opts = "".join(
+            f"<option value='{html_escape(s)}'>{html_escape(s)}</option>"
+            for s in services
+            if s not in pservices
+        )
         rule_rows = "".join(
             f"<tr><td data-label='Action'>{r['action']}</td><td data-label='Type'>{r['pattern_type']}</td><td data-label='Pattern' class='td-domain'><code>{r['pattern']}</code></td>"
             f"<td data-label='Actions'><form method='post' action='/profiles/rule-delete' style='display:inline'>"
@@ -4099,6 +4106,14 @@ def profiles_page():
             f"<button class='btn btn-sm btn-outline-danger'>x</button></form></td></tr>"
             for pb in pbl
         )
+        service_rows = "".join(
+            f"<tr><td data-label='Service'>{html_escape(svc)}</td>"
+            f"<td data-label='Actions'><form method='post' action='/profiles/service-remove' style='display:inline'>"
+            f"<input type='hidden' name='profile_id' value='{p['id']}'>"
+            f"<input type='hidden' name='service_name' value='{html_escape(svc)}'>"
+            f"<button class='btn btn-sm btn-outline-danger'>x</button></form></td></tr>"
+            for svc in pservices
+        )
         badges = ""
         if p["is_default"]:
             badges += "<span class='badge bg-info me-1'>default</span>"
@@ -4107,6 +4122,7 @@ def profiles_page():
         did = f"delModal-{p['id']}"
         rid = f"ruleModal-{p['id']}"
         bid = f"blModal-{p['id']}"
+        sid = f"svcModal-{p['id']}"
         del_btn = ""
         if not p['is_default']:
             del_btn = '<button class="btn btn-sm btn-outline-danger" onclick="document.getElementById(\'' + did + '\').classList.add(\'show\')">Delete</button>'
@@ -4128,6 +4144,10 @@ def profiles_page():
 <div class="col-md-6">
 <h6 class="d-flex align-items-center gap-2">Blocklists<button class="btn btn-sm btn-success" onclick="document.getElementById('{bid}').classList.add('show')">+</button></h6>
 <div class="table-responsive"><table class="table table-dark table-sm mobile-card-table"><thead><tr><th>Name</th><th></th></tr></thead><tbody>{bl_rows or '<tr><td colspan=2 class=text-muted>No blocklists attached</td></tr>'}</tbody></table></div>
+</div>
+<div class="col-md-6">
+<h6 class="d-flex align-items-center gap-2">Service Blocks<button class="btn btn-sm btn-success" onclick="document.getElementById('{sid}').classList.add('show')">+</button></h6>
+<div class="table-responsive"><table class="table table-dark table-sm mobile-card-table"><thead><tr><th>Service</th><th></th></tr></thead><tbody>{service_rows or '<tr><td colspan=2 class=text-muted>No services blocked</td></tr>'}</tbody></table></div>
 </div>
 </div>
 </div>
@@ -4164,6 +4184,23 @@ def profiles_page():
 {blist_opts}
 </select>
 <button class="btn btn-success w-100 mt-3" type="submit">Add</button>
+</form>
+</div>
+</div>
+<!-- Service modal -->
+<div id="{sid}" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('show')">
+<div class="modal-box">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+<h2 class="h5" style="margin:0">Add Service Block to {p['name']}</h2>
+<button class="btn btn-sm btn-outline-light" onclick="document.getElementById('{sid}').classList.remove('show')" style="border:none;font-size:1.2rem">&times;</button>
+</div>
+<form method="post" action="/profiles/service-add">
+<input type="hidden" name="profile_id" value="{p['id']}">
+<label class="form-label">Service</label>
+<select class="form-select mb-2" name="service_name" required>
+{service_opts or '<option value="">All services are already blocked</option>'}
+</select>
+<button class="btn btn-success w-100 mt-3" type="submit" {"disabled" if not service_opts else ""}>Add</button>
 </form>
 </div>
 </div>
@@ -4228,16 +4265,23 @@ def profiles_page():
     return template(f"""
 <div class="d-flex align-items-center justify-content-between mb-3">
 <h1 class="h3 mb-0">Profiles</h1>
-<a href="/profiles/add" class="btn btn-success">+ New Profile</a>
+<button class="btn btn-success" type="button" onclick="document.getElementById('profile-create-modal').classList.add('show')">+ New Profile</button>
 </div>
 {cards}
-<div class="panel rounded-2 border border-secondary-subtle p-3 mb-3">
-<h5 class="mb-3">Create Profile</h5>
-<form class="row g-2 align-items-end" method="post" action="/profiles/add">
-<div class="col-auto flex-grow-1"><input class="form-control" name="name" placeholder="Profile name" required></div>
-<div class="col-auto flex-grow-1"><input class="form-control" name="description" placeholder="Description"></div>
-<div class="col-auto"><button class="btn btn-success">Create</button></div>
+<div id="profile-create-modal" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('show')">
+<div class="modal-box">
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+<h2 class="h5" style="margin:0">New Profile</h2>
+<button class="btn btn-sm btn-outline-light" type="button" onclick="document.getElementById('profile-create-modal').classList.remove('show')" style="border:none;font-size:1.2rem">&times;</button>
+</div>
+<form method="post" action="/profiles/add">
+<label class="form-label">Name</label>
+<input class="form-control mb-2" name="name" placeholder="Profile name" required>
+<label class="form-label">Description</label>
+<input class="form-control mb-2" name="description" placeholder="Description">
+<button class="btn btn-success w-100 mt-3" type="submit">Create</button>
 </form>
+</div>
 </div>""", "Profiles")
 
 def cache_page():
@@ -5429,6 +5473,22 @@ class WebHandler(BaseHTTPRequestHandler):
                 pid = int(form.get("profile_id"))
                 bl_id = int(form.get("blocklist_id"))
                 client_manager.remove_blocklist_from_profile(pid, bl_id)
+            self.redirect("/profiles")
+        elif path == "/profiles/service-add":
+            if client_manager is not None:
+                pid = int(form.get("profile_id"))
+                svc = form.get("service_name", "").strip()
+                if svc:
+                    client_manager.add_profile_service(pid, svc)
+                    invalidate_rules_cache()
+            self.redirect("/profiles")
+        elif path == "/profiles/service-remove":
+            if client_manager is not None:
+                pid = int(form.get("profile_id"))
+                svc = form.get("service_name", "").strip()
+                if svc:
+                    client_manager.remove_profile_service(pid, svc)
+                    invalidate_rules_cache()
             self.redirect("/profiles")
         elif path == "/profiles/edit":
             if client_manager is not None:
