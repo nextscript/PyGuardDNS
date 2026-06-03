@@ -193,20 +193,6 @@ localdnsguard.sqlite3
 
 Backups can be exported and restored through the web interface or CLI. Backups include settings, rules, DNS rewrites, upstreams, profiles, clients, profile rules, profile blocklist mappings, and blocklist metadata. Query logs are not part of the normal backup.
 
-## Development and Tests
-
-Tests are located in `test_*.py` files in the project directory and can be run with `unittest`:
-
-```sh
-python -m unittest
-```
-
-Syntax check:
-
-```sh
-python -m py_compile app.py dns_engine.py blocklist_manager.py client_manager.py
-```
-
 ## Security Notes
 
 - Do not expose the web interface to the public internet without additional protection.
@@ -224,7 +210,6 @@ client_manager.py         Profiles, clients, profile rules, and service blocks
 requirements.txt          Python dependencies
 start-pyguarddns.bat      Windows start script
 start-pyguarddns.sh       Linux/macOS start script
-test_*.py                 Unit tests
 ```
 
 ## License
