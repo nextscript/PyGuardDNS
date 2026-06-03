@@ -213,7 +213,3 @@ requirements.txt          Python dependencies
 start-pyguarddns.bat      Windows start script
 start-pyguarddns.sh       Linux/macOS start script
 ```
-
-## License
-
-This repository currently does not include a license file. Add an appropriate license before publishing if others should be allowed to use or modify the project.
