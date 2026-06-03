@@ -1,3 +1,5 @@
+<img src="https://raw.githubusercontent.com/nextscript/PyGuardDNS/refs/heads/main/example.png">
+
 # PyGuardDNS
 
 PyGuardDNS is a local DNS filtering server with a web interface, blocklist management, client profiles, and encrypted upstream resolvers. It runs as a Python application, stores its configuration in SQLite, and can be used as the central DNS resolver for a home network, small lab, or individual devices.
