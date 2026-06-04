@@ -410,6 +410,7 @@ def init_db():
             "query_log_enabled": "1",
             "admin_password_set": "0",
             "log_retention_days": "7",
+            "auto_clear_query_log_hours": "0",
             "localdnsguard_web_host": WEB_HOST,
             "localdnsguard_web_port": str(WEB_PORT),
             "localdnsguard_dns_host": DNS_HOST,
@@ -2930,6 +2931,17 @@ def db_maintenance_loop():
         except Exception:
             pass
         try:
+            hours = int(get_setting("auto_clear_query_log_hours", "0") or "0")
+            if hours > 0:
+                last_clear = float(get_setting("query_log_last_auto_clear", "0") or "0")
+                if last_clear == 0 or (time.time() - last_clear) >= hours * 3600:
+                    with db_lock:
+                        db.execute("DELETE FROM query_log")
+                        db.commit()
+                    set_setting("query_log_last_auto_clear", str(time.time()))
+        except Exception:
+            pass
+        try:
             db.execute("PRAGMA optimize")
         except Exception:
             pass
@@ -3752,21 +3764,21 @@ def extended_dashboard_data():
         return round((curr - prev_v) / prev_v * 100, 1)
 
     live_raw = rows("""
-        SELECT strftime('%Y-%m-%d %H:%M', timestamp) as min,
+        SELECT strftime('%Y-%m-%d %H', timestamp) as hr,
                COUNT(*) as total, COALESCE(SUM(blocked),0) as blocked,
                COALESCE(SUM(CASE WHEN cache_status='hit' THEN 1 ELSE 0 END),0) as cache_hits,
                COALESCE(AVG(CASE WHEN duration_ms<1000 THEN duration_ms END),0) as avg_ms
-        FROM query_log WHERE timestamp >= datetime('now','localtime','-24 minutes')
-        GROUP BY min ORDER BY min
+        FROM query_log WHERE timestamp >= datetime('now','localtime','-24 hours')
+        GROUP BY hr ORDER BY hr
     """)
-    all_mins = {}
+    all_hrs = {}
     for r in live_raw:
-        all_mins[r["min"]] = r
+        all_hrs[r["hr"]] = r
     sparkline_total, sparkline_blocked, sparkline_cache, sparkline_avgms = [], [], [], []
     overall_avg_ms = combined.get("avg_ms", 0) or 0
     for i in range(23, -1, -1):
-        m = (datetime.now() - timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M")
-        r = all_mins.get(m, {})
+        h = (datetime.now() - timedelta(hours=i)).strftime("%Y-%m-%d %H")
+        r = all_hrs.get(h, {})
         tot = r.get("total", 0)
         sparkline_total.append(tot)
         sparkline_blocked.append(r.get("blocked", 0))
@@ -4957,6 +4969,11 @@ def settings_page(message="", is_error=False, values=None):
         <div>
           <label class="form-label">Log Retention (days)</label>
           <input class="form-control" name="log_retention_days" type="number" min="1" max="365" value="{html_escape(get_setting('log_retention_days', '7'))}">
+        </div>
+        <div>
+          <label class="form-label">Auto Clear Query Log (hours)</label>
+          <input class="form-control" name="auto_clear_query_log_hours" type="number" min="0" max="8760" value="{html_escape(get_setting('auto_clear_query_log_hours', '0'))}">
+          <div class="settings-help">Set to 0 to disable. When enabled, the entire query log is automatically deleted at this interval.</div>
         </div>
       </div>
     </section>
@@ -6243,7 +6260,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 "filtering_enabled", "cache_enabled", "query_log_enabled", "lan_only", "dnssec_validation_enabled",
                 "block_mode", "block_response_ttl", "disable_ipv6", "cache_ttl", "cache_size", "cache_min_ttl", "cache_max_ttl", "cache_optimistic",
                 "filter_update_interval_hours", "allowed_networks", "custom_block_ipv4", "custom_block_ipv6",
-                "log_retention_days", "localdnsguard_web_host", "localdnsguard_web_port",
+                "log_retention_days", "auto_clear_query_log_hours", "localdnsguard_web_host", "localdnsguard_web_port",
                 "localdnsguard_dns_host", "localdnsguard_dns_port", "encrypted_dns_host", "encrypted_dns_domain",
                 "upstream_timeout",
                 "dns_over_tls_enabled", "dns_over_tls_port", "dns_over_https_enabled", "dns_over_https_port",
