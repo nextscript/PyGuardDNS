@@ -3113,7 +3113,7 @@ def send_doh_response(handler, params=None):
                 handler.send_error(400, "invalid DNS message length")
                 return
             request = handler.rfile.read(length)
-        response = handle_dns_request(request, handler.client_address[0], "doh")
+        response = handle_dns_request(request, handler.client_address[0], "HTTPS")
         if response is None:
             handler.send_error(502, "DNS query failed")
             return
@@ -3155,7 +3155,7 @@ class DNSHTTPSHandler(BaseHTTPRequestHandler):
 class DNSUDPHandler(socketserver.BaseRequestHandler):
     def handle(self):
         data, sock = self.request
-        response = handle_dns_request(data, self.client_address[0], "udp")
+        response = handle_dns_request(data, self.client_address[0], "UDP")
         if response is not None:
             sock.sendto(response, self.client_address)
 
@@ -3186,7 +3186,7 @@ class DNSTCPHandler(socketserver.BaseRequestHandler):
                 data = recv_exact(self.request, length)
                 if not data:
                     return
-                connection_type = "dot" if isinstance(self.server, ReusableThreadingTLSDNSServer) else "tcp"
+                connection_type = "TLS" if isinstance(self.server, ReusableThreadingTLSDNSServer) else "TCP"
                 response = handle_dns_request(data, self.client_address[0], connection_type)
                 if response is not None:
                     self.request.sendall(struct.pack("!H", len(response)) + response)
@@ -4036,6 +4036,23 @@ def badge(status):
     return f'<span class="badge text-bg-{cls}">{status}</span>'
 
 
+def connection_label(value):
+    labels = {
+        "udp": "UDP",
+        "tcp": "TCP",
+        "doh": "HTTPS",
+        "https": "HTTPS",
+        "dot": "TLS",
+        "tls": "TLS",
+        "doq": "QUIC",
+        "quic": "QUIC",
+    }
+    raw = str(value or "").strip()
+    if not raw:
+        return "Unknown"
+    return labels.get(raw.lower(), raw.upper())
+
+
 def querylog_page(params):
     where, values = [], []
     if params.get("q", [""])[0]:
@@ -4067,7 +4084,7 @@ def querylog_page(params):
             f"<button class='btn btn-outline-light' onclick=\"qlRuleAction('{domain}','{action}','profile','{client}','')\" {'disabled' if not profile_name else ''}>{label} Profile</button>"
             f"</div>"
         )
-    body = "".join(f"<tr><td data-label='Time'>{r['timestamp']}</td><td data-label='Client'>{r['client_ip']}</td><td data-label='Connect'>{r.get('connection_type','') or 'dns'}</td><td data-label='Domain' class='td-domain'>{r['domain']}</td><td data-label='Type'>{r['query_type']}</td><td data-label='Status'>{badge(r['status'])}</td><td data-label='Upstream'>{r['upstream']}</td><td data-label='ms'>{r['duration_ms']:.1f}</td><td data-label='Actions'>{ql_actions(r)}</td></tr>" for r in data)
+    body = "".join(f"<tr><td data-label='Time'>{r['timestamp']}</td><td data-label='Client'>{r['client_ip']}</td><td data-label='Connect'>{connection_label(r.get('connection_type',''))}</td><td data-label='Domain' class='td-domain'>{r['domain']}</td><td data-label='Type'>{r['query_type']}</td><td data-label='Status'>{badge(r['status'])}</td><td data-label='Upstream'>{r['upstream']}</td><td data-label='ms'>{r['duration_ms']:.1f}</td><td data-label='Actions'>{ql_actions(r)}</td></tr>" for r in data)
     return template(f"""
 <h1 class="h3 mb-3">Query Log</h1>
 <div class="d-flex gap-2 mb-3 flex-wrap">
@@ -4117,6 +4134,12 @@ function qlFetch() {{
     .then(r => r.json())
     .then(d => {{
       const tb = document.getElementById('ql-body');
+      const connectLabel = (value) => {{
+        const labels = {{udp:'UDP', tcp:'TCP', doh:'HTTPS', https:'HTTPS', dot:'TLS', tls:'TLS', doq:'QUIC', quic:'QUIC'}};
+        const raw = String(value || '').trim();
+        if (!raw) return 'Unknown';
+        return labels[raw.toLowerCase()] || raw.toUpperCase();
+      }};
       tb.innerHTML = d.map(r => {{
         let bc = 'success';
         if (r.status.includes('block') || r.status==='refused' || r.status==='upstream_error') bc='danger';
@@ -4127,7 +4150,7 @@ function qlFetch() {{
         const client = esc(r.client_ip || '');
         const profDisabled = r.profile_name ? '' : 'disabled';
         const actions = `<div class="btn-group btn-group-sm" role="group"><button class="btn btn-outline-light" onclick="qlRuleAction('${{domain}}','${{act}}','global','${{client}}','')">${{label}} Global</button><button class="btn btn-outline-light" onclick="qlRuleAction('${{domain}}','${{act}}','profile','${{client}}','')" ${{profDisabled}}>${{label}} Profile</button></div>`;
-        return `<tr><td data-label="Time">${{r.timestamp}}</td><td data-label="Client">${{r.client_ip}}</td><td data-label="Connect">${{r.connection_type||'dns'}}</td><td data-label="Domain" class="td-domain">${{r.domain}}</td><td data-label="Type">${{r.query_type}}</td><td data-label="Status"><span class="badge text-bg-${{bc}}">${{r.status}}</span></td><td data-label="Upstream">${{r.upstream||''}}</td><td data-label="ms">${{r.duration_ms?.toFixed(1)||''}}</td><td data-label="Actions">${{actions}}</td></tr>`;
+        return `<tr><td data-label="Time">${{r.timestamp}}</td><td data-label="Client">${{r.client_ip}}</td><td data-label="Connect">${{connectLabel(r.connection_type)}}</td><td data-label="Domain" class="td-domain">${{r.domain}}</td><td data-label="Type">${{r.query_type}}</td><td data-label="Status"><span class="badge text-bg-${{bc}}">${{r.status}}</span></td><td data-label="Upstream">${{r.upstream||''}}</td><td data-label="ms">${{r.duration_ms?.toFixed(1)||''}}</td><td data-label="Actions">${{actions}}</td></tr>`;
       }}).join('');
     }}).catch(() => {{}});
 }}
@@ -7152,7 +7175,7 @@ class DoQRuntimeServer:
                         peer = self._quic._network_paths[0].addr[0] if self._quic._network_paths else ""
                         update_doq_metric("queries")
                         update_doq_metric("last_peer", peer)
-                        response = handle_dns_request(request, peer, "doq")
+                        response = handle_dns_request(request, peer, "QUIC")
                         payload = b"" if response is None else struct.pack("!H", len(response)) + response
                         try:
                             question = parse_dns_question(request)
