@@ -19,6 +19,65 @@ import dns.tsig
 
 logger = logging.getLogger("dnssec")
 
+_EMBEDDED_ROOT_ANCHOR_XML = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<TrustAnchor id="0C05FDD6-422C-4910-8ED6-430ED15E11C2" source="http://data.iana.org/root-anchors/root-anchors.xml">
+    <Zone>.</Zone>
+    <KeyDigest id="Kjqmt7v" validFrom="2010-07-15T00:00:00+00:00" validUntil="2019-01-11T00:00:00+00:00">
+        <KeyTag>19036</KeyTag>
+        <Algorithm>8</Algorithm>
+        <DigestType>2</DigestType>
+        <Digest>49AAC11D7B6F6446702E54A1607371607A1A41855200FD2CE1CDDE32F24E8FB5</Digest>
+    </KeyDigest>
+    <KeyDigest id="Klajeyz" validFrom="2017-02-02T00:00:00+00:00">
+        <KeyTag>20326</KeyTag>
+        <Algorithm>8</Algorithm>
+        <DigestType>2</DigestType>
+        <Digest>E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D</Digest>
+        <PublicKey>AwEAAaz/tAm8yTn4Mfeh5eyI96WSVexTBAvkMgJzkKTOiW1vkIbzxeF3+/4RgWOq7HrxRixHlFlExOLAJr5emLvN7SWXgnLh4+B5xQlNVz8Og8kvArMtNROxVQuCaSnIDdD5LKyWbRd2n9WGe2R8PzgCmr3EgVLrjyBxWezF0jLHwVN8efS3rCj/EWgvIWgb9tarpVUDK/b58Da+sqqls3eNbuv7pr+eoZG+SrDK6nWeL3c6H5Apxz7LjVc1uTIdsIXxuOLYA4/ilBmSVIzuDWfdRUfhHdY6+cn8HFRm+2hM8AnXGXws9555KrUB5qihylGa8subX2Nn6UwNR1AkUTV74bU=</PublicKey>
+        <Flags>257</Flags>
+    </KeyDigest>
+    <KeyDigest id="Kmyv6jo" validFrom="2024-07-18T00:00:00+00:00">
+        <KeyTag>38696</KeyTag>
+        <Algorithm>8</Algorithm>
+        <DigestType>2</DigestType>
+        <Digest>683D2D0ACB8C9B712A1948B27F741219298D0A450D612C483AF444A4C0FB2B16</Digest>
+        <PublicKey>AwEAAa96jeuknZlaeSrvyAJj6ZHv28hhOKkx3rLGXVaC6rXTsDc449/cidltpkyGwCJNnOAlFNKF2jBosZBU5eeHspaQWOmOElZsjICMQMC3aeHbGiShvZsx4wMYSjH8e7Vrhbu6irwCzVBApESjbUdpWWmEnhathWu1jo+siFUiRAAxm9qyJNg/wOZqqzL/dL/q8PkcRU5oUKEpUge71M3ej2/7CPqpdVwuMoTvoB+ZOT4YeGyxMvHmbrxlFzGOHOijtzN+u1TQNatX2XBuzZNQ1K+s2CXkPIZo7s6JgZyvaBevYtxPvYLw4z9mR7K2vaF18UYH9Z9GNUUeayffKC73PYc=</PublicKey>
+        <Flags>257</Flags>
+    </KeyDigest>
+</TrustAnchor>"""
+
+_EMBEDDED_ROOT_KEY = """\
+; Root Zone Trust Anchor (DNSKEY)
+; This file contains the root DNSKEY records that serve as the
+; DNSSEC trust anchor for local validation.
+. IN DNSKEY 257 3 8 AwEAAaz/tAm8yTn4Mfeh5eyI96WSVexTBAvkMgJzkKTOiW1vkIbzxeF3+/4RgWOq7HrxRixHlFlExOLAJr5emLvN7SWXgnLh4+B5xQlNVz8Og8kvArMtNROxVQuCaSnIDdD5LKyWbRd2n9WGe2R8PzgCmr3EgVLrjyBxWezF0jLHwVN8efS3rCj/EWgvIWgb9tarpVUDK/b58Da+sqqls3eNbuv7pr+eoZG+SrDK6nWeL3c6H5Apxz7LjVc1uTIdsIXxuOLYA4/ilBmSVIzuDWfdRUfhHdY6+cn8HFRm+2hM8AnXGXws9555KrUB5qihylGa8subX2Nn6UwNR1AkUTV74bU=
+. IN DNSKEY 257 3 8 AwEAAa96jeuknZlaeSrvyAJj6ZHv28hhOKkx3rLGXVaC6rXTsDc449/cidltpkyGwCJNnOAlFNKF2jBosZBU5eeHspaQWOmOElZsjICMQMC3aeHbGiShvZsx4wMYSjH8e7Vrhbu6irwCzVBApESjbUdpWWmEnhathWu1jo+siFUiRAAxm9qyJNg/wOZqqzL/dL/q8PkcRU5oUKEpUge71M3ej2/7CPqpdVwuMoTvoB+ZOT4YeGyxMvHmbrxlFzGOHOijtzN+u1TQNatX2XBuzZNQ1K+s2CXkPIZo7s6JgZyvaBevYtxPvYLw4z9mR7K2vaF18UYH9Z9GNUUeayffKC73PYc=
+. IN DNSKEY 256 3 8 AwEAAb5dDYffpgAJ8VUGLwQtWXPlQWsjIFJtCM00/XaKU+8ln+ofah3q2KxEIjvzQg+nqdxRj+8emtPne1mtYcbFWP4Q9E+DniOJLK09R05FuzvGbrG7DDdRDUX/cedFdV7O8pFEAYpJqYNR9BCTIAV973DO2biauKSA31b7I2lK/woxoR1tf5cqJ4SMbJUviuHicAEoUi2ATswloZNWd5T5thmEFZnxFx7D5UgKCY7oflS7+GU7dNJwEtmFnWYVETHN0kHXVz6aguouaAZp706YXNIoR/iTgQhmsR7XX+wL0Z8QM2LxQIyU6vRZ06IyuJMGRMiwkSuGElbumyBt12JZbrU=
+"""
+
+
+def _ensure_data_files():
+    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    os.makedirs(data_dir, exist_ok=True)
+    xml_path = os.path.join(data_dir, "root-anchors.xml")
+    if not os.path.exists(xml_path):
+        try:
+            with open(xml_path, "w", encoding="utf-8") as f:
+                f.write(_EMBEDDED_ROOT_ANCHOR_XML)
+            logger.info("Created %s from embedded IANA root anchor", xml_path)
+        except Exception as e:
+            logger.error("Failed to create %s: %s", xml_path, e)
+    key_path = os.path.join(data_dir, "root.key")
+    if not os.path.exists(key_path):
+        try:
+            with open(key_path, "w", encoding="utf-8") as f:
+                f.write(_EMBEDDED_ROOT_KEY)
+            logger.info("Created %s from embedded root DNSKEYs", key_path)
+        except Exception as e:
+            logger.error("Failed to create %s: %s", key_path, e)
+
+
 _trust_anchor_lock = threading.Lock()
 _trust_anchor_loaded = False
 _trust_anchor_ds_set = None
@@ -104,6 +163,7 @@ class TrustAnchorStore:
 
     def load(self):
         global _trust_anchor_loaded, _trust_anchor_ds_set, _trust_anchor_dnskey_set, _trust_anchor_error
+        _ensure_data_files()
         with _trust_anchor_lock:
             if _trust_anchor_loaded:
                 return True, _trust_anchor_error
