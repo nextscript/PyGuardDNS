@@ -1,10 +1,16 @@
 import ipaddress
+import gzip
+import hashlib
+import io
+import json
 import re
 import threading
 import time
+import zipfile
 from datetime import datetime
 from typing import Optional
 from urllib.parse import urlparse
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 try:
@@ -146,6 +152,10 @@ def _parse_umatrix_markdown(text: str, default_action: str):
     return entries
 
 
+def _dangerous_regex(pattern: str) -> bool:
+    return bool(re.search(r"\((?:[^()\\]|\\.)*[*+](?:[^()\\]|\\.)*\)[*+{]", pattern))
+
+
 def _drop_redundant_occurrences(entries, count: int):
     if count <= 0:
         return entries
@@ -176,6 +186,8 @@ def parse_filter_rule(line: str, default_action: str = "block"):
     if line.startswith("/") and line.count("/") >= 2:
         end = line.rfind("/")
         pattern = line[1:end]
+        if _dangerous_regex(pattern):
+            return []
         try:
             re.compile(pattern)
         except re.error:
@@ -246,17 +258,93 @@ def parse_filter_list(text: str, default_action: str = "block"):
     return filtered
 
 
-def fetch_url_text(url: str, max_bytes: int = 100_000_000) -> str:
+TEXT_EXTENSIONS = (".txt", ".hosts", ".domains", ".list", ".conf", ".rules")
+MAX_EXTRACTED_BYTES = 100_000_000
+
+
+def _looks_like_html(data: bytes) -> bool:
+    sample = data[:2048].lstrip().lower()
+    return sample.startswith(b"<!doctype html") or sample.startswith(b"<html") or b"<body" in sample[:512]
+
+
+def decode_blocklist_content(data: bytes, url: str = "", max_bytes: int = MAX_EXTRACTED_BYTES) -> str:
+    lower = (url or "").lower()
+    if lower.endswith(".gz") or data[:2] == b"\x1f\x8b":
+        data = gzip.decompress(data)
+    elif lower.endswith(".zip") or data[:4] == b"PK\x03\x04":
+        total = 0
+        chunks = []
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            for info in archive.infolist():
+                name = info.filename.replace("\\", "/")
+                if name.startswith("/") or ".." in name.split("/"):
+                    raise ValueError("ZIP blocklist contains unsafe path")
+                if info.is_dir() or not name.lower().endswith(TEXT_EXTENSIONS):
+                    continue
+                total += info.file_size
+                if total > max_bytes:
+                    raise ValueError("ZIP blocklist is too large")
+                with archive.open(info) as fh:
+                    chunks.append(fh.read(max_bytes - sum(len(c) for c in chunks)))
+        if not chunks:
+            raise ValueError("ZIP blocklist contains no supported text file")
+        data = b"\n".join(chunks)
+    if len(data) > max_bytes:
+        raise ValueError("Blocklist is too large")
+    if not data.strip():
+        raise ValueError("Downloaded blocklist is empty")
+    if _looks_like_html(data):
+        raise ValueError("Downloaded blocklist looks like an HTML error page")
+    return data.decode("utf-8", errors="ignore")
+
+
+def fetch_url_text(url: str, max_bytes: int = 100_000_000, etag: str = "", last_modified: str = ""):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; PyGuardDNS/1.0; +https://github.com/)",
+        "Accept": "text/plain,text/*,application/gzip,application/zip,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if etag:
+        headers["If-None-Match"] = etag
+    if last_modified:
+        headers["If-Modified-Since"] = last_modified
     request = Request(
         url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; PyGuardDNS/1.0; +https://github.com/)",
-            "Accept": "text/plain,text/*,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
+        headers=headers,
     )
-    with urlopen(request, timeout=10) as response:
-        return response.read(max_bytes).decode("utf-8", errors="ignore")
+    try:
+        with urlopen(request, timeout=10) as response:
+            status = getattr(response, "status", 200)
+            data = response.read(max_bytes + 1)
+            return {
+                "status": status,
+                "text": decode_blocklist_content(data, url, max_bytes),
+                "etag": response.headers.get("ETag", ""),
+                "last_modified": response.headers.get("Last-Modified", ""),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+    except HTTPError as exc:
+        if exc.code == 304:
+            return {"status": 304, "text": "", "etag": etag, "last_modified": last_modified, "sha256": ""}
+        raise
+
+
+def import_report(entries, total_lines: int = 0, invalid_rules: int = 0) -> dict:
+    unique = set(entries)
+    regex_rules = sum(1 for _, pt, _ in entries if pt == "regex")
+    allow_rules = sum(1 for action, _, _ in entries if action == "allow")
+    block_rules = sum(1 for action, _, _ in entries if action == "block")
+    return {
+        "total_lines": total_lines,
+        "valid_rules": len(entries),
+        "unique_rules": len(unique),
+        "duplicate_rules": max(0, len(entries) - len(unique)),
+        "invalid_rules": invalid_rules,
+        "regex_rules": regex_rules,
+        "allow_rules": allow_rules,
+        "block_rules": block_rules,
+        "rejected_regex_rules": 0,
+    }
 
 
 SCHEMA_SQL = """
@@ -269,6 +357,15 @@ CREATE TABLE IF NOT EXISTS blocklists (
     rule_count INTEGER NOT NULL DEFAULT 0,
     last_update TEXT NOT NULL DEFAULT '',
     last_error TEXT NOT NULL DEFAULT '',
+    last_successful_update TEXT NOT NULL DEFAULT '',
+    last_failed_update TEXT NOT NULL DEFAULT '',
+    last_rule_count INTEGER NOT NULL DEFAULT 0,
+    last_unique_rule_count INTEGER NOT NULL DEFAULT 0,
+    last_sha256 TEXT NOT NULL DEFAULT '',
+    etag TEXT NOT NULL DEFAULT '',
+    last_modified TEXT NOT NULL DEFAULT '',
+    duplicate_rule_count INTEGER NOT NULL DEFAULT 0,
+    import_report TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
 
@@ -299,27 +396,43 @@ class BlocklistManager:
     def init_schema(self):
         self.db.executescript(SCHEMA_SQL)
         existing = [row["name"] for row in self.db.execute("PRAGMA table_info(blocklists)").fetchall()]
-        if "enabled" not in existing:
-            self.db.execute("ALTER TABLE blocklists ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+        migrations = {
+            "enabled": "INTEGER NOT NULL DEFAULT 1",
+            "last_successful_update": "TEXT NOT NULL DEFAULT ''",
+            "last_failed_update": "TEXT NOT NULL DEFAULT ''",
+            "last_rule_count": "INTEGER NOT NULL DEFAULT 0",
+            "last_unique_rule_count": "INTEGER NOT NULL DEFAULT 0",
+            "last_sha256": "TEXT NOT NULL DEFAULT ''",
+            "etag": "TEXT NOT NULL DEFAULT ''",
+            "last_modified": "TEXT NOT NULL DEFAULT ''",
+            "duplicate_rule_count": "INTEGER NOT NULL DEFAULT 0",
+            "import_report": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column, definition in migrations.items():
+            if column not in existing:
+                self.db.execute(f"ALTER TABLE blocklists ADD COLUMN {column} {definition}")
         self.db.commit()
 
     def add_from_url(self, name: str, url: str, list_type: str = "block") -> int:
-        text = fetch_url_text(url)
-        return self.add_from_text(name, text, list_type, source=url)
+        fetched = fetch_url_text(url)
+        return self.add_from_text(name, fetched["text"], list_type, source=url, sha256=fetched.get("sha256", ""), etag=fetched.get("etag", ""), last_modified=fetched.get("last_modified", ""))
 
-    def add_from_text(self, name: str, text: str, list_type: str = "block", source: str = "") -> int:
+    def add_from_text(self, name: str, text: str, list_type: str = "block", source: str = "", sha256: str = "", etag: str = "", last_modified: str = "") -> int:
         list_type = "allow" if list_type == "allow" else "block"
         entries = parse_filter_list(text, default_action=list_type)
         if list_type == "allow":
             entries = [(action, pt, pattern) for action, pt, pattern in entries if action == "allow"]
         if not entries:
             return 0
+        report = import_report(entries, total_lines=len(text.splitlines()))
         created = now_iso()
         with self._update_lock:
             self._delete_by_name(name)
             curs = self.db.execute(
-                "INSERT INTO blocklists(name,url,list_type,rule_count,last_update,created_at) VALUES(?,?,?,?,?,?)",
-                (name, source, list_type, len(entries), created, created),
+                """INSERT INTO blocklists(name,url,list_type,rule_count,last_update,last_successful_update,last_rule_count,
+                   last_unique_rule_count,last_sha256,etag,last_modified,duplicate_rule_count,import_report,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (name, source, list_type, len(entries), created, created, len(entries), report["unique_rules"], sha256, etag, last_modified, report["duplicate_rules"], json.dumps(report), created),
             )
             bl_id = curs.lastrowid
             self.db.executemany(
@@ -339,13 +452,23 @@ class BlocklistManager:
 
         def _do():
             try:
-                text = fetch_url_text(item["url"])
+                fetched = fetch_url_text(item["url"], etag=item.get("etag", ""), last_modified=item.get("last_modified", ""))
+                if fetched["status"] == 304:
+                    with self._update_lock:
+                        self.db.execute("UPDATE blocklists SET last_update=?, last_error='' WHERE id=?", (now_iso(), list_id))
+                        self.db.commit()
+                    return
+                text = fetched["text"]
                 list_type = "allow" if item.get("list_type") == "allow" else "block"
                 entries = parse_filter_list(text, default_action=list_type)
                 if list_type == "allow":
                     entries = [(action, pt, pattern) for action, pt, pattern in entries if action == "allow"]
                 if not entries:
                     raise ValueError("Download succeeded but no valid rules found")
+                old_count = int(item.get("last_rule_count") or item.get("rule_count") or 0)
+                if old_count > 10000 and len(entries) < old_count * 0.5:
+                    raise ValueError("New list is suspiciously smaller than previous version")
+                report = import_report(entries, total_lines=len(text.splitlines()))
                 created = now_iso()
                 with self._update_lock:
                     self._delete_entries(list_id)
@@ -354,14 +477,17 @@ class BlocklistManager:
                         [(list_id, action, pt, pattern, created) for action, pt, pattern in entries],
                     )
                     self.db.execute(
-                        "UPDATE blocklists SET rule_count=?, last_update=?, last_error='' WHERE id=?",
-                        (len(entries), created, list_id),
+                        """UPDATE blocklists SET rule_count=?, last_update=?, last_error='', last_successful_update=?,
+                           last_rule_count=?, last_unique_rule_count=?, last_sha256=?, etag=?, last_modified=?,
+                           duplicate_rule_count=?, import_report=? WHERE id=?""",
+                        (len(entries), created, created, len(entries), report["unique_rules"], fetched.get("sha256", ""),
+                         fetched.get("etag", ""), fetched.get("last_modified", ""), report["duplicate_rules"], json.dumps(report), list_id),
                     )
                     self.db.commit()
                 self._notify_reload()
             except Exception as exc:
                 with self._update_lock:
-                    self.db.execute("UPDATE blocklists SET last_error=? WHERE id=?", (str(exc), list_id))
+                    self.db.execute("UPDATE blocklists SET last_error=?, last_failed_update=? WHERE id=?", (str(exc), now_iso(), list_id))
                     self.db.commit()
 
         if background:

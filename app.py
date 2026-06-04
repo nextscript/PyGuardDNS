@@ -1068,6 +1068,25 @@ def build_ip_response(request, ip_text, ttl=60):
     return header + question_part + answer
 
 
+def build_block_response(request, qtype_name=None):
+    mode = get_setting("block_mode", "zero_ip")
+    if mode == "refused":
+        return build_error_response(request, 5)
+    if mode == "nxdomain":
+        return build_error_response(request, 3)
+    if mode == "nodata":
+        return build_empty_response(request)
+    if mode == "drop":
+        return None
+    if mode not in ("zero_ip", "custom_ip"):
+        mode = "zero_ip"
+    if mode == "custom_ip":
+        ip = get_setting("custom_block_ipv6", "::") if qtype_name == "AAAA" else get_setting("custom_block_ipv4", "0.0.0.0")
+    else:
+        ip = "::" if qtype_name == "AAAA" else "0.0.0.0"
+    return build_ip_response(request, ip)
+
+
 def is_lan_allowed(client_ip):
     if get_setting("lan_only", "1") != "1":
         return True
@@ -1251,6 +1270,30 @@ def extract_response_addresses(response, wanted_type):
     except Exception:
         pass
     return addresses
+
+
+def extract_cname_targets(packet: bytes) -> list[str]:
+    targets = []
+    try:
+        question = parse_dns_question(packet)
+        offset = question["question_end"]
+        ancount = struct.unpack("!H", packet[6:8])[0]
+        for _ in range(ancount):
+            _, offset = parse_qname(packet, offset)
+            if offset + 10 > len(packet):
+                break
+            rtype, _, _, rdlen = struct.unpack("!HHIH", packet[offset : offset + 10])
+            offset += 10
+            rdata_offset = offset
+            offset += rdlen
+            if rtype == QTYPE_CODE["CNAME"]:
+                target, _ = parse_qname(packet, rdata_offset)
+                normalized = normalize_domain(target)
+                if normalized:
+                    targets.append(normalized)
+    except Exception:
+        return []
+    return list(dict.fromkeys(targets))
 
 
 def query_plain_upstream(upstream, request, timeout=2.5):
@@ -2303,14 +2346,15 @@ def decide(domain, qtype_name, client_ip):
         "profile_id": profile_id,
     }
 
+    matched_rule = result.matched_rule or result.matched_domain or result.reason
     if result.action == "REFUSED":
-        base.update({"status": "refused", "action": "refuse", "rule": result.reason, "filter_list": result.list_name or "", "reason": result.reason})
+        base.update({"status": "refused", "action": "refuse", "rule": matched_rule, "filter_list": result.list_name or "", "reason": result.reason})
     elif result.action == "ALLOW":
-        base.update({"status": "allowed", "action": "allow", "rule": result.reason, "filter_list": result.list_name or "", "reason": result.reason})
+        base.update({"status": "allowed", "action": "allow", "rule": matched_rule, "filter_list": result.list_name or "", "reason": result.reason})
     elif result.action == "REWRITE":
-        base.update({"status": "rewritten", "action": "rewrite", "target": result.answer_ip or "", "rule": result.reason, "filter_list": result.list_name or "", "reason": result.reason})
+        base.update({"status": "rewritten", "action": "rewrite", "target": result.answer_ip or "", "rule": matched_rule, "filter_list": result.list_name or "", "reason": result.reason})
     elif result.action == "BLOCK":
-        base.update({"status": "blocked", "action": "block", "rule": result.reason, "filter_list": result.list_name or "", "reason": result.reason})
+        base.update({"status": "blocked", "action": "block", "rule": matched_rule, "filter_list": result.list_name or "", "reason": result.reason})
     else:
         base.update({"status": "allowed", "action": "allow", "rule": "", "reason": "no matching rule"})
     return base
@@ -2816,16 +2860,7 @@ def handle_dns_request(request, client_ip):
             log_query(client_ip, domain, normalized, qtype_name, "refused", matched_rule=decision["rule"], blocked=1, reason=decision["reason"], duration_ms=(time.perf_counter() - started) * 1000, matched_list=decision.get("filter_list", ""), client_name=dc, profile_name=dp)
             return response
         if decision["action"] == "block":
-            mode = get_setting("block_mode", "zero_ip")
-            if mode == "refused":
-                response = build_error_response(request, 5)
-            elif mode == "nxdomain":
-                response = build_error_response(request, 3)
-            elif mode == "drop":
-                return None
-            else:
-                ip = get_setting("custom_block_ipv6", "::") if qtype_name == "AAAA" else get_setting("custom_block_ipv4", "0.0.0.0")
-                response = build_ip_response(request, ip)
+            response = build_block_response(request, qtype_name)
             log_query(client_ip, domain, normalized, qtype_name, "blocked", matched_rule=decision["rule"], blocked=1, reason=decision["reason"], duration_ms=(time.perf_counter() - started) * 1000, matched_list=decision.get("filter_list", ""), client_name=dc, profile_name=dp)
             return response
         if decision["action"] == "rewrite":
@@ -2845,6 +2880,20 @@ def handle_dns_request(request, client_ip):
             return cached
 
         response, upstream = forward_query(request)
+        filtering_on = get_setting("filtering_enabled", "1") == "1" and client_filtering_enabled(client_ip)
+        profile_id = decision.get("profile_id")
+        engine = get_filter_engine()
+        for cname in extract_cname_targets(response):
+            cname_result = engine.check(cname, filtering_enabled=filtering_on, profile_id=profile_id)
+            if cname_result.action == "BLOCK":
+                blocked_response = build_block_response(request, qtype_name)
+                matched = cname_result.matched_rule or cname_result.matched_domain or cname
+                log_query(client_ip, domain, normalized, qtype_name, "blocked", upstream=upstream,
+                          matched_rule=matched, blocked=1, reason="cname_blocked",
+                          duration_ms=(time.perf_counter() - started) * 1000,
+                          matched_list=cname_result.list_name or cname_result.matched_list or "",
+                          client_name=dc, profile_name=dp)
+                return blocked_response
         set_cached(normalized, qtype_name, response)
         log_query(client_ip, domain, normalized, qtype_name, "allowed", response_ips=extract_response_ips(response), upstream=upstream, duration_ms=(time.perf_counter() - started) * 1000, client_name=dc, profile_name=dp)
         return response
@@ -3797,7 +3846,19 @@ def querylog_page(params):
     client_val = html_escape(params.get('client', [''])[0])
     q_val = html_escape(params.get('q', [''])[0])
     status_val = params.get('status', [''])[0]
-    body = "".join(f"<tr><td data-label='Time'>{r['timestamp']}</td><td data-label='Client'>{r['client_ip']}</td><td data-label='Domain' class='td-domain'>{r['domain']}</td><td data-label='Type'>{r['query_type']}</td><td data-label='Status'>{badge(r['status'])}</td><td data-label='Rule'>{r['matched_rule']}</td><td data-label='List'>{r.get('matched_list','')}</td><td data-label='Upstream'>{r['upstream']}</td><td data-label='ms'>{r['duration_ms']:.1f}</td></tr>" for r in data)
+    def ql_actions(r):
+        domain = html_escape(r["normalized_domain"] or r["domain"])
+        client = html_escape(r["client_ip"])
+        profile_name = html_escape(r.get("profile_name", ""))
+        action = "allow" if r.get("blocked") else "block"
+        label = "Allow" if action == "allow" else "Block"
+        return (
+            f"<div class='btn-group btn-group-sm' role='group'>"
+            f"<button class='btn btn-outline-light' onclick=\"qlRuleAction('{domain}','{action}','global','{client}','')\">{label} Global</button>"
+            f"<button class='btn btn-outline-light' onclick=\"qlRuleAction('{domain}','{action}','profile','{client}','')\" {'disabled' if not profile_name else ''}>{label} Profile</button>"
+            f"</div>"
+        )
+    body = "".join(f"<tr><td data-label='Time'>{r['timestamp']}</td><td data-label='Client'>{r['client_ip']}</td><td data-label='Domain' class='td-domain'>{r['domain']}</td><td data-label='Type'>{r['query_type']}</td><td data-label='Status'>{badge(r['status'])}</td><td data-label='Rule'>{r['matched_rule']}</td><td data-label='List'>{r.get('matched_list','')}</td><td data-label='Upstream'>{r['upstream']}</td><td data-label='ms'>{r['duration_ms']:.1f}</td><td data-label='Actions'>{ql_actions(r)}</td></tr>" for r in data)
     return template(f"""
 <h1 class="h3 mb-3">Query Log</h1>
 <div class="d-flex gap-2 mb-3 flex-wrap">
@@ -3808,7 +3869,7 @@ def querylog_page(params):
   <button class="btn btn-outline-light" id="ql-auto-btn" onclick="qlToggleAuto()">Auto-Refresh Off</button>
   <form method="post" action="/querylog/clear" style="margin:0"><button class="btn btn-outline-danger">Clear</button></form>
 </div>
-<div class="panel rounded-2 border border-secondary-subtle p-3"><div class="table-responsive"><table class="table table-dark table-hover mobile-card-table" id="ql-table"><thead><tr><th>Time</th><th>Client</th><th>Domain</th><th>Type</th><th>Status</th><th>Rule</th><th>List</th><th>Upstream</th><th>ms</th></tr></thead><tbody id="ql-body">{body}</tbody></table></div></div>
+<div class="panel rounded-2 border border-secondary-subtle p-3"><div class="table-responsive"><table class="table table-dark table-hover mobile-card-table" id="ql-table"><thead><tr><th>Time</th><th>Client</th><th>Domain</th><th>Type</th><th>Status</th><th>Rule</th><th>List</th><th>Upstream</th><th>ms</th><th>Actions</th></tr></thead><tbody id="ql-body">{body}</tbody></table></div></div>
 <script>
 let qlTimer;
 function qlSearch() {{
@@ -3851,9 +3912,28 @@ function qlFetch() {{
         let bc = 'success';
         if (r.status.includes('block') || r.status==='refused' || r.status==='upstream_error') bc='danger';
         else if (r.status==='cached' || r.status==='rewritten') bc='info';
-        return `<tr><td data-label="Time">${{r.timestamp}}</td><td data-label="Client">${{r.client_ip}}</td><td data-label="Domain" class="td-domain">${{r.domain}}</td><td data-label="Type">${{r.query_type}}</td><td data-label="Status"><span class="badge text-bg-${{bc}}">${{r.status}}</span></td><td data-label="Rule">${{r.matched_rule||''}}</td><td data-label="List">${{r.matched_list||''}}</td><td data-label="Upstream">${{r.upstream||''}}</td><td data-label="ms">${{r.duration_ms?.toFixed(1)||''}}</td></tr>`;
+        const act = r.blocked ? 'allow' : 'block';
+        const label = r.blocked ? 'Allow' : 'Block';
+        const domain = esc(r.normalized_domain || r.domain || '');
+        const client = esc(r.client_ip || '');
+        const profDisabled = r.profile_name ? '' : 'disabled';
+        const actions = `<div class="btn-group btn-group-sm" role="group"><button class="btn btn-outline-light" onclick="qlRuleAction('${{domain}}','${{act}}','global','${{client}}','')">${{label}} Global</button><button class="btn btn-outline-light" onclick="qlRuleAction('${{domain}}','${{act}}','profile','${{client}}','')" ${{profDisabled}}>${{label}} Profile</button></div>`;
+        return `<tr><td data-label="Time">${{r.timestamp}}</td><td data-label="Client">${{r.client_ip}}</td><td data-label="Domain" class="td-domain">${{r.domain}}</td><td data-label="Type">${{r.query_type}}</td><td data-label="Status"><span class="badge text-bg-${{bc}}">${{r.status}}</span></td><td data-label="Rule">${{r.matched_rule||''}}</td><td data-label="List">${{r.matched_list||''}}</td><td data-label="Upstream">${{r.upstream||''}}</td><td data-label="ms">${{r.duration_ms?.toFixed(1)||''}}</td><td data-label="Actions">${{actions}}</td></tr>`;
       }}).join('');
     }}).catch(() => {{}});
+}}
+function qlRuleAction(domain, action, scope, client, profileId) {{
+  if (scope === 'global' && !confirm(`This will ${{action}} ${{domain}} for all clients. Continue?`)) return;
+  const fd = new URLSearchParams();
+  fd.set('domain', domain);
+  fd.set('action', action);
+  fd.set('scope', scope);
+  fd.set('client', client || '');
+  if (profileId) fd.set('profile_id', profileId);
+  fetch('/api/querylog/rule-action', {{method:'POST', body: fd}})
+    .then(r => r.json())
+    .then(d => {{ if (d.error) alert(d.error); else qlFetch(); }})
+    .catch(() => alert('Rule action failed'));
 }}
 function qlRestoreAuto() {{
   if (localStorage.getItem('qlAutoRefresh') === '1') {{
@@ -4865,6 +4945,20 @@ def api_docs_page():
 def domain_test_result_html(result):
     if not result:
         return ""
+    steps = result.get("steps") or []
+    steps_html = ""
+    if steps:
+        step_rows = ""
+        for item in steps:
+            detail = ", ".join(f"{html_escape(str(k))}: {html_escape(str(v))}" for k, v in item.items() if k != "step")
+            step_rows += f"<tr><td>{html_escape(str(item.get('step', '')))}</td><td>{detail or '-'}</td></tr>"
+        steps_html = f"""
+  <div class="table-responsive mt-3">
+    <table class="table table-dark table-striped align-middle mb-0 domain-test-table">
+      <thead><tr><th>Step</th><th>Result</th></tr></thead>
+      <tbody>{step_rows}</tbody>
+    </table>
+  </div>"""
 
     action = str(result.get("action", "") or "").upper()
     badge_cls = {
@@ -4902,7 +4996,7 @@ def domain_test_result_html(result):
       <tbody>{rows_html}</tbody>
     </table>
   </div>
-</div>"""
+</div>{steps_html}"""
 
 
 def domain_test_page(result=None):
@@ -4937,19 +5031,80 @@ def run_domain_test(form):
         client_info = client_manager.get_client_by_ip(client)
         if client_info:
             profile_id = client_info.get("profile_id")
-    result = engine.check(domain, filtering_enabled=filtering_on, profile_id=profile_id)
+    explanation = engine.explain(domain, filtering_enabled=filtering_on, profile_id=profile_id)
     base = {
         "domain": domain, "query_type": query_type, "client": client,
-        "action": result.action, "reason": result.reason,
-        "matched_rule": result.matched_rule, "matched_domain": result.matched_domain,
-        "list_name": result.list_name or "",
+        "action": explanation["result"], "reason": explanation["reason"],
+        "matched_rule": explanation.get("matched_rule", ""), "matched_domain": explanation.get("matched_domain", ""),
+        "list_name": explanation.get("matched_list", ""),
         "profile_id": profile_id,
         "profile_name": client_info.get("profile_name", "") if client_info else "",
         "client_name": client_info.get("name", "") if client_info else "",
+        "steps": explanation.get("steps", []),
+        "allow_rule_won": explanation.get("allow_rule_won", False),
+        "rewrite_applied": explanation.get("rewrite_applied", False),
+        "safesearch_applied": explanation.get("safesearch_applied", False),
+        "service_block_applied": explanation.get("service_block_applied", False),
     }
-    if result.action == "REWRITE":
-        base["target"] = result.answer_ip or ""
+    if explanation.get("target"):
+        base["target"] = explanation["target"]
     return base
+
+
+def explain_decision(domain: str, client_ip: str = "") -> dict:
+    client = client_ip or "127.0.0.1"
+    normalized = normalize_domain(domain)
+    filtering_on = get_setting("filtering_enabled", "1") == "1" and client_filtering_enabled(client)
+    profile_id = None
+    client_info = None
+    if client_manager is not None:
+        client_info = client_manager.get_client_by_ip(client)
+        if client_info:
+            profile_id = client_info.get("profile_id")
+    explanation = get_filter_engine().explain(normalized or domain, filtering_enabled=filtering_on, profile_id=profile_id)
+    explanation.update({
+        "client_ip": client,
+        "client_name": client_info.get("name", client) if client_info else client,
+        "profile_id": profile_id,
+        "profile_name": client_info.get("profile_name", "") if client_info else "",
+        "filtering_enabled": filtering_on,
+    })
+    return explanation
+
+
+def create_rule_from_querylog(form) -> dict:
+    domain = normalize_domain(form.get("domain", ""))
+    action = "allow" if form.get("action") == "allow" else "block"
+    scope = form.get("scope", "global")
+    client_ip = form.get("client", "").strip()
+    profile_id = form.get("profile_id")
+    if not domain:
+        raise ValueError("domain required")
+    now = now_iso()
+    if scope == "global":
+        with db_lock:
+            db.execute(
+                "INSERT INTO rules(scope,client,action,pattern_type,pattern,target,enabled,comment,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("global", "", action, "domain", domain, "", 1, "created from query log", now),
+            )
+            db.commit()
+        invalidate_rules_cache()
+        return {"ok": True, "scope": "global", "action": action, "pattern": domain}
+    if scope == "profile":
+        if client_manager is None:
+            raise ValueError("profiles are not available")
+        if not profile_id and client_ip:
+            client_info = client_manager.get_client_by_ip(client_ip)
+            profile_id = client_info.get("profile_id") if client_info else None
+        if not profile_id:
+            raise ValueError("profile_id required")
+        rule = client_manager.add_profile_rule(int(profile_id), action, "domain", domain)
+        if not rule:
+            raise ValueError("profile not found")
+        return {"ok": True, "scope": "profile", "profile_id": int(profile_id), "action": action, "pattern": domain}
+    if scope == "client":
+        raise ValueError("client-specific rules are not supported by the current filter engine")
+    raise ValueError("invalid scope")
 
 
 def handle_restore_data(data):
@@ -6087,6 +6242,13 @@ class WebHandler(BaseHTTPRequestHandler):
             if w: sql += " WHERE " + " AND ".join(w)
             sql += " ORDER BY id DESC LIMIT 300"
             self.send_json(rows(sql, v))
+        elif path == "/api/explain":
+            domain = params.get("domain", [""])[0]
+            client = params.get("client", ["127.0.0.1"])[0]
+            if not domain:
+                self.send_json({"error": "domain required"}, 400)
+            else:
+                self.send_json(explain_decision(domain, client))
         elif path == "/api/querylog.csv":
             data = rows("SELECT * FROM query_log ORDER BY id DESC LIMIT 5000")
             output = io.StringIO()
@@ -6255,6 +6417,13 @@ class WebHandler(BaseHTTPRequestHandler):
             result = blocklist_manager.update_all()
             log_admin_action(self.session_user(), "blocklist_update_all", "Updated all blocklists", self.client_address[0])
             self.send_json(result)
+        elif path == "/api/querylog/rule-action":
+            try:
+                result = create_rule_from_querylog(form)
+                log_admin_action(self.session_user(), "querylog_rule_action", f"{result['action']} {result['pattern']} scope={result['scope']}", self.client_address[0])
+                self.send_json(result)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, 400)
         elif path == "/api/clients":
             if client_manager is None:
                 self.send_json({"error": "not available"}, 500)
