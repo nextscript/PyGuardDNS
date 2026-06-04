@@ -4762,6 +4762,56 @@ def settings_page(message="", is_error=False, values=None):
 </div>
 
 <script>
+let flUpdatePollTimer = null;
+
+function flEsc(value) {{
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[ch]));
+}}
+
+function renderFilterListUpdateStatus(d) {{
+  const status = document.getElementById('fl-update-status');
+  const results = document.getElementById('fl-update-results');
+  const total = d.total || 0;
+  const idx = d.current_index || 0;
+  const current = d.current_name || '';
+  if (d.running) {{
+    status.textContent = current
+      ? `Updating ${{idx}}/${{total}}: ${{current}}`
+      : `Preparing ${{total}} filter list update${{total === 1 ? '' : 's'}}...`;
+  }} else if (d.status === 'done') {{
+    status.textContent = `Finished. Updated ${{d.results?.length || 0}}/${{total}} filter list${{total === 1 ? '' : 's'}}.`;
+  }} else if (d.status === 'no_lists') {{
+    status.textContent = 'No remote filter lists found.';
+  }} else {{
+    status.textContent = 'Update status: ' + (d.status || 'idle');
+  }}
+  const rows = (d.results || []).map(item => {{
+    const cls = item.status === 'error' ? 'err' : 'ok';
+    const msg = item.status === 'error'
+      ? `${{flEsc(item.name)}}: ${{flEsc(item.error || 'failed')}}`
+      : `${{flEsc(item.name)}}: updated (${{item.rules || 0}} rules)`;
+    return `<div class="modal-result ${{cls}}">${{msg}}</div>`;
+  }}).join('');
+  const pending = d.running && current ? `<div class="modal-result pending">Now: ${{flEsc(current)}}</div>` : '';
+  results.innerHTML = pending + rows;
+}}
+
+async function pollFilterListUpdateStatus() {{
+  try {{
+    const r = await fetch('/api/blocklists/update-status', {{cache:'no-store'}});
+    const d = await r.json();
+    renderFilterListUpdateStatus(d);
+    if (d.running) {{
+      flUpdatePollTimer = setTimeout(pollFilterListUpdateStatus, 900);
+    }} else {{
+      flUpdatePollTimer = null;
+    }}
+  }} catch(e) {{
+    document.getElementById('fl-update-status').textContent = 'Error: ' + e.message;
+    flUpdatePollTimer = null;
+  }}
+}}
+
 async function updateFilterLists() {{
   const modal = document.getElementById('fl-update-modal');
   const status = document.getElementById('fl-update-status');
@@ -4769,10 +4819,21 @@ async function updateFilterLists() {{
   modal.classList.add('show');
   status.textContent = 'Starting...';
   results.innerHTML = '';
+  if (flUpdatePollTimer) {{
+    clearTimeout(flUpdatePollTimer);
+    flUpdatePollTimer = null;
+  }}
   try {{
     const r = await fetch('/api/blocklists/update-all', {{method:'POST'}});
     const d = await r.json();
-    status.textContent = d.status === 'started' ? 'Update started in background.' : 'Finished.';
+    if (d.status === 'already_running') {{
+      status.textContent = 'Update is already running.';
+    }} else if (d.status === 'started') {{
+      status.textContent = `Starting ${{d.count || 0}} filter list update${{d.count === 1 ? '' : 's'}}...`;
+    }} else {{
+      status.textContent = d.status || 'Finished.';
+    }}
+    pollFilterListUpdateStatus();
   }} catch(e) {{
     status.textContent = 'Error: ' + e.message;
   }}
@@ -4901,6 +4962,9 @@ def api_docs_page():
             ("POST", "/api/blocklists/update-all", "Update all remote blocklists.",
              None,
              '{"status": "started", "count": 3}'),
+            ("GET", "/api/blocklists/update-status", "Current background blocklist update progress.",
+             None,
+             '{"running": true, "current_name": "HaGeZi", "current_index": 1, "total": 3, "results": []}'),
             ("POST", "/api/blocklists/delete", "Delete a blocklist and its entries.",
              '{"id": "1"}',
              '{"ok": true}'),
@@ -6268,6 +6332,8 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_json(blocklist_manager.get_all() if blocklist_manager else [])
         elif path == "/api/blocklists/stats":
             self.send_json(blocklist_manager.get_stats() if blocklist_manager else [])
+        elif path == "/api/blocklists/update-status":
+            self.send_json(blocklist_manager.update_status() if blocklist_manager else {"running": False, "status": "not_available"})
         elif path == "/api/clients":
             if client_manager is not None:
                 self.send_json(client_manager.get_clients())
