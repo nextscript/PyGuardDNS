@@ -37,6 +37,8 @@ By default, the application listens on DNS port `53` for UDP/TCP and serves the 
 - Audit log for administrative actions
 - Start scripts for Windows and Linux/macOS
 - CLI commands for status, backup, restore, blocklist updates, and domain testing
+- DNSSEC self-validation with local root trust anchor (SERVFAIL on bogus, AD flag set on valid)
+- Automatic missing dependency detection and installation at startup
 - Benchmark script for generated filter-engine rule sets
 
 ## Requirements
@@ -136,6 +138,12 @@ Example:
 ```http
 GET /api/explain?domain=doubleclick.net&client=192.168.0.80
 ```
+
+### DNSSEC Self-Validation
+
+When enabled, PyGuardDNS validates DNSSEC locally using a root trust anchor loaded from `data/root-anchors.xml` and `data/root.key`. It does not simply trust the upstream resolver's AD flag. The DO bit is set on outgoing queries, the chain of trust is verified from the root down, and signed bogus responses are returned as SERVFAIL. Unsigned delegations are allowed when the missing DS record is proven by the parent zone. Locally generated block, rewrite and SafeSearch responses are not marked as authenticated data. The client's CD (Checking Disabled) flag is respected — validation is skipped when the client sets CD.
+
+If `dnspython` is not installed, DNSSEC validation is automatically disabled and the application continues to run normally. Metrics for secure, insecure, bogus, and indeterminate results are exported via Prometheus.
 
 ### CNAME Blocking
 
@@ -303,12 +311,17 @@ python benchmark_filter_engine.py --rules 100000 --samples 5000
 ```txt
 app.py                    Web UI, DNS server, API, CLI, and runtime
 dns_engine.py             Filter engine for rules, rewrites, SafeSearch, and service blocks
+dnssec_validator.py       DNSSEC chain-of-trust validation and trust anchor store
 blocklist_manager.py      Import, parsing, update, and storage of blocklists
 client_manager.py         Profiles, clients, profile rules, and service blocks
 benchmark_filter_engine.py Synthetic filter-engine benchmark
+data/root-anchors.xml     IANA root trust anchor (KSK key digests and public keys)
+data/root.key             Root DNSKEYs in BIND format (optional override)
 requirements.txt          Runtime Python dependencies
 requirements-dev.txt      Test/development Python dependencies
 start-pyguarddns.bat      Windows start script
 start-pyguarddns.sh       Linux/macOS start script
+tests/                    Pytest test suite
+```
 tests/                    Pytest test suite
 ```
