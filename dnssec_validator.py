@@ -78,6 +78,8 @@ def _ensure_data_files():
             logger.error("Failed to create %s: %s", key_path, e)
 
 
+_ensure_data_files()
+
 _trust_anchor_lock = threading.Lock()
 _trust_anchor_loaded = False
 _trust_anchor_ds_set = None
@@ -163,7 +165,6 @@ class TrustAnchorStore:
 
     def load(self):
         global _trust_anchor_loaded, _trust_anchor_ds_set, _trust_anchor_dnskey_set, _trust_anchor_error
-        _ensure_data_files()
         with _trust_anchor_lock:
             if _trust_anchor_loaded:
                 return True, _trust_anchor_error
