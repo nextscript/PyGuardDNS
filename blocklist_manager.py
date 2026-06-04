@@ -392,6 +392,18 @@ class BlocklistManager:
         self.db = db
         self.reload_callback = reload_callback
         self._update_lock = threading.Lock()
+        self._status_lock = threading.Lock()
+        self._update_status = {
+            "running": False,
+            "status": "idle",
+            "total": 0,
+            "current_index": 0,
+            "current_id": None,
+            "current_name": "",
+            "results": [],
+            "started_at": "",
+            "finished_at": "",
+        }
 
     def init_schema(self):
         self.db.executescript(SCHEMA_SQL)
@@ -501,21 +513,90 @@ class BlocklistManager:
         lists = self.get_all()
         urls = [bl for bl in lists if bl["url"].startswith(("http://", "https://"))]
         if not urls:
+            self._set_update_status({
+                "running": False,
+                "status": "no_lists",
+                "total": 0,
+                "current_index": 0,
+                "current_id": None,
+                "current_name": "",
+                "results": [],
+                "started_at": now_iso(),
+                "finished_at": now_iso(),
+            })
             return {"status": "no_lists", "updated": 0}
 
         def _do_all():
-            for bl in urls:
+            self._set_update_status({
+                "running": True,
+                "status": "running",
+                "total": len(urls),
+                "current_index": 0,
+                "current_id": None,
+                "current_name": "",
+                "results": [],
+                "started_at": now_iso(),
+                "finished_at": "",
+            })
+            for idx, bl in enumerate(urls, 1):
+                self._set_update_status({
+                    "running": True,
+                    "status": "running",
+                    "current_index": idx,
+                    "current_id": bl["id"],
+                    "current_name": bl.get("name", "") or f"ID {bl['id']}",
+                })
                 try:
                     self.update(bl["id"], background=False)
-                except Exception:
-                    pass
+                    updated = self._get(bl["id"]) or {}
+                    last_error = updated.get("last_error", "")
+                    result = {
+                        "id": bl["id"],
+                        "name": bl.get("name", "") or f"ID {bl['id']}",
+                        "status": "error" if last_error else "done",
+                        "error": last_error,
+                        "rules": updated.get("rule_count", bl.get("rule_count", 0)),
+                    }
+                except Exception as exc:
+                    result = {
+                        "id": bl["id"],
+                        "name": bl.get("name", "") or f"ID {bl['id']}",
+                        "status": "error",
+                        "error": str(exc),
+                        "rules": bl.get("rule_count", 0),
+                    }
+                self._append_update_result(result)
+            self._set_update_status({
+                "running": False,
+                "status": "done",
+                "current_id": None,
+                "current_name": "",
+                "finished_at": now_iso(),
+            })
 
         if background:
+            current = self.update_status()
+            if current.get("running"):
+                return {"status": "already_running", "count": current.get("total", 0)}
             threading.Thread(target=_do_all, name="bl-update-all", daemon=True).start()
             return {"status": "started", "count": len(urls)}
-        for bl in urls:
-            self.update(bl["id"], background=False)
-        return {"status": "done", "updated": len(urls)}
+        _do_all()
+        status = self.update_status()
+        return {"status": "done", "updated": len(status.get("results", [])), "results": status.get("results", [])}
+
+    def update_status(self) -> dict:
+        with self._status_lock:
+            status = dict(self._update_status)
+            status["results"] = [dict(item) for item in self._update_status.get("results", [])]
+            return status
+
+    def _set_update_status(self, updates: dict) -> None:
+        with self._status_lock:
+            self._update_status.update(updates)
+
+    def _append_update_result(self, result: dict) -> None:
+        with self._status_lock:
+            self._update_status.setdefault("results", []).append(result)
 
     def update_metadata(self, list_id: int, name: str, url: str, list_type: str) -> bool:
         item = self._get(list_id)
