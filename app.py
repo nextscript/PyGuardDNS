@@ -43,6 +43,7 @@ ENCRYPTED_DNS_HOST = os.environ.get("LOCALDNSGUARD_ENCRYPTED_DNS_HOST", DNS_HOST
 ENCRYPTED_DNS_DOMAIN = os.environ.get("LOCALDNSGUARD_ENCRYPTED_DNS_DOMAIN", "")
 DNS_TLS_PORT = int(os.environ.get("LOCALDNSGUARD_DNS_TLS_PORT", "853"))
 DNS_QUIC_PORT = int(os.environ.get("LOCALDNSGUARD_DNS_QUIC_PORT", "853"))
+DNS_HTTPS_PORT = int(os.environ.get("LOCALDNSGUARD_DNS_HTTPS_PORT", "443"))
 STRICT_DNS_PORT = os.environ.get("LOCALDNSGUARD_STRICT_DNS_PORT", "0") == "1"
 DEFAULT_UPSTREAM = "tls://cloudflare-dns.com"
 BOOT_TIME = time.time()
@@ -347,6 +348,7 @@ def init_db():
                 status TEXT NOT NULL,
                 response_ips TEXT NOT NULL DEFAULT '',
                 upstream TEXT NOT NULL DEFAULT '',
+                connection_type TEXT NOT NULL DEFAULT '',
                 matched_rule TEXT NOT NULL DEFAULT '',
                 cache_status TEXT NOT NULL DEFAULT 'miss',
                 blocked INTEGER NOT NULL DEFAULT 0,
@@ -394,8 +396,11 @@ def init_db():
             "cache_min_ttl": "0",
             "cache_max_ttl": "0",
             "cache_optimistic": "0",
+            "disable_ipv6": "0",
             "upstream_mode": "sequential",
+            "upstream_timeout": "2.5",
             "block_mode": "zero_ip",
+            "block_response_ttl": "60",
             "custom_block_ipv4": "0.0.0.0",
             "custom_block_ipv6": "::",
             "lan_only": "1",
@@ -413,6 +418,8 @@ def init_db():
             "encrypted_dns_domain": ENCRYPTED_DNS_DOMAIN,
             "dns_over_tls_enabled": "0",
             "dns_over_tls_port": str(DNS_TLS_PORT),
+            "dns_over_https_enabled": "0",
+            "dns_over_https_port": str(DNS_HTTPS_PORT),
             "dns_over_quic_enabled": "0",
             "dns_over_quic_port": str(DNS_QUIC_PORT),
             "encrypted_dns_certificate_pem": "",
@@ -477,6 +484,7 @@ MIGRATIONS = [
         _ensure_column("query_log", "client_name", "TEXT NOT NULL DEFAULT ''"),
         _ensure_column("query_log", "profile_name", "TEXT NOT NULL DEFAULT ''"),
     )),
+    (10, "add connection_type to query_log", lambda: _ensure_column("query_log", "connection_type", "TEXT NOT NULL DEFAULT ''")),
     (7, "migrate clients to profile schema", lambda: _migrate_clients_table()),
     (8, "add upstream_health columns", lambda: (
         _ensure_column("upstreams", "latency_ms", "REAL"),
@@ -631,6 +639,16 @@ def parse_port(value, default, name):
     return port
 
 
+def parse_positive_float(value, default, name):
+    try:
+        number = float(str(value).strip())
+    except ValueError:
+        raise ValueError(f"{name} must be a number")
+    if number <= 0:
+        raise ValueError(f"{name} must be greater than 0")
+    return number
+
+
 def certificate_matches_name(cert, server_name):
     server_name = (server_name or "").strip().lower().rstrip(".")
     if not server_name:
@@ -700,6 +718,7 @@ def encrypted_dns_readiness():
     cert = get_setting("encrypted_dns_certificate_pem", "")
     key = get_setting("encrypted_dns_private_key_pem", "")
     tls_enabled = get_setting("dns_over_tls_enabled", "0") == "1"
+    https_enabled = get_setting("dns_over_https_enabled", "0") == "1"
     quic_enabled = get_setting("dns_over_quic_enabled", "0") == "1"
     issues = []
     if not domain:
@@ -708,7 +727,7 @@ def encrypted_dns_readiness():
         issues.append("Certificate PEM is not set")
     if not key.strip():
         issues.append("Private Key PEM is not set")
-    if (tls_enabled or quic_enabled) and cert.strip() and key.strip():
+    if (tls_enabled or https_enabled or quic_enabled) and cert.strip() and key.strip():
         try:
             validate_certificate_pair(cert, key, domain)
         except Exception as exc:
@@ -716,6 +735,7 @@ def encrypted_dns_readiness():
     return {
         "domain": domain,
         "tls_enabled": tls_enabled,
+        "https_enabled": https_enabled,
         "quic_enabled": quic_enabled,
         "certificate_configured": bool(cert.strip()),
         "private_key_configured": bool(key.strip()),
@@ -726,15 +746,18 @@ def encrypted_dns_readiness():
 
 def encrypted_dns_runtime_state():
     tls_running = False
+    https_running = False
     quic_running = False
     for srv in encrypted_dns_servers:
         if isinstance(srv, DoQRuntimeServer):
             quic_running = srv.thread is not None and srv.thread.is_alive() and srv.error is None
+        elif isinstance(srv, ReusableThreadingHTTPSServer):
+            https_running = True
         elif isinstance(srv, ReusableThreadingTLSDNSServer):
             tls_running = True
     with doq_metrics_lock:
         metrics = dict(doq_metrics)
-    return {"tls_running": tls_running, "quic_running": quic_running, "doq_metrics": metrics}
+    return {"tls_running": tls_running, "https_running": https_running, "quic_running": quic_running, "doq_metrics": metrics}
 
 
 def update_doq_metric(key, value=None):
@@ -795,7 +818,7 @@ def make_encrypted_dns_ssl_context():
 
 
 def load_runtime_network_settings():
-    global WEB_HOST, WEB_PORT, DNS_HOST, DNS_PORT, ENCRYPTED_DNS_HOST, ENCRYPTED_DNS_DOMAIN, DNS_TLS_PORT, DNS_QUIC_PORT
+    global WEB_HOST, WEB_PORT, DNS_HOST, DNS_PORT, ENCRYPTED_DNS_HOST, ENCRYPTED_DNS_DOMAIN, DNS_TLS_PORT, DNS_QUIC_PORT, DNS_HTTPS_PORT
     WEB_HOST = get_setting("localdnsguard_web_host", WEB_HOST).strip() or "0.0.0.0"
     WEB_PORT = parse_port(get_setting("localdnsguard_web_port", WEB_PORT), WEB_PORT, "Web port")
     DNS_HOST = get_setting("localdnsguard_dns_host", DNS_HOST).strip() or "0.0.0.0"
@@ -803,6 +826,7 @@ def load_runtime_network_settings():
     ENCRYPTED_DNS_HOST = get_setting("encrypted_dns_host", DNS_HOST).strip() or DNS_HOST
     ENCRYPTED_DNS_DOMAIN = get_setting("encrypted_dns_domain", ENCRYPTED_DNS_DOMAIN).strip()
     DNS_TLS_PORT = parse_port(get_setting("dns_over_tls_port", DNS_TLS_PORT), DNS_TLS_PORT, "DNS-over-TLS port")
+    DNS_HTTPS_PORT = parse_port(get_setting("dns_over_https_port", DNS_HTTPS_PORT), DNS_HTTPS_PORT, "DNS-over-HTTPS port")
     DNS_QUIC_PORT = parse_port(get_setting("dns_over_quic_port", DNS_QUIC_PORT), DNS_QUIC_PORT, "DNS-over-QUIC port")
 
 
@@ -1068,6 +1092,13 @@ def build_ip_response(request, ip_text, ttl=60):
     return header + question_part + answer
 
 
+def block_response_ttl():
+    try:
+        return max(0, int(get_setting("block_response_ttl", "60") or "60"))
+    except ValueError:
+        return 60
+
+
 def build_block_response(request, qtype_name=None):
     mode = get_setting("block_mode", "zero_ip")
     if mode == "refused":
@@ -1084,7 +1115,79 @@ def build_block_response(request, qtype_name=None):
         ip = get_setting("custom_block_ipv6", "::") if qtype_name == "AAAA" else get_setting("custom_block_ipv4", "0.0.0.0")
     else:
         ip = "::" if qtype_name == "AAAA" else "0.0.0.0"
-    return build_ip_response(request, ip)
+    return build_ip_response(request, ip, ttl=block_response_ttl())
+
+
+def strip_svcb_ipv6hint_rdata(packet, rdata):
+    try:
+        if len(rdata) < 3:
+            return rdata
+        priority = rdata[:2]
+        offset = 2
+        while offset < len(rdata):
+            length = rdata[offset]
+            offset += 1
+            if length == 0:
+                break
+            if offset + length > len(rdata):
+                return rdata
+            offset += length
+        params = rdata[offset:]
+        out_params = b""
+        p = 0
+        while p + 4 <= len(params):
+            key, value_len = struct.unpack("!HH", params[p : p + 4])
+            p += 4
+            value = params[p : p + value_len]
+            if len(value) != value_len:
+                return rdata
+            p += value_len
+            if key != 6:
+                out_params += struct.pack("!HH", key, value_len) + value
+        if p != len(params):
+            return rdata
+        return priority + rdata[2:offset] + out_params
+    except Exception:
+        return rdata
+
+
+def apply_ipv6_disabled_policy(response):
+    if get_setting("disable_ipv6", "0") != "1":
+        return response
+    try:
+        question = parse_dns_question(response)
+        if question["qtype_name"] == "AAAA":
+            return build_empty_response(response)
+        counts = list(struct.unpack("!HHHH", response[4:12]))
+        total_rrs = counts[1] + counts[2] + counts[3]
+        offset = question["question_end"]
+        rebuilt = bytearray(response[:offset])
+        changed = False
+        for _ in range(total_rrs):
+            rr_start = offset
+            _, offset = parse_qname(response, offset)
+            if offset + 10 > len(response):
+                return response
+            rtype, rclass, ttl, rdlen = struct.unpack("!HHIH", response[offset : offset + 10])
+            header_start = offset
+            rdata_start = offset + 10
+            rdata_end = rdata_start + rdlen
+            if rdata_end > len(response):
+                return response
+            rdata = response[rdata_start:rdata_end]
+            new_rdata = rdata
+            if rtype in (QTYPE_CODE["HTTPS"], QTYPE_CODE["SVCB"]):
+                new_rdata = strip_svcb_ipv6hint_rdata(response, rdata)
+                changed = changed or new_rdata != rdata
+            rebuilt += response[rr_start:header_start]
+            rebuilt += struct.pack("!HHIH", rtype, rclass, ttl, len(new_rdata))
+            rebuilt += new_rdata
+            offset = rdata_end
+        if offset != len(response):
+            rebuilt += response[offset:]
+        return bytes(rebuilt) if changed else response
+    except Exception:
+        return response
 
 
 def is_lan_allowed(client_ip):
@@ -1351,17 +1454,36 @@ def read_http_response(conn, max_bytes=65_536):
     if "transfer-encoding: chunked" in header_text.lower():
         decoded = b""
         rest = body
-        while rest:
+        while len(data) < max_bytes:
+            while b"\r\n" not in rest and len(data) < max_bytes:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                rest += chunk
+                data += chunk
             size_line, _, rest = rest.partition(b"\r\n")
             if not size_line:
                 break
             size = int(size_line.split(b";", 1)[0], 16)
             if size == 0:
                 break
+            while len(rest) < size + 2 and len(data) < max_bytes:
+                chunk = conn.recv(min(65536, size + 2 - len(rest)))
+                if not chunk:
+                    break
+                rest += chunk
+                data += chunk
+            if len(rest) < size:
+                break
             decoded += rest[:size]
             rest = rest[size + 2 :]
         return decoded
     return body
+
+
+def doh_authority(host, port):
+    display_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return display_host if int(port) == 443 else f"{display_host}:{int(port)}"
 
 
 def doh_request_parts(resolver):
@@ -1393,6 +1515,7 @@ def resolve_upstream_host(host):
 
 def query_doh_upstream(upstream, request, timeout=4.0):
     host, port, path = doh_request_parts(upstream["resolver"])
+    authority = doh_authority(host, port)
     ips = resolve_upstream_host(host)
     last_error = None
     for i, ip in enumerate(ips[:4]):
@@ -1408,7 +1531,7 @@ def query_doh_upstream(upstream, request, timeout=4.0):
                 with conn:
                     http_request = (
                         f"POST {path} HTTP/1.1\r\n"
-                        f"Host: {host}\r\n"
+                        f"Host: {authority}\r\n"
                         "User-Agent: PyGuardDNS/0.1\r\n"
                         "Accept: application/dns-message\r\n"
                         "Content-Type: application/dns-message\r\n"
@@ -2214,7 +2337,7 @@ def detect_upstream(resolver):
         "type": "plain_udp_host",
         "transport": "udp",
         "supported": True,
-        "label": "Normales DNS over UDP (Hostname)",
+        "label": "Regular DNS over UDP (hostname)",
     }
 
     if lower.startswith("sdns://"):
@@ -2291,9 +2414,9 @@ def detect_upstream(resolver):
                 result.update({"address": host, "port": port, "type": resolver_type, "transport": transport, "supported": True, "label": label})
             else:
                 host, port = split_host_port(rest.split("/", 1)[0], default_port)
-                suffix = " (mit Port)" if ":" in rest and not rest.startswith("[") else ""
+                suffix = " (with port)" if ":" in rest and not rest.startswith("[") else ""
                 if not looks_like_ip(host):
-                    suffix = " (Hostname)"
+                    suffix = " (hostname)"
                 supported = resolver_type in ("plain_udp", "plain_tcp", "dot")
                 if resolver_type == "doq":
                     label += " (experimental, disabled by default)"
@@ -2607,27 +2730,24 @@ def forward_query(request):
 
 def _query_one_upstream(upstream, request, update_metrics=True, timeout_override=None):
     start = time.perf_counter()
-    doh_timeout = timeout_override or 2.0
-    doh3_timeout = timeout_override or 3.0
-    dot_timeout = timeout_override or 2.0
-    dnscrypt_timeout = timeout_override or 3.0
-    plain_timeout = timeout_override or 2.5
+    configured_timeout = parse_positive_float(get_setting("upstream_timeout", "2.5"), 2.5, "Upstream timeout")
+    timeout = timeout_override or configured_timeout
     if upstream.get("resolver_type") == "doh":
-        response = query_doh_upstream(upstream, request, timeout=doh_timeout)
+        response = query_doh_upstream(upstream, request, timeout=timeout)
     elif upstream.get("resolver_type") == "doh_stamp":
-        response = query_doh_stamp_upstream(upstream, request, timeout=doh_timeout)
+        response = query_doh_stamp_upstream(upstream, request, timeout=timeout)
     elif upstream.get("resolver_type") == "doh_http3":
-        response = query_doh_http3_upstream(upstream, request, timeout=doh3_timeout)
+        response = query_doh_http3_upstream(upstream, request, timeout=timeout)
     elif upstream.get("resolver_type") == "dot":
-        response = query_dot_upstream(upstream, request, timeout=dot_timeout)
+        response = query_dot_upstream(upstream, request, timeout=timeout)
     elif upstream.get("resolver_type") == "doq":
         raise OSError("DoQ upstream forwarding is experimental and disabled by default")
     elif upstream.get("resolver_type") == "dnscrypt_stamp":
-        response = query_dnscrypt_upstream(upstream, request, timeout=dnscrypt_timeout)
+        response = query_dnscrypt_upstream(upstream, request, timeout=timeout)
     elif upstream.get("resolver_type") in ("dns_stamp_unknown", "plain_dns_stamp"):
-        response = query_dns_stamp_unknown_upstream(upstream, request, timeout=dnscrypt_timeout)
+        response = query_dns_stamp_unknown_upstream(upstream, request, timeout=timeout)
     else:
-        response = query_plain_upstream(upstream, request, timeout=plain_timeout)
+        response = query_plain_upstream(upstream, request, timeout=timeout)
     latency = (time.perf_counter() - start) * 1000
     if update_metrics:
         maybe_update_upstream_status(upstream, latency=latency, error="")
@@ -2752,13 +2872,13 @@ def extract_response_ips(response):
     return ",".join(ips)
 
 
-def log_query(client_ip, domain, normalized, qtype_name, status, response_ips="", upstream="", matched_rule="", cache_status="miss", blocked=0, reason="", duration_ms=0, matched_list="", client_name="", profile_name=""):
+def log_query(client_ip, domain, normalized, qtype_name, status, response_ips="", upstream="", matched_rule="", cache_status="miss", blocked=0, reason="", duration_ms=0, matched_list="", client_name="", profile_name="", connection_type=""):
     if get_setting("query_log_enabled", "1") != "1":
         return
     with db_write_lock:
         if len(db_write_queue) >= 20000:
             return
-        db_write_queue.append((now_iso(), client_ip or "", domain or "", normalized or "", qtype_name or "", status or "", response_ips or "", upstream or "", matched_rule or "", cache_status or "miss", blocked or 0, reason or "", matched_list or "", duration_ms or 0, client_name or "", profile_name or ""))
+        db_write_queue.append((now_iso(), client_ip or "", domain or "", normalized or "", qtype_name or "", status or "", response_ips or "", upstream or "", connection_type or "", matched_rule or "", cache_status or "miss", blocked or 0, reason or "", matched_list or "", duration_ms or 0, client_name or "", profile_name or ""))
 
 
 def db_writer_loop():
@@ -2774,13 +2894,13 @@ def db_writer_loop():
         try:
             with db_lock:
                 batch = [
-                    tuple((0 if idx in (10, 13) else "") if value is None else value for idx, value in enumerate(item))
+                    tuple((0 if idx in (11, 14) else "") if value is None else value for idx, value in enumerate(item))
                     for item in batch
                 ]
                 db.executemany(
                     """
-                    INSERT INTO query_log(timestamp,client_ip,domain,normalized_domain,query_type,status,response_ips,upstream,matched_rule,cache_status,blocked,blocked_reason,matched_list,duration_ms,client_name,profile_name)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    INSERT INTO query_log(timestamp,client_ip,domain,normalized_domain,query_type,status,response_ips,upstream,connection_type,matched_rule,cache_status,blocked,blocked_reason,matched_list,duration_ms,client_name,profile_name)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     batch,
                 )
@@ -2820,21 +2940,21 @@ def db_maintenance_loop():
         time.sleep(3600)
 
 
-def log_query_sync(client_ip, domain, normalized, qtype_name, status, response_ips="", upstream="", matched_rule="", cache_status="miss", blocked=0, reason="", duration_ms=0, matched_list="", client_name="", profile_name=""):
+def log_query_sync(client_ip, domain, normalized, qtype_name, status, response_ips="", upstream="", matched_rule="", cache_status="miss", blocked=0, reason="", duration_ms=0, matched_list="", client_name="", profile_name="", connection_type=""):
     if get_setting("query_log_enabled", "1") != "1":
         return
     with db_lock:
         db.execute(
             """
-            INSERT INTO query_log(timestamp,client_ip,domain,normalized_domain,query_type,status,response_ips,upstream,matched_rule,cache_status,blocked,blocked_reason,matched_list,duration_ms,client_name,profile_name)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO query_log(timestamp,client_ip,domain,normalized_domain,query_type,status,response_ips,upstream,connection_type,matched_rule,cache_status,blocked,blocked_reason,matched_list,duration_ms,client_name,profile_name)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
-            (now_iso(), client_ip, domain, normalized, qtype_name, status, response_ips, upstream, matched_rule, cache_status, blocked, reason, matched_list, duration_ms, client_name, profile_name),
+            (now_iso(), client_ip, domain, normalized, qtype_name, status, response_ips, upstream, connection_type, matched_rule, cache_status, blocked, reason, matched_list, duration_ms, client_name, profile_name),
         )
         db.commit()
 
 
-def handle_dns_request(request, client_ip):
+def handle_dns_request(request, client_ip, connection_type=""):
     started = time.perf_counter()
     ensure_client(client_ip)
     client_info = client_manager.get_client_by_ip(client_ip) if client_manager else None
@@ -2846,9 +2966,14 @@ def handle_dns_request(request, client_ip):
         normalized = question["normalized_domain"]
         qtype_name = question["qtype_name"]
 
+        if get_setting("disable_ipv6", "0") == "1" and qtype_name == "AAAA":
+            response = build_empty_response(request)
+            log_query(client_ip, domain, normalized, qtype_name, "blocked", matched_rule="ipv6 disabled", blocked=1, reason="ipv6_disabled", duration_ms=(time.perf_counter() - started) * 1000, client_name=client_log_name, profile_name=client_profile_name, connection_type=connection_type)
+            return response
+
         if is_local_reverse_lookup(normalized, qtype_name):
             response = build_empty_response(request)
-            log_query(client_ip, domain, normalized, qtype_name, "local", matched_rule="local reverse", cache_status="local", reason="local reverse lookup", duration_ms=(time.perf_counter() - started) * 1000, client_name=client_log_name, profile_name=client_profile_name)
+            log_query(client_ip, domain, normalized, qtype_name, "local", matched_rule="local reverse", cache_status="local", reason="local reverse lookup", duration_ms=(time.perf_counter() - started) * 1000, client_name=client_log_name, profile_name=client_profile_name, connection_type=connection_type)
             return response
 
         decision = decide(normalized, qtype_name, client_ip)
@@ -2857,29 +2982,31 @@ def handle_dns_request(request, client_ip):
 
         if decision["action"] == "refuse":
             response = build_error_response(request, 5)
-            log_query(client_ip, domain, normalized, qtype_name, "refused", matched_rule=decision["rule"], blocked=1, reason=decision["reason"], duration_ms=(time.perf_counter() - started) * 1000, matched_list=decision.get("filter_list", ""), client_name=dc, profile_name=dp)
+            log_query(client_ip, domain, normalized, qtype_name, "refused", matched_rule=decision["rule"], blocked=1, reason=decision["reason"], duration_ms=(time.perf_counter() - started) * 1000, matched_list=decision.get("filter_list", ""), client_name=dc, profile_name=dp, connection_type=connection_type)
             return response
         if decision["action"] == "block":
             response = build_block_response(request, qtype_name)
-            log_query(client_ip, domain, normalized, qtype_name, "blocked", matched_rule=decision["rule"], blocked=1, reason=decision["reason"], duration_ms=(time.perf_counter() - started) * 1000, matched_list=decision.get("filter_list", ""), client_name=dc, profile_name=dp)
+            log_query(client_ip, domain, normalized, qtype_name, "blocked", matched_rule=decision["rule"], blocked=1, reason=decision["reason"], duration_ms=(time.perf_counter() - started) * 1000, matched_list=decision.get("filter_list", ""), client_name=dc, profile_name=dp, connection_type=connection_type)
             return response
         if decision["action"] == "rewrite":
             response = build_ip_response(request, decision["target"])
-            log_query(client_ip, domain, normalized, qtype_name, "rewritten", response_ips=decision["target"], matched_rule=decision["rule"], reason=decision["reason"], duration_ms=(time.perf_counter() - started) * 1000, matched_list=decision.get("filter_list", ""), client_name=dc, profile_name=dp)
+            log_query(client_ip, domain, normalized, qtype_name, "rewritten", response_ips=decision["target"], matched_rule=decision["rule"], reason=decision["reason"], duration_ms=(time.perf_counter() - started) * 1000, matched_list=decision.get("filter_list", ""), client_name=dc, profile_name=dp, connection_type=connection_type)
             return response
 
         if is_local_nodata_query(qtype_name):
             response = build_empty_response(request)
-            log_query(client_ip, domain, normalized, qtype_name, "local", matched_rule="local nodata", cache_status="local", reason="local no data", duration_ms=(time.perf_counter() - started) * 1000, client_name=dc, profile_name=dp)
+            log_query(client_ip, domain, normalized, qtype_name, "local", matched_rule="local nodata", cache_status="local", reason="local no data", duration_ms=(time.perf_counter() - started) * 1000, client_name=dc, profile_name=dp, connection_type=connection_type)
             return response
 
         cached = get_cached(normalized, qtype_name)
         if cached:
             cached = request[:2] + cached[2:]
-            log_query(client_ip, domain, normalized, qtype_name, "cached", response_ips=extract_response_ips(cached), cache_status="hit", duration_ms=(time.perf_counter() - started) * 1000, client_name=dc, profile_name=dp)
+            cached = apply_ipv6_disabled_policy(cached)
+            log_query(client_ip, domain, normalized, qtype_name, "cached", response_ips=extract_response_ips(cached), cache_status="hit", duration_ms=(time.perf_counter() - started) * 1000, client_name=dc, profile_name=dp, connection_type=connection_type)
             return cached
 
         response, upstream = forward_query(request)
+        response = apply_ipv6_disabled_policy(response)
         filtering_on = get_setting("filtering_enabled", "1") == "1" and client_filtering_enabled(client_ip)
         profile_id = decision.get("profile_id")
         engine = get_filter_engine()
@@ -2892,15 +3019,15 @@ def handle_dns_request(request, client_ip):
                           matched_rule=matched, blocked=1, reason="cname_blocked",
                           duration_ms=(time.perf_counter() - started) * 1000,
                           matched_list=cname_result.list_name or cname_result.matched_list or "",
-                          client_name=dc, profile_name=dp)
+                          client_name=dc, profile_name=dp, connection_type=connection_type)
                 return blocked_response
         set_cached(normalized, qtype_name, response)
-        log_query(client_ip, domain, normalized, qtype_name, "allowed", response_ips=extract_response_ips(response), upstream=upstream, duration_ms=(time.perf_counter() - started) * 1000, client_name=dc, profile_name=dp)
+        log_query(client_ip, domain, normalized, qtype_name, "allowed", response_ips=extract_response_ips(response), upstream=upstream, duration_ms=(time.perf_counter() - started) * 1000, client_name=dc, profile_name=dp, connection_type=connection_type)
         return response
     except Exception as exc:
         try:
             question = parse_dns_question(request)
-            log_query(client_ip, question["domain"], question["normalized_domain"], question["qtype_name"], "upstream_error", reason=str(exc), duration_ms=(time.perf_counter() - started) * 1000, client_name=client_log_name, profile_name=client_profile_name)
+            log_query(client_ip, question["domain"], question["normalized_domain"], question["qtype_name"], "upstream_error", reason=str(exc), duration_ms=(time.perf_counter() - started) * 1000, client_name=client_log_name, profile_name=client_profile_name, connection_type=connection_type)
         except Exception:
             pass
         return build_error_response(request, 2)
@@ -2952,10 +3079,83 @@ class ReusableThreadingTLSDNSServer(ReusableThreadingTCPServer):
             raise
 
 
+class ReusableThreadingHTTPSServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+
+    def __init__(self, server_address, handler_class, ssl_context):
+        self.ssl_context = ssl_context
+        super().__init__(server_address, handler_class)
+
+    def get_request(self):
+        sock, addr = super().get_request()
+        try:
+            return self.ssl_context.wrap_socket(sock, server_side=True), addr
+        except Exception:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            raise
+
+
+def send_doh_response(handler, params=None):
+    try:
+        if handler.command == "GET":
+            dns_param = (params or {}).get("dns", [""])[0]
+            if not dns_param:
+                handler.send_error(400, "missing dns query parameter")
+                return
+            padded = dns_param + ("=" * (-len(dns_param) % 4))
+            request = base64.urlsafe_b64decode(padded.encode("ascii"))
+        else:
+            length = int(handler.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 65535:
+                handler.send_error(400, "invalid DNS message length")
+                return
+            request = handler.rfile.read(length)
+        response = handle_dns_request(request, handler.client_address[0], "doh")
+        if response is None:
+            handler.send_error(502, "DNS query failed")
+            return
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/dns-message")
+        handler.send_header("Content-Length", str(len(response)))
+        handler.send_header("Cache-Control", "no-store")
+        handler.end_headers()
+        handler.wfile.write(response)
+    except Exception as exc:
+        handler.send_error(400, str(exc))
+
+
+class DNSHTTPSHandler(BaseHTTPRequestHandler):
+    server_version = f"{APP_NAME}-DoH/0.1"
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path != "/dns-query":
+            self.send_error(404)
+            return
+        send_doh_response(self, parse_qs(urlparse(self.path).query))
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path != "/dns-query":
+            self.send_error(404)
+            return
+        send_doh_response(self)
+
+    def log_message(self, fmt, *args):
+        try:
+            with open("web-error.log", "a", encoding="utf-8") as log:
+                log.write(f"{now_iso()} [doh] {self.address_string()} {fmt % args}\n")
+        except Exception:
+            pass
+
+
 class DNSUDPHandler(socketserver.BaseRequestHandler):
     def handle(self):
         data, sock = self.request
-        response = handle_dns_request(data, self.client_address[0])
+        response = handle_dns_request(data, self.client_address[0], "udp")
         if response is not None:
             sock.sendto(response, self.client_address)
 
@@ -2986,7 +3186,8 @@ class DNSTCPHandler(socketserver.BaseRequestHandler):
                 data = recv_exact(self.request, length)
                 if not data:
                     return
-                response = handle_dns_request(data, self.client_address[0])
+                connection_type = "dot" if isinstance(self.server, ReusableThreadingTLSDNSServer) else "tcp"
+                response = handle_dns_request(data, self.client_address[0], connection_type)
                 if response is not None:
                     self.request.sendall(struct.pack("!H", len(response)) + response)
             except socket.timeout:
@@ -3057,6 +3258,12 @@ def template(content, title="Dashboard"):
     .sys-status{{margin-top:auto;padding:.8rem 1.1rem;border-top:1px solid var(--border)}}
     .sys-row{{display:flex;align-items:center;gap:.4rem;font-size:.82rem;color:var(--muted2);margin-bottom:.25rem}}
     .dot-status{{width:8px;height:8px;border-radius:50%;background:var(--green);flex-shrink:0;box-shadow:0 0 5px var(--green)}}
+    .setup-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}}
+    .setup-card{{background:var(--card);border:1px solid var(--border);border-radius:.6rem;padding:1rem;min-width:0}}
+    .setup-card-title{{font-size:.95rem;font-weight:800;margin-bottom:.25rem}}
+    .setup-card-text{{font-size:.86rem;color:var(--muted2);margin-bottom:.75rem}}
+    .setup-endpoint{{display:block;background:#0b1220;border:1px solid var(--border);border-radius:.45rem;padding:.55rem .7rem;margin:.45rem 0;color:var(--text);font:700 .86rem/1.35 ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace;overflow-wrap:anywhere;word-break:break-word}}
+    .setup-muted{{color:var(--muted2);font-size:.82rem}}
     .card-grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;margin-bottom:1.3rem}}
     .stat-card{{background:var(--card);border:1px solid var(--border);border-radius:.6rem;padding:1.1rem 1.2rem .9rem}}
     .card-label{{font-size:.78rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:.35rem}}
@@ -3169,6 +3376,7 @@ def template(content, title="Dashboard"):
       .sys-status{{display:block}}
       body.nav-open{{overflow:hidden}}
       .card-grid{{grid-template-columns:1fr 1fr}}
+      .setup-grid{{grid-template-columns:1fr}}
       .three-col{{grid-template-columns:1fr;gap:.75rem;margin-bottom:1rem;width:100%}}
       .three-col table{{width:100%;max-width:100%;min-width:0}}
       .three-col .td-num{{width:82px}}
@@ -3267,6 +3475,7 @@ def template(content, title="Dashboard"):
   {nav_item("/clients", "Clients", icon_clients(), title)}
   {nav_item("/upstreams", "Upstreams", icon_upstream(), title)}
   {nav_item("/cache", "Cache", icon_cache(), title)}
+  {nav_item("/setup-wizard", "Setup Wizard", icon_settings(), title)}
   {nav_item("/settings", "Settings", icon_settings(), title)}
   {nav_item("/api-docs", "API", icon_api(), title)}
   {nav_item("/domain-test", "Domain Test", icon_search(), title)}
@@ -3393,7 +3602,7 @@ def nav_item(path, label, icon="", current_title=""):
         "Dashboard": "/", "Query Log": "/querylog",
         "Blocklists": "/blocklists", "Rules": "/rules",
         "DNS Rewrites": "/rewrites", "Clients": "/clients", "Profiles": "/profiles", "Upstreams": "/upstreams", "Cache": "/cache",
-        "Settings": "/settings", "API": "/api-docs", "Domain Test": "/domain-test",
+        "Setup Wizard": "/setup-wizard", "Settings": "/settings", "API": "/api-docs", "Domain Test": "/domain-test",
     }
     active = " active" if _map.get(current_title) == path else ""
     return f'<a class="nav-link{active}" href="{path}">{icon}<span>{label}</span></a>'
@@ -3858,7 +4067,7 @@ def querylog_page(params):
             f"<button class='btn btn-outline-light' onclick=\"qlRuleAction('{domain}','{action}','profile','{client}','')\" {'disabled' if not profile_name else ''}>{label} Profile</button>"
             f"</div>"
         )
-    body = "".join(f"<tr><td data-label='Time'>{r['timestamp']}</td><td data-label='Client'>{r['client_ip']}</td><td data-label='Domain' class='td-domain'>{r['domain']}</td><td data-label='Type'>{r['query_type']}</td><td data-label='Status'>{badge(r['status'])}</td><td data-label='Rule'>{r['matched_rule']}</td><td data-label='List'>{r.get('matched_list','')}</td><td data-label='Upstream'>{r['upstream']}</td><td data-label='ms'>{r['duration_ms']:.1f}</td><td data-label='Actions'>{ql_actions(r)}</td></tr>" for r in data)
+    body = "".join(f"<tr><td data-label='Time'>{r['timestamp']}</td><td data-label='Client'>{r['client_ip']}</td><td data-label='Connect'>{r.get('connection_type','') or 'dns'}</td><td data-label='Domain' class='td-domain'>{r['domain']}</td><td data-label='Type'>{r['query_type']}</td><td data-label='Status'>{badge(r['status'])}</td><td data-label='Upstream'>{r['upstream']}</td><td data-label='ms'>{r['duration_ms']:.1f}</td><td data-label='Actions'>{ql_actions(r)}</td></tr>" for r in data)
     return template(f"""
 <h1 class="h3 mb-3">Query Log</h1>
 <div class="d-flex gap-2 mb-3 flex-wrap">
@@ -3869,7 +4078,7 @@ def querylog_page(params):
   <button class="btn btn-outline-light" id="ql-auto-btn" onclick="qlToggleAuto()">Auto-Refresh Off</button>
   <form method="post" action="/querylog/clear" style="margin:0"><button class="btn btn-outline-danger">Clear</button></form>
 </div>
-<div class="panel rounded-2 border border-secondary-subtle p-3"><div class="table-responsive"><table class="table table-dark table-hover mobile-card-table" id="ql-table"><thead><tr><th>Time</th><th>Client</th><th>Domain</th><th>Type</th><th>Status</th><th>Rule</th><th>List</th><th>Upstream</th><th>ms</th><th>Actions</th></tr></thead><tbody id="ql-body">{body}</tbody></table></div></div>
+<div class="panel rounded-2 border border-secondary-subtle p-3"><div class="table-responsive"><table class="table table-dark table-hover mobile-card-table" id="ql-table"><thead><tr><th>Time</th><th>Client</th><th>Connect</th><th>Domain</th><th>Type</th><th>Status</th><th>Upstream</th><th>ms</th><th>Actions</th></tr></thead><tbody id="ql-body">{body}</tbody></table></div></div>
 <script>
 let qlTimer;
 function qlSearch() {{
@@ -3918,7 +4127,7 @@ function qlFetch() {{
         const client = esc(r.client_ip || '');
         const profDisabled = r.profile_name ? '' : 'disabled';
         const actions = `<div class="btn-group btn-group-sm" role="group"><button class="btn btn-outline-light" onclick="qlRuleAction('${{domain}}','${{act}}','global','${{client}}','')">${{label}} Global</button><button class="btn btn-outline-light" onclick="qlRuleAction('${{domain}}','${{act}}','profile','${{client}}','')" ${{profDisabled}}>${{label}} Profile</button></div>`;
-        return `<tr><td data-label="Time">${{r.timestamp}}</td><td data-label="Client">${{r.client_ip}}</td><td data-label="Domain" class="td-domain">${{r.domain}}</td><td data-label="Type">${{r.query_type}}</td><td data-label="Status"><span class="badge text-bg-${{bc}}">${{r.status}}</span></td><td data-label="Rule">${{r.matched_rule||''}}</td><td data-label="List">${{r.matched_list||''}}</td><td data-label="Upstream">${{r.upstream||''}}</td><td data-label="ms">${{r.duration_ms?.toFixed(1)||''}}</td><td data-label="Actions">${{actions}}</td></tr>`;
+        return `<tr><td data-label="Time">${{r.timestamp}}</td><td data-label="Client">${{r.client_ip}}</td><td data-label="Connect">${{r.connection_type||'dns'}}</td><td data-label="Domain" class="td-domain">${{r.domain}}</td><td data-label="Type">${{r.query_type}}</td><td data-label="Status"><span class="badge text-bg-${{bc}}">${{r.status}}</span></td><td data-label="Upstream">${{r.upstream||''}}</td><td data-label="ms">${{r.duration_ms?.toFixed(1)||''}}</td><td data-label="Actions">${{actions}}</td></tr>`;
       }}).join('');
     }}).catch(() => {{}});
 }}
@@ -4540,6 +4749,20 @@ def settings_page(message="", is_error=False, values=None):
             f'</span></label>'
         )
 
+    def radio_group(name, options, default):
+        current = value(name, default)
+        out = ""
+        for opt_value, label, description in options:
+            checked = "checked" if str(current) == str(opt_value) else ""
+            out += (
+                f'<label class="settings-radio">'
+                f'<input type="radio" name="{html_escape(name)}" value="{html_escape(opt_value)}" {checked}>'
+                f'<span><span class="settings-label">{html_escape(label)}</span>'
+                f'<span class="settings-help">{html_escape(description)}</span></span>'
+                f'</label>'
+            )
+        return out
+
     encrypted_status = encrypted_dns_readiness()
     encrypted_alert = ""
     if encrypted_status["issues"]:
@@ -4566,6 +4789,9 @@ def settings_page(message="", is_error=False, values=None):
 .settings-field-grid.two{{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .settings-switch{{display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:.78rem .85rem;border:1px solid rgba(30,45,61,.7);border-radius:.5rem;background:#0b1220;cursor:pointer;min-height:64px}}
 .settings-switch:hover{{border-color:#2f455e;background:#0d1626}}
+.settings-radio{{display:flex;align-items:flex-start;gap:.7rem;padding:.78rem .85rem;border:1px solid rgba(30,45,61,.7);border-radius:.5rem;background:#0b1220;cursor:pointer;min-height:78px}}
+.settings-radio:hover{{border-color:#2f455e;background:#0d1626}}
+.settings-radio input{{margin-top:.2rem;accent-color:var(--accent);flex-shrink:0}}
 .settings-label{{display:block;font-size:.9rem;font-weight:700;color:var(--text)}}
 .settings-help{{font-size:.78rem;color:var(--muted2);margin-top:.12rem}}
 .settings-toggle{{margin-left:auto}}
@@ -4614,12 +4840,18 @@ def settings_page(message="", is_error=False, values=None):
           <div><label class="form-label">LOCALDNSGUARD_DNS_PORT</label><input class="form-control" name="localdnsguard_dns_port" type="number" min="0" max="65535" value="{html_escape(value('localdnsguard_dns_port', DNS_PORT))}"></div>
           <div><label class="form-label">Public DNS Domain</label><input class="form-control" name="encrypted_dns_domain" placeholder="dns.example.com" value="{html_escape(value('encrypted_dns_domain', ENCRYPTED_DNS_DOMAIN))}"></div>
         </div>
-        <div class="settings-field-grid two">
-          {switch("dns_over_tls_enabled", "DNS over TLS", "Accept encrypted DNS over TCP/TLS. Default port is 853.", "0")}
-          {switch("dns_over_quic_enabled", "DNS over QUIC (experimental)", "Accept encrypted DNS over QUIC. Disabled by default while upstream QUIC pooling is experimental.", "0")}
+        <div class="settings-field-grid">
+          <div><label class="form-label">Upstream Timeout</label><input class="form-control" name="upstream_timeout" type="number" min="0.1" step="0.1" value="{html_escape(value('upstream_timeout', '2.5'))}"></div>
+          <div class="settings-help" style="display:flex;align-items:center;grid-column:span 2">Number of seconds to wait for a response from the upstream server.</div>
         </div>
         <div class="settings-field-grid two">
+          {switch("dns_over_tls_enabled", "DNS over TLS", "Accept encrypted DNS over TCP/TLS. Default port is 853.", "0")}
+          {switch("dns_over_https_enabled", "DNS over HTTPS", "Accept DNS-over-HTTPS on /dns-query. Default port is 443.", "0")}
+          {switch("dns_over_quic_enabled", "DNS over QUIC (experimental)", "Accept encrypted DNS over QUIC. Disabled by default while upstream QUIC pooling is experimental.", "0")}
+        </div>
+        <div class="settings-field-grid">
           <div><label class="form-label">DNS-over-TLS Port</label><input class="form-control" name="dns_over_tls_port" type="number" min="0" max="65535" value="{html_escape(value('dns_over_tls_port', '853'))}"></div>
+          <div><label class="form-label">DNS-over-HTTPS Port</label><input class="form-control" name="dns_over_https_port" type="number" min="0" max="65535" value="{html_escape(value('dns_over_https_port', '443'))}"></div>
           <div><label class="form-label">DNS-over-QUIC Port</label><input class="form-control" name="dns_over_quic_port" type="number" min="0" max="65535" value="{html_escape(value('dns_over_quic_port', '853'))}"></div>
         </div>
         <div class="settings-field-grid two">
@@ -4632,7 +4864,7 @@ def settings_page(message="", is_error=False, values=None):
             <textarea class="form-control settings-textarea" name="encrypted_dns_private_key_pem" spellcheck="false" placeholder="-----BEGIN RSA PRIVATE KEY-----">{html_escape(value('encrypted_dns_private_key_pem', ''))}</textarea>
           </div>
         </div>
-        <div class="settings-help">Clients connect with <code>tls://{html_escape(value('encrypted_dns_domain', 'panel.ts3x.cc') or 'panel.ts3x.cc')}</code> for DNS-over-TLS. Native DNS-over-QUIC is experimental and remains disabled unless explicitly enabled. The listen host is the local bind address, usually <code>0.0.0.0</code>. Public DNS Domain must be the exact hostname clients use, and the certificate must include that hostname.</div>
+        <div class="settings-help">Clients connect with <code>tls://{html_escape(value('encrypted_dns_domain', 'panel.ts3x.cc') or 'panel.ts3x.cc')}</code> for DNS-over-TLS and <code>https://{html_escape(value('encrypted_dns_domain', 'panel.ts3x.cc') or 'panel.ts3x.cc')}/dns-query</code> for DNS-over-HTTPS. The listen host is the local bind address, usually <code>0.0.0.0</code>. Public DNS Domain must be the exact hostname clients use, and the certificate must include that hostname.</div>
       </div>
     </section>
 
@@ -4718,14 +4950,13 @@ def settings_page(message="", is_error=False, values=None):
         <div class="settings-field-grid">
           <div><label class="form-label">Default TTL (sec.)</label><input class="form-control" name="cache_ttl" type="number" min="0" value="{get_setting('cache_ttl')}"></div>
           <div><label class="form-label">Cache Size (Bytes)</label><input class="form-control" name="cache_size" type="number" min="65536" value="{get_setting('cache_size','4194304')}"></div>
-          <div><label class="form-label">Block Mode</label><select class="form-select" name="block_mode">{select_options(['zero_ip','nxdomain','refused','drop'], get_setting('block_mode'))}</select></div>
+          {switch("cache_enabled", "Cache Enabled", "Use cached DNS answers when valid.", "1")}
         </div>
         <div class="settings-field-grid">
           <div><label class="form-label">Minimum TTL Override</label><input class="form-control" name="cache_min_ttl" type="number" min="0" value="{get_setting('cache_min_ttl','0')}"></div>
           <div><label class="form-label">Maximum TTL Override</label><input class="form-control" name="cache_max_ttl" type="number" min="0" value="{get_setting('cache_max_ttl','0')}"></div>
-          {switch("cache_enabled", "Cache Enabled", "Use cached DNS answers when valid.", "1")}
+          {switch("cache_optimistic", "Optimistic Caching", "Serve expired entries while refreshing them in the background.", "0")}
         </div>
-        {switch("cache_optimistic", "Optimistic Caching", "Serve expired entries while refreshing them in the background.", "0")}
       </div>
     </section>
 
@@ -4733,13 +4964,29 @@ def settings_page(message="", is_error=False, values=None):
       <div class="settings-section-head">
         <div>
           <div class="settings-section-title">Block Response</div>
-          <div class="settings-section-subtitle">Custom IPs for blocked answers.</div>
+          <div class="settings-section-subtitle">Block mode, IPv6 policy, and TTL for filtered answers.</div>
         </div>
       </div>
-      <div class="settings-section-body">
+      <div class="settings-section-body settings-stack">
+        {switch("disable_ipv6", "Disable IPv6", "Discard all DNS queries for IPv6 addresses (type AAAA) and remove IPv6 hints from HTTPS/SVCB answers.", "0")}
+        <div>
+          <label class="form-label">Block Mode</label>
+          <div class="settings-field-grid two">
+            {radio_group("block_mode", [
+                ("zero_ip", "Default / Null IP", "Reply with a null IP address (0.0.0.0 for A; :: for AAAA). Hosts-style rules with their own IP are still answered as rewrites."),
+                ("refused", "REFUSED", "Reply with the REFUSED response code."),
+                ("nxdomain", "NXDOMAIN", "Reply with the NXDOMAIN response code."),
+                ("custom_ip", "Custom IP", "Reply with a manually configured IPv4 or IPv6 address."),
+            ], "zero_ip")}
+          </div>
+        </div>
         <div class="settings-field-grid two">
           <div><label class="form-label">Custom Block IPv4</label><input class="form-control" name="custom_block_ipv4" value="{get_setting('custom_block_ipv4')}"></div>
           <div><label class="form-label">Custom Block IPv6</label><input class="form-control" name="custom_block_ipv6" value="{get_setting('custom_block_ipv6')}"></div>
+        </div>
+        <div class="settings-field-grid two">
+          <div><label class="form-label">Blocked Response TTL</label><input class="form-control" name="block_response_ttl" type="number" min="0" value="{get_setting('block_response_ttl','60')}"></div>
+          <div class="settings-help" style="display:flex;align-items:center">Number of seconds clients should cache a filtered response.</div>
         </div>
       </div>
     </section>
@@ -5347,6 +5594,136 @@ def html_escape(text):
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
+def bracket_host_for_url(host):
+    host = str(host or "").strip()
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
+
+
+def local_dns_connection_hosts():
+    hosts = []
+
+    def add(host):
+        host = str(host or "").strip()
+        if not host or host in {"0.0.0.0", "::"}:
+            return
+        if host not in hosts:
+            hosts.append(host)
+
+    add("127.0.0.1")
+    if DNS_HOST in {"0.0.0.0", "::"}:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("1.1.1.1", 53))
+                add(s.getsockname()[0])
+        except Exception:
+            pass
+        try:
+            for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+                if not ip.startswith("127."):
+                    add(ip)
+        except Exception:
+            pass
+    else:
+        add(DNS_HOST)
+
+    domain = get_setting("encrypted_dns_domain", ENCRYPTED_DNS_DOMAIN).strip()
+    add(domain)
+    return hosts
+
+
+def dns_connection_endpoints():
+    dns_port = int(DNS_PORT)
+    tls_port = int(DNS_TLS_PORT)
+    quic_port = int(DNS_QUIC_PORT)
+    web_port = int(WEB_PORT)
+    hosts = local_dns_connection_hosts()[:4]
+    if not hosts:
+        hosts = ["127.0.0.1"]
+
+    endpoints = {
+        "plain": [],
+        "dot": [],
+        "doq": [],
+        "doh": [],
+        "notes": [],
+    }
+    for host in hosts:
+        display_host = bracket_host_for_url(host)
+        plain_value = host if dns_port == 53 else f"{display_host}:{dns_port}"
+        endpoints["plain"].append(plain_value)
+
+    encrypted_status = encrypted_dns_readiness()
+    public_name = encrypted_status.get("domain") or get_setting("encrypted_dns_domain", "").strip()
+    if public_name:
+        public_host = bracket_host_for_url(public_name)
+        https_port = int(DNS_HTTPS_PORT)
+        https_port_part = "" if https_port == 443 else f":{https_port}"
+        endpoints["doh"].append(f"https://{public_host}{https_port_part}/dns-query")
+        if get_setting("dns_over_tls_enabled", "0") == "1":
+            endpoints["dot"].append(f"tls://{public_host}:{tls_port}")
+        if get_setting("dns_over_quic_enabled", "0") == "1":
+            endpoints["doq"].append(f"quic://{public_host}:{quic_port}")
+    else:
+        endpoints["notes"].append("Set Public DNS Domain in Settings to show public encrypted DNS URLs.")
+
+    for host in hosts[:2]:
+        display_host = bracket_host_for_url(host)
+        scheme = "http"
+        port_part = "" if web_port in (80, 443) else f":{web_port}"
+        endpoints["doh"].append(f"{scheme}://{display_host}{port_part}/dns-query")
+
+    if public_name and not encrypted_status.get("ready"):
+        endpoints["notes"].extend(encrypted_status.get("issues", []))
+    endpoints["notes"].append("DoH uses the web endpoint /dns-query. For https://domain/dns-query, publish the web service through HTTPS or a reverse proxy.")
+    return endpoints
+
+
+def endpoint_codes(values):
+    if not values:
+        return '<div class="setup-muted">Not configured or disabled.</div>'
+    return "".join(f'<code class="setup-endpoint">{html_escape(value)}</code>' for value in values)
+
+
+def setup_wizard_page():
+    endpoints = dns_connection_endpoints()
+    notes = "".join(f"<li>{html_escape(note)}</li>" for note in endpoints["notes"])
+    body = f"""
+<div class="page-toolbar">
+  <div>
+    <h1 class="h3 mb-1">Setup Wizard</h1>
+    <div class="small text-secondary">Use these addresses to connect devices, routers, and encrypted DNS clients to this server.</div>
+  </div>
+</div>
+<div class="setup-grid mb-3">
+  <section class="setup-card">
+    <div class="setup-card-title">DNS UDP/TCP</div>
+    <div class="setup-card-text">For router DHCP DNS settings, Windows, Android private network DNS fields that accept an IP, and local clients.</div>
+    {endpoint_codes(endpoints["plain"])}
+  </section>
+  <section class="setup-card">
+    <div class="setup-card-title">DNS-over-HTTPS</div>
+    <div class="setup-card-text">For clients that support DoH URLs.</div>
+    {endpoint_codes(endpoints["doh"])}
+  </section>
+  <section class="setup-card">
+    <div class="setup-card-title">DNS-over-TLS</div>
+    <div class="setup-card-text">For Android Private DNS, routers, and clients that support DoT.</div>
+    {endpoint_codes(endpoints["dot"])}
+  </section>
+  <section class="setup-card">
+    <div class="setup-card-title">DNS-over-QUIC</div>
+    <div class="setup-card-text">Experimental encrypted DNS endpoint.</div>
+    {endpoint_codes(endpoints["doq"])}
+  </section>
+</div>
+<section class="panel p-3">
+  <h2 class="h5 mb-2">Notes</h2>
+  <ul class="setup-muted" style="padding-left:1.1rem">{notes}</ul>
+</section>
+"""
+    return template(body, "Setup Wizard")
+
+
 def set_runtime_status(message, ready=None):
     global runtime_status_message
     with runtime_status_lock:
@@ -5417,6 +5794,9 @@ class WebHandler(BaseHTTPRequestHandler):
     def _do_GET(self):
         path = urlparse(self.path).path
         params = parse_qs(urlparse(self.path).query)
+        if path == "/dns-query":
+            self.handle_doh_query(params=params)
+            return
         if path == "/metrics":
             self.send_prometheus_metrics()
             return
@@ -5447,6 +5827,7 @@ class WebHandler(BaseHTTPRequestHandler):
             "/clients": clients_page,
             "/profiles": profiles_page,
             "/cache": cache_page,
+            "/setup-wizard": setup_wizard_page,
             "/upstreams": upstreams_page,
             "/settings": settings_page,
             "/api-docs": api_docs_page,
@@ -5535,6 +5916,9 @@ class WebHandler(BaseHTTPRequestHandler):
 
     def _do_POST(self):
         path = urlparse(self.path).path
+        if path == "/dns-query":
+            self.handle_doh_query()
+            return
         if path == "/api/restore":
             mode = self.api_auth_mode()
             if not mode:
@@ -5758,19 +6142,31 @@ class WebHandler(BaseHTTPRequestHandler):
         elif path == "/settings":
             settings_keys = [
                 "filtering_enabled", "cache_enabled", "query_log_enabled", "lan_only", "dnssec_validation_enabled",
-                "block_mode", "cache_ttl", "cache_size", "cache_min_ttl", "cache_max_ttl", "cache_optimistic",
+                "block_mode", "block_response_ttl", "disable_ipv6", "cache_ttl", "cache_size", "cache_min_ttl", "cache_max_ttl", "cache_optimistic",
                 "filter_update_interval_hours", "allowed_networks", "custom_block_ipv4", "custom_block_ipv6",
                 "log_retention_days", "localdnsguard_web_host", "localdnsguard_web_port",
                 "localdnsguard_dns_host", "localdnsguard_dns_port", "encrypted_dns_host", "encrypted_dns_domain",
-                "dns_over_tls_enabled", "dns_over_tls_port", "dns_over_quic_enabled", "dns_over_quic_port",
+                "upstream_timeout",
+                "dns_over_tls_enabled", "dns_over_tls_port", "dns_over_https_enabled", "dns_over_https_port",
+                "dns_over_quic_enabled", "dns_over_quic_port",
                 "encrypted_dns_certificate_pem", "encrypted_dns_private_key_pem",
             ]
             try:
                 parse_port(form.get("localdnsguard_web_port", WEB_PORT), WEB_PORT, "LOCALDNSGUARD_WEB_PORT")
                 parse_port(form.get("localdnsguard_dns_port", DNS_PORT), DNS_PORT, "LOCALDNSGUARD_DNS_PORT")
+                parse_positive_float(form.get("upstream_timeout", "2.5"), 2.5, "Upstream timeout")
                 parse_port(form.get("dns_over_tls_port", DNS_TLS_PORT), DNS_TLS_PORT, "DNS-over-TLS port")
+                parse_port(form.get("dns_over_https_port", DNS_HTTPS_PORT), DNS_HTTPS_PORT, "DNS-over-HTTPS port")
                 parse_port(form.get("dns_over_quic_port", DNS_QUIC_PORT), DNS_QUIC_PORT, "DNS-over-QUIC port")
-                encrypted_enabled = form.get("dns_over_tls_enabled") == "1" or form.get("dns_over_quic_enabled") == "1"
+                if form.get("block_mode", "zero_ip") not in {"zero_ip", "refused", "nxdomain", "custom_ip", "nodata", "drop"}:
+                    raise ValueError("Invalid block mode")
+                if int(form.get("block_response_ttl", "60") or "0") < 0:
+                    raise ValueError("Blocked response TTL must be 0 or higher")
+                encrypted_enabled = (
+                    form.get("dns_over_tls_enabled") == "1"
+                    or form.get("dns_over_https_enabled") == "1"
+                    or form.get("dns_over_quic_enabled") == "1"
+                )
                 existing_cert = get_setting("encrypted_dns_certificate_pem", "")
                 existing_key = get_setting("encrypted_dns_private_key_pem", "")
                 existing_domain = get_setting("encrypted_dns_domain", "")
@@ -5862,6 +6258,9 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_header("Set-Cookie", f"{CSRF_COOKIE}=; Max-Age=0; Path=/")
         self.send_header("Location", "/login")
         self.end_headers()
+
+    def handle_doh_query(self, params=None):
+        send_doh_response(self, params)
 
     def current_session(self):
         token = self.cookie("session")
@@ -6274,6 +6673,12 @@ class WebHandler(BaseHTTPRequestHandler):
                         "running": encrypted_runtime["tls_running"],
                         "port": DNS_TLS_PORT,
                     },
+                    "https": {
+                        "enabled": get_setting("dns_over_https_enabled", "0") == "1",
+                        "running": encrypted_runtime["https_running"],
+                        "port": DNS_HTTPS_PORT,
+                        "connect_url": f"https://{encrypted_status['domain']}{'' if DNS_HTTPS_PORT == 443 else ':' + str(DNS_HTTPS_PORT)}/dns-query" if encrypted_status["domain"] else "",
+                    },
                     "quic": {
                         "enabled": get_setting("dns_over_quic_enabled", "0") == "1",
                         "running": encrypted_runtime["quic_running"],
@@ -6315,6 +6720,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 self.send_json(explain_decision(domain, client))
         elif path == "/api/querylog.csv":
             data = rows("SELECT * FROM query_log ORDER BY id DESC LIMIT 5000")
+            data = [{k: v for k, v in row.items() if k != "matched_rule"} for row in data]
             output = io.StringIO()
             writer = csv.DictWriter(output, fieldnames=data[0].keys() if data else ["id"])
             writer.writeheader()
@@ -6746,7 +7152,7 @@ class DoQRuntimeServer:
                         peer = self._quic._network_paths[0].addr[0] if self._quic._network_paths else ""
                         update_doq_metric("queries")
                         update_doq_metric("last_peer", peer)
-                        response = handle_dns_request(request, peer)
+                        response = handle_dns_request(request, peer, "doq")
                         payload = b"" if response is None else struct.pack("!H", len(response)) + response
                         try:
                             question = parse_dns_question(request)
@@ -6825,11 +7231,20 @@ class DoQRuntimeServer:
 def start_encrypted_dns_servers():
     servers = []
     try:
+        context = None
+        def ssl_context():
+            nonlocal context
+            if context is None:
+                context = make_encrypted_dns_ssl_context()
+            return context
         if get_setting("dns_over_tls_enabled", "0") == "1":
-            context = make_encrypted_dns_ssl_context()
-            dot = ReusableThreadingTLSDNSServer((ENCRYPTED_DNS_HOST, DNS_TLS_PORT), DNSTCPHandler, context)
+            dot = ReusableThreadingTLSDNSServer((ENCRYPTED_DNS_HOST, DNS_TLS_PORT), DNSTCPHandler, ssl_context())
             threading.Thread(target=dot.serve_forever, name="dns-over-tls-server", daemon=True).start()
             servers.append(dot)
+        if get_setting("dns_over_https_enabled", "0") == "1":
+            doh = ReusableThreadingHTTPSServer((ENCRYPTED_DNS_HOST, DNS_HTTPS_PORT), DNSHTTPSHandler, ssl_context())
+            threading.Thread(target=doh.serve_forever, name="dns-over-https-server", daemon=True).start()
+            servers.append(doh)
         if get_setting("dns_over_quic_enabled", "0") == "1":
             doq = DoQRuntimeServer(ENCRYPTED_DNS_HOST, DNS_QUIC_PORT, make_encrypted_dns_ssl_context())
             doq.start()
@@ -6938,7 +7353,7 @@ def print_console_status():
     print(f"  Web UI:          http://127.0.0.1:{WEB_PORT}", flush=True)
     print(f"  DNS:             {DNS_HOST}:{DNS_PORT} UDP/TCP", flush=True)
     public_name = ENCRYPTED_DNS_DOMAIN or ENCRYPTED_DNS_HOST
-    print(f"  Encrypted DNS:   tls://{public_name}:{DNS_TLS_PORT}, quic://{public_name}:{DNS_QUIC_PORT}", flush=True)
+    print(f"  Encrypted DNS:   tls://{public_name}:{DNS_TLS_PORT}, https://{public_name}{'' if DNS_HTTPS_PORT == 443 else ':' + str(DNS_HTTPS_PORT)}/dns-query, quic://{public_name}:{DNS_QUIC_PORT}", flush=True)
     print(f"  Total queries:   {summary.get('total', 0)}", flush=True)
     print(f"  Blocked queries: {summary.get('blocked', 0)}", flush=True)
     print(f"  Block rate:      {summary.get('block_rate', 0.0):.1f}%", flush=True)
@@ -6950,7 +7365,7 @@ def print_console_status():
 
 def run_console_command(command):
     global dns_servers
-    command = command.replace("ï»¿", "").replace("\ufeff", "")
+    command = command.replace(chr(0xFEFF), "")
     cleaned = "".join(ch for ch in command if ch.isprintable())
     cmd = " ".join(cleaned.strip().lower().split())
     if not cmd:
@@ -7065,8 +7480,9 @@ def main():
         if encrypted_dns_servers:
             log.write(
                 f"{now_iso()} encrypted dns ready on {ENCRYPTED_DNS_HOST}:{DNS_TLS_PORT}/tls "
+                f"{ENCRYPTED_DNS_HOST}:{DNS_HTTPS_PORT}/https "
                 f"{ENCRYPTED_DNS_HOST}:{DNS_QUIC_PORT}/quic "
-                f"tls_running={encrypted_state['tls_running']} quic_running={encrypted_state['quic_running']}\n"
+                f"tls_running={encrypted_state['tls_running']} https_running={encrypted_state['https_running']} quic_running={encrypted_state['quic_running']}\n"
             )
         else:
             log.write(f"{now_iso()} encrypted dns disabled\n")
@@ -7076,7 +7492,7 @@ def main():
         print(f"{APP_NAME} Web UI: http://127.0.0.1:{WEB_PORT}", flush=True)
         print(f"{APP_NAME} DNS UDP/TCP: {DNS_HOST}:{DNS_PORT}", flush=True)
         if encrypted_dns_servers:
-            print(f"{APP_NAME} encrypted DNS: tls://{public_dns_name}:{DNS_TLS_PORT} | quic://{public_dns_name}:{DNS_QUIC_PORT}", flush=True)
+            print(f"{APP_NAME} encrypted DNS: tls://{public_dns_name}:{DNS_TLS_PORT} | https://{public_dns_name}{'' if DNS_HTTPS_PORT == 443 else ':' + str(DNS_HTTPS_PORT)}/dns-query | quic://{public_dns_name}:{DNS_QUIC_PORT}", flush=True)
     try:
         console_loop()
     finally:
