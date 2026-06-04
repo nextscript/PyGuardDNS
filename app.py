@@ -200,8 +200,10 @@ def add_do_bit_to_query(request_bytes):
         import dns.message
         import dns.flags
         msg = dns.message.from_wire(request_bytes)
-        if msg.edns != 0:
-            msg.use_edns(edns=True, payload=1232, ednsflags=dns.flags.DO)
+        # Always (re-)set EDNS with the DO bit so DNSSEC records are
+        # requested from the upstream.  msg.edns is -1 when no EDNS is
+        # present, otherwise the EDNS version (normally 0).
+        msg.use_edns(edns=True, payload=1232, ednsflags=dns.flags.DO)
         return msg.to_wire()
     except Exception:
         return request_bytes
@@ -681,7 +683,8 @@ def discover_system_dns_servers():
 
 
 def get_setting(key, default=""):
-    row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    with db_lock:
+        row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     return row["value"] if row else default
 
 
@@ -3101,6 +3104,11 @@ def handle_dns_request(request, client_ip, connection_type=""):
                 validator = get_dnssec_validator()
                 if validator:
                     dnssec_result = validator.validate_response(qmsg, rmsg)
+                    logger.debug(
+                        "DNSSEC result for %s: status=%s reason=%s ad_allowed=%s",
+                        normalized, dnssec_result.status, dnssec_result.reason,
+                        dnssec_result.ad_flag_allowed,
+                    )
                     if dnssec_result.status in ("bogus", "indeterminate"):
                         servfail_response = build_error_response(request, 2)
                         log_query(client_ip, domain, normalized, qtype_name, "blocked",
