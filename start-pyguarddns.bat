@@ -2,10 +2,19 @@
 setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
+set "INSTALL_DEV_DEPS=%LOCALDNSGUARD_INSTALL_DEV_DEPS%"
+if not defined INSTALL_DEV_DEPS set "INSTALL_DEV_DEPS=0"
+if /I "%~1"=="--dev" set "INSTALL_DEV_DEPS=1"
+if /I "%~1"=="--dev-deps" set "INSTALL_DEV_DEPS=1"
+if /I "%~1"=="dev" set "INSTALL_DEV_DEPS=1"
+if /I "%~1"=="--no-dev" set "INSTALL_DEV_DEPS=0"
+if /I "%~1"=="--no-dev-deps" set "INSTALL_DEV_DEPS=0"
+set "LOCALDNSGUARD_INSTALL_DEV_DEPS=%INSTALL_DEV_DEPS%"
+
 net session >nul 2>&1
 if not "%errorlevel%"=="0" (
   echo Requesting administrator rights for DNS port 53...
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -ArgumentList '%*' -Verb RunAs"
   exit /b
 )
 
@@ -71,7 +80,7 @@ if errorlevel 1 (
   echo Runtime requirements are already installed.
 )
 
-if "%LOCALDNSGUARD_INSTALL_DEV_DEPS%"=="1" (
+if "%INSTALL_DEV_DEPS%"=="1" (
   echo Installing Python development requirements...
   "%PYTHON_EXE%" -m pip install -r requirements-dev.txt --disable-pip-version-check
   if errorlevel 1 (

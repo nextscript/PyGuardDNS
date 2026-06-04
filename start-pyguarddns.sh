@@ -3,6 +3,19 @@ set -u
 
 cd "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)" || exit 1
 
+INSTALL_DEV_DEPS="${LOCALDNSGUARD_INSTALL_DEV_DEPS:-0}"
+for arg in "$@"; do
+  case "$arg" in
+    --dev|--dev-deps|dev)
+      INSTALL_DEV_DEPS=1
+      ;;
+    --no-dev|--no-dev-deps)
+      INSTALL_DEV_DEPS=0
+      ;;
+  esac
+done
+export LOCALDNSGUARD_INSTALL_DEV_DEPS="$INSTALL_DEV_DEPS"
+
 if [ "$(id -u)" -ne 0 ]; then
   echo "DNS port 53 requires root privileges."
   if command -v sudo >/dev/null 2>&1; then
@@ -126,7 +139,7 @@ else
   fi
 fi
 
-if [ "${LOCALDNSGUARD_INSTALL_DEV_DEPS:-0}" = "1" ]; then
+if [ "$INSTALL_DEV_DEPS" = "1" ]; then
   echo "Installing Python development requirements..."
   "$PYTHON_EXE" -m pip install -r requirements-dev.txt --disable-pip-version-check
   if [ $? -ne 0 ]; then
