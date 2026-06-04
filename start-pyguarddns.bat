@@ -56,14 +56,32 @@ if errorlevel 1 (
   "%PYTHON_EXE%" -m ensurepip --upgrade
 )
 
-echo Checking Python requirements...
-"%PYTHON_EXE%" -m pip install -r requirements.txt --disable-pip-version-check
+echo Checking Python runtime requirements...
+call :runtime_requirements_ok
 if errorlevel 1 (
-  echo FAILED: Python requirements could not be installed.
-  pause
-  exit /b 1
+  echo Installing Python runtime requirements...
+  "%PYTHON_EXE%" -m pip install -r requirements.txt --disable-pip-version-check
+  if errorlevel 1 (
+    echo FAILED: Python runtime requirements could not be installed.
+    echo If this machine is offline or DNS is not working, restore network access or preinstall requirements.txt.
+    pause
+    exit /b 1
+  )
+) else (
+  echo Runtime requirements are already installed.
 )
-echo All Python requirements are installed.
+
+if "%LOCALDNSGUARD_INSTALL_DEV_DEPS%"=="1" (
+  echo Installing Python development requirements...
+  "%PYTHON_EXE%" -m pip install -r requirements-dev.txt --disable-pip-version-check
+  if errorlevel 1 (
+    echo FAILED: Python development requirements could not be installed.
+    pause
+    exit /b 1
+  )
+)
+
+echo All required Python runtime packages are installed.
 echo.
 echo Server console is active. Commands: restart, stop, status, cache clear, update blocklist
 echo.
@@ -156,3 +174,7 @@ if exist ".venv\Scripts\python.exe" (
 )
 set "PYTHON_EXE=%BASE_PYTHON_EXE%"
 exit /b 1
+
+:runtime_requirements_ok
+"%PYTHON_EXE%" -c "import bcrypt, certifi, cryptography, OpenSSL, service_identity, nacl, aioquic" >nul 2>&1
+exit /b %errorlevel%

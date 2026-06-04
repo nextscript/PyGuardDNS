@@ -101,13 +101,41 @@ if ! "$PYTHON_EXE" -m pip --version >/dev/null 2>&1; then
   fi
 fi
 
-echo "Checking Python requirements..."
-"$PYTHON_EXE" -m pip install -r requirements.txt --disable-pip-version-check
-if [ $? -ne 0 ]; then
-  echo "FAILED: Python requirements could not be installed."
-  exit 1
+runtime_requirements_ok() {
+  "$PYTHON_EXE" - <<'PY' >/dev/null 2>&1
+import bcrypt
+import certifi
+import cryptography
+import OpenSSL
+import service_identity
+import nacl
+import aioquic
+PY
+}
+
+echo "Checking Python runtime requirements..."
+if runtime_requirements_ok; then
+  echo "Runtime requirements are already installed."
+else
+  echo "Installing Python runtime requirements..."
+  "$PYTHON_EXE" -m pip install -r requirements.txt --disable-pip-version-check
+  if [ $? -ne 0 ]; then
+    echo "FAILED: Python runtime requirements could not be installed."
+    echo "If this machine is offline or DNS is not working, restore network access or preinstall requirements.txt."
+    exit 1
+  fi
 fi
-echo "All Python requirements are installed."
+
+if [ "${LOCALDNSGUARD_INSTALL_DEV_DEPS:-0}" = "1" ]; then
+  echo "Installing Python development requirements..."
+  "$PYTHON_EXE" -m pip install -r requirements-dev.txt --disable-pip-version-check
+  if [ $? -ne 0 ]; then
+    echo "FAILED: Python development requirements could not be installed."
+    exit 1
+  fi
+fi
+
+echo "All required Python runtime packages are installed."
 echo
 echo "Server console is active. Commands: restart, stop, status, cache clear, update blocklist"
 echo
