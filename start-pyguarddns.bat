@@ -14,7 +14,11 @@ set "LOCALDNSGUARD_INSTALL_DEV_DEPS=%INSTALL_DEV_DEPS%"
 net session >nul 2>&1
 if not "%errorlevel%"=="0" (
   echo Requesting administrator rights for DNS port 53...
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -ArgumentList '%*' -Verb RunAs"
+  if "%~1"=="" (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+  ) else (
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -ArgumentList '%*' -Verb RunAs"
+  )
   exit /b
 )
 
