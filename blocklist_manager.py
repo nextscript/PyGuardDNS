@@ -609,7 +609,6 @@ class BlocklistManager:
                 (name, url, list_type, list_id),
             )
             self.db.commit()
-        self._notify_reload()
         return True
 
     def set_enabled(self, list_id: int, enabled: bool) -> bool:

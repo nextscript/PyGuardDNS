@@ -363,7 +363,6 @@ class ClientManager:
             )
             self.db.commit()
             cid = self.db.execute("SELECT last_insert_rowid()").fetchone()[0]
-        self._notify()
         return self.get_client(cid)
 
     def update_client(self, client_id: int, **kwargs) -> Optional[dict]:
@@ -382,7 +381,6 @@ class ClientManager:
                 (name, ip, cidr, profile_id, int(filtering_enabled), now, client_id),
             )
             self.db.commit()
-        self._notify()
         return self.get_client(client_id)
 
     def delete_client(self, client_id: int) -> bool:
@@ -392,7 +390,6 @@ class ClientManager:
         with self._lock:
             self.db.execute("DELETE FROM clients WHERE id=?", (client_id,))
             self.db.commit()
-        self._notify()
         return True
 
     # ------------------------------------------------------------------ #

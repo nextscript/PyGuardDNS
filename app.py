@@ -7509,7 +7509,6 @@ def run_console_command(command):
         print("Restarting runtime servers...", flush=True)
         try:
             restart_runtime_servers()
-            reload_filter_engine()
             print(f"Runtime restarted. Web UI: http://127.0.0.1:{WEB_PORT} | DNS: {DNS_HOST}:{DNS_PORT}", flush=True)
         except Exception as exc:
             print(f"Runtime restart failed: {exc}", flush=True)
