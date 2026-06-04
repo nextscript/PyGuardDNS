@@ -371,14 +371,15 @@ class ClientManager:
         if not client:
             return None
         name = kwargs.get("name", client["name"])
+        ip = kwargs.get("ip", client["ip"])
         cidr = kwargs.get("cidr", client["cidr"])
         profile_id = kwargs.get("profile_id", client["profile_id"])
         filtering_enabled = kwargs.get("filtering_enabled", bool(client["filtering_enabled"]))
         now = now_iso()
         with self._lock:
             self.db.execute(
-                "UPDATE clients SET name=?, cidr=?, profile_id=?, filtering_enabled=?, updated_at=? WHERE id=?",
-                (name, cidr, profile_id, int(filtering_enabled), now, client_id),
+                "UPDATE clients SET name=?, ip=?, cidr=?, profile_id=?, filtering_enabled=?, updated_at=? WHERE id=?",
+                (name, ip, cidr, profile_id, int(filtering_enabled), now, client_id),
             )
             self.db.commit()
         self._notify()

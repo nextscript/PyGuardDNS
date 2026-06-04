@@ -58,7 +58,7 @@ rules_lock = threading.RLock()
 runtime_restart_lock = threading.RLock()
 dns_cache = {}
 dash_cache = {"data": None, "ts": 0.0}
-DASH_CACHE_TTL = 2.5
+DASH_CACHE_TTL = 5
 sessions = {}
 doh_host_cache = {}
 doh_connection_cache = {}
@@ -484,7 +484,10 @@ MIGRATIONS = [
         _ensure_column("query_log", "client_name", "TEXT NOT NULL DEFAULT ''"),
         _ensure_column("query_log", "profile_name", "TEXT NOT NULL DEFAULT ''"),
     )),
-    (10, "add connection_type to query_log", lambda: _ensure_column("query_log", "connection_type", "TEXT NOT NULL DEFAULT ''")),
+    (11, "add connection_type to query_log", lambda: (
+        _ensure_column("query_log", "connection_type", "TEXT NOT NULL DEFAULT ''"),
+        db.execute("UPDATE query_log SET connection_type='UDP' WHERE connection_type='' OR connection_type IS NULL"),
+    )),
     (7, "migrate clients to profile schema", lambda: _migrate_clients_table()),
     (8, "add upstream_health columns", lambda: (
         _ensure_column("upstreams", "latency_ms", "REAL"),
@@ -4049,7 +4052,7 @@ def connection_label(value):
     }
     raw = str(value or "").strip()
     if not raw:
-        return "Unknown"
+        return "UDP"
     return labels.get(raw.lower(), raw.upper())
 
 
@@ -4064,10 +4067,10 @@ def querylog_page(params):
     if params.get("client", [""])[0]:
         where.append("client_ip LIKE ?")
         values.append(f"%{params['client'][0]}%")
-    sql = "SELECT * FROM query_log"
+    sql = "SELECT q.*, COALESCE(NULLIF(c.name, c.ip), NULLIF(q.client_name, ''), q.client_ip) AS client_display_name FROM query_log q LEFT JOIN clients c ON c.ip = q.client_ip"
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY id DESC LIMIT 300"
+    sql += " ORDER BY q.id DESC LIMIT 300"
     data = rows(sql, values)
     client_val = html_escape(params.get('client', [''])[0])
     q_val = html_escape(params.get('q', [''])[0])
@@ -4084,7 +4087,7 @@ def querylog_page(params):
             f"<button class='btn btn-outline-light' onclick=\"qlRuleAction('{domain}','{action}','profile','{client}','')\" {'disabled' if not profile_name else ''}>{label} Profile</button>"
             f"</div>"
         )
-    body = "".join(f"<tr><td data-label='Time'>{r['timestamp']}</td><td data-label='Client'>{r['client_ip']}</td><td data-label='Connect'>{connection_label(r.get('connection_type',''))}</td><td data-label='Domain' class='td-domain'>{r['domain']}</td><td data-label='Type'>{r['query_type']}</td><td data-label='Status'>{badge(r['status'])}</td><td data-label='Upstream'>{r['upstream']}</td><td data-label='ms'>{r['duration_ms']:.1f}</td><td data-label='Actions'>{ql_actions(r)}</td></tr>" for r in data)
+    body = "".join(f"<tr><td data-label='Time'>{r['timestamp']}</td><td data-label='Client'>{r.get('client_display_name') or r['client_ip']}</td><td data-label='Connect'>{connection_label(r.get('connection_type',''))}</td><td data-label='Domain' class='td-domain'>{r['domain']}</td><td data-label='Type'>{r['query_type']}</td><td data-label='Status'>{badge(r['status'])}</td><td data-label='Upstream'>{r['upstream']}</td><td data-label='ms'>{r['duration_ms']:.1f}</td><td data-label='Actions'>{ql_actions(r)}</td></tr>" for r in data)
     return template(f"""
 <h1 class="h3 mb-3">Query Log</h1>
 <div class="d-flex gap-2 mb-3 flex-wrap">
@@ -4092,12 +4095,19 @@ def querylog_page(params):
   <input class="form-control" style="max-width:180px;flex:1 1 120px" id="ql-client" placeholder="Client-IP" value="{client_val}">
   <select class="form-select" style="max-width:160px;flex:1 1 100px" id="ql-status"><option value="">All Statuses</option>{status_options(status_val)}</select>
   <a class="btn btn-outline-light" href="/api/querylog.csv">CSV</a>
+  <button class="btn btn-outline-light" onclick="qlFetch()">Refresh</button>
   <button class="btn btn-outline-light" id="ql-auto-btn" onclick="qlToggleAuto()">Auto-Refresh Off</button>
   <form method="post" action="/querylog/clear" style="margin:0"><button class="btn btn-outline-danger">Clear</button></form>
+  <span class="small text-secondary" id="ql-count" style="display:flex;align-items:center">{len(data)} entries</span>
 </div>
 <div class="panel rounded-2 border border-secondary-subtle p-3"><div class="table-responsive"><table class="table table-dark table-hover mobile-card-table" id="ql-table"><thead><tr><th>Time</th><th>Client</th><th>Connect</th><th>Domain</th><th>Type</th><th>Status</th><th>Upstream</th><th>ms</th><th>Actions</th></tr></thead><tbody id="ql-body">{body}</tbody></table></div></div>
 <script>
 let qlTimer;
+function esc(s) {{
+  return String(s||'').replace(/[&<>"']/g,c=>({{
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }}[c]));
+}}
 function qlSearch() {{
   clearTimeout(qlTimer);
   qlTimer = setTimeout(() => {{
@@ -4114,7 +4124,7 @@ function qlToggleAuto() {{
     btn.textContent = 'Auto-Refresh On';
     btn.className = 'btn btn-success';
     qlFetch();
-    qlAutoTimer = setInterval(() => qlFetch(), 3000);
+    qlAutoTimer = setInterval(() => qlFetch(), 1000);
   }} else {{
     btn.textContent = 'Auto-Refresh Off';
     btn.className = 'btn btn-outline-light';
@@ -4130,17 +4140,21 @@ function qlFetch() {{
   if (q) p.set('q', q);
   if (c) p.set('client', c);
   if (s) p.set('status', s);
-  fetch('/api/querylog?' + p.toString())
+  fetch('/api/querylog?' + p.toString(), {{cache:'no-store'}})
     .then(r => r.json())
     .then(d => {{
       const tb = document.getElementById('ql-body');
+      const count = document.getElementById('ql-count');
+      if (count) count.textContent = d.length + ' entries';
+      const nextUrl = p.toString() ? ('/querylog?' + p.toString()) : '/querylog';
+      history.replaceState(null, '', nextUrl);
       const connectLabel = (value) => {{
         const labels = {{udp:'UDP', tcp:'TCP', doh:'HTTPS', https:'HTTPS', dot:'TLS', tls:'TLS', doq:'QUIC', quic:'QUIC'}};
         const raw = String(value || '').trim();
-        if (!raw) return 'Unknown';
+        if (!raw) return 'UDP';
         return labels[raw.toLowerCase()] || raw.toUpperCase();
       }};
-      tb.innerHTML = d.map(r => {{
+      tb.innerHTML = d.length ? d.map(r => {{
         let bc = 'success';
         if (r.status.includes('block') || r.status==='refused' || r.status==='upstream_error') bc='danger';
         else if (r.status==='cached' || r.status==='rewritten') bc='info';
@@ -4150,8 +4164,8 @@ function qlFetch() {{
         const client = esc(r.client_ip || '');
         const profDisabled = r.profile_name ? '' : 'disabled';
         const actions = `<div class="btn-group btn-group-sm" role="group"><button class="btn btn-outline-light" onclick="qlRuleAction('${{domain}}','${{act}}','global','${{client}}','')">${{label}} Global</button><button class="btn btn-outline-light" onclick="qlRuleAction('${{domain}}','${{act}}','profile','${{client}}','')" ${{profDisabled}}>${{label}} Profile</button></div>`;
-        return `<tr><td data-label="Time">${{r.timestamp}}</td><td data-label="Client">${{r.client_ip}}</td><td data-label="Connect">${{connectLabel(r.connection_type)}}</td><td data-label="Domain" class="td-domain">${{r.domain}}</td><td data-label="Type">${{r.query_type}}</td><td data-label="Status"><span class="badge text-bg-${{bc}}">${{r.status}}</span></td><td data-label="Upstream">${{r.upstream||''}}</td><td data-label="ms">${{r.duration_ms?.toFixed(1)||''}}</td><td data-label="Actions">${{actions}}</td></tr>`;
-      }}).join('');
+        return `<tr><td data-label="Time">${{r.timestamp}}</td><td data-label="Client">${{r.client_display_name || r.client_ip}}</td><td data-label="Connect">${{connectLabel(r.connection_type)}}</td><td data-label="Domain" class="td-domain">${{r.domain}}</td><td data-label="Type">${{r.query_type}}</td><td data-label="Status"><span class="badge text-bg-${{bc}}">${{r.status}}</span></td><td data-label="Upstream">${{r.upstream||''}}</td><td data-label="ms">${{r.duration_ms?.toFixed(1)||''}}</td><td data-label="Actions">${{actions}}</td></tr>`;
+      }}).join('') : '<tr><td colspan="9" style="color:var(--muted);text-align:center;padding:1rem">No matching entries</td></tr>';
     }}).catch(() => {{}});
 }}
 function qlRuleAction(domain, action, scope, client, profileId) {{
@@ -4365,14 +4379,52 @@ def clients_page():
     data = client_manager.get_clients() if client_manager else []
     profiles = client_manager.get_profiles() if client_manager else []
     profile_opts = "".join(f"<option value='{p['id']}'>{p['name']}</option>" for p in profiles)
-    table = "".join(
-        f"<tr><td data-label='Name'>{r['name']}</td><td data-label='IP'>{r['ip']}</td><td data-label='CIDR'>{r.get('cidr','')}</td>"
-        f"<td data-label='Profile'>{r.get('profile_name','Default')}</td>"
-        f"<td data-label='Filter'>{toggle(r['filtering_enabled'])}</td>"
-        f"<td data-label='Actions'><form method='post' action='/clients/delete' style='display:inline'><input type='hidden' name='id' value='{r['id']}'>"
-        f"<button class='btn btn-sm btn-outline-danger'>Delete</button></form></td></tr>"
-        for r in data
-    )
+    table = ""
+    edit_modals = ""
+    for r in data:
+        rid = int(r["id"])
+        edit_id = f"clientEdit-{rid}"
+        cidr_or_ip = r.get("cidr") or r.get("ip") or ""
+        edit_profile_opts = "".join(
+            f"<option value='{p['id']}' {'selected' if str(p['id']) == str(r.get('profile_id') or '') else ''}>{html_escape(p['name'])}</option>"
+            for p in profiles
+        )
+        filter_checked = "checked" if r.get("filtering_enabled") else ""
+        table += (
+            f"<tr><td data-label='Name'>{html_escape(r['name'])}</td><td data-label='IP'>{html_escape(r['ip'])}</td><td data-label='CIDR'>{html_escape(r.get('cidr',''))}</td>"
+            f"<td data-label='Profile'>{html_escape(r.get('profile_name','Default') or 'Default')}</td>"
+            f"<td data-label='Filter'>{toggle(r['filtering_enabled'])}</td>"
+            f"<td data-label='Actions'><button class='btn btn-sm btn-outline-light' type='button' onclick=\"document.getElementById('{edit_id}').classList.add('show')\">Edit</button>"
+            f"<form method='post' action='/clients/delete' style='display:inline;margin-left:.35rem'><input type='hidden' name='id' value='{rid}'>"
+            f"<button class='btn btn-sm btn-outline-danger'>Delete</button></form></td></tr>"
+        )
+        edit_modals += f"""
+<div id="{edit_id}" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="modal-box">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+      <h2 class="h5" style="margin:0">Edit {html_escape(r['name'] or r['ip'])}</h2>
+      <button class="btn btn-sm btn-outline-light" type="button" onclick="document.getElementById('{edit_id}').classList.remove('show')" style="border:none;font-size:1.2rem">&times;</button>
+    </div>
+    <form method="post" action="/clients/edit">
+      <input type="hidden" name="id" value="{rid}">
+      <label class="form-label">Name</label><input class="form-control mb-2" name="name" value="{html_escape(r['name'])}" required>
+      <label class="form-label">IP or CIDR</label><input class="form-control mb-2" name="address" value="{html_escape(cidr_or_ip)}" required>
+      <label class="form-label">Profile</label><select class="form-select mb-2" name="profile_id">
+        <option value="">-- Select Profile --</option>
+        {edit_profile_opts}
+      </select>
+      <label class="settings-switch mb-3" for="client-filter-{rid}">
+        <span><span class="settings-label">Filtering Enabled</span><span class="settings-help">Apply filtering rules to this client.</span></span>
+        <input type="hidden" name="filtering_enabled" value="0">
+        <span class="toggle settings-toggle">
+          <input id="client-filter-{rid}" type="checkbox" role="switch" name="filtering_enabled" value="1" {filter_checked}>
+          <span class="toggle-track"></span><span class="toggle-thumb"></span>
+        </span>
+      </label>
+      <button class="btn btn-success w-100" type="submit">Save</button>
+    </form>
+  </div>
+</div>"""
     return template(f"""
 <h1 class="h3 mb-3">Clients</h1><div class="row g-3">
 <div class="col-xl-4"><form class="panel rounded-2 border border-secondary-subtle p-3" method="post" action="/clients/add">
@@ -4384,7 +4436,7 @@ def clients_page():
 {profile_opts}
 </select>
 <button class="btn btn-success w-100">Save</button></form></div>
-<div class="col-xl-8"><div class="panel rounded-2 border border-secondary-subtle p-3"><div class="table-responsive"><table class="table table-dark table-hover mobile-card-table"><thead><tr><th>Name</th><th>IP</th><th>CIDR</th><th>Profile</th><th>Filter</th><th></th></tr></thead><tbody>{table}</tbody></table></div></div></div></div>""", "Clients")
+<div class="col-xl-8"><div class="panel rounded-2 border border-secondary-subtle p-3"><div class="table-responsive"><table class="table table-dark table-hover mobile-card-table"><thead><tr><th>Name</th><th>IP</th><th>CIDR</th><th>Profile</th><th>Filter</th><th></th></tr></thead><tbody>{table}</tbody></table></div></div></div></div>{edit_modals}""", "Clients")
 
 
 def profiles_page():
@@ -5126,10 +5178,10 @@ def api_docs_page():
              '{\n  "total": 1024, "blocked": 312, "block_rate": 30.5,\n  "avg_ms": 14.2, "cache_rate": 18.3,\n  "clients": 5, "rules": 87432, "upstreams": 2, "uptime": 3600\n}'),
         ]),
         ("Query Log", [
-            ("GET", "/api/querylog", "Latest 500 DNS requests as a JSON array.",
+            ("GET", "/api/querylog", "All retained DNS requests as a JSON array. Supports q, client, and status filters.",
              None,
              '[{\n  "id": 1, "timestamp": "2026-05-31T12:00:00+02:00",\n  "client_ip": "192.168.0.10", "domain": "example.com",\n  "query_type": "A", "status": "allowed",\n  "duration_ms": 12.4, "matched_rule": "", "upstream": "Cloudflare"\n}]'),
-            ("GET", "/api/querylog.csv", "Download query log as a CSV file (up to 5,000 entries). Browser starts the download.",
+            ("GET", "/api/querylog.csv", "Download the retained query log as a CSV file. Browser starts the download.",
              None, None),
         ]),
         ("Filtering", [
@@ -6059,6 +6111,30 @@ class WebHandler(BaseHTTPRequestHandler):
                     db.execute("INSERT INTO clients(name,address,created_at) VALUES(?,?,?)", (form.get("name", ""), form.get("address", ""), now_iso()))
                     db.commit()
             self.redirect("/clients")
+        elif path == "/clients/edit":
+            if client_manager is not None:
+                cid = int(form.get("id"))
+                name = form.get("name", "").strip()
+                address = form.get("address", "").strip()
+                profile_id = form.get("profile_id")
+                profile_id = int(profile_id) if profile_id else None
+                filtering_enabled = form.get("filtering_enabled") == "1"
+                ip = address
+                cidr = address if "/" in address else ""
+                if "/" in address:
+                    ip = address.split("/", 1)[0].strip()
+                    ipaddress.ip_network(address, strict=False)
+                else:
+                    ipaddress.ip_address(address)
+                client_manager.update_client(
+                    cid,
+                    name=name or address,
+                    ip=ip,
+                    cidr=cidr,
+                    profile_id=profile_id,
+                    filtering_enabled=filtering_enabled,
+                )
+            self.redirect("/clients")
         elif path == "/clients/delete":
             if client_manager is not None:
                 client_manager.delete_client(int(form.get("id")))
@@ -6730,9 +6806,9 @@ class WebHandler(BaseHTTPRequestHandler):
                 w.append("client_ip LIKE ?"); v.append(f"%{params['client'][0]}%")
             if params.get("status", [""])[0]:
                 w.append("status=?"); v.append(params["status"][0])
-            sql = "SELECT * FROM query_log"
+            sql = "SELECT q.*, COALESCE(NULLIF(c.name, c.ip), NULLIF(q.client_name, ''), q.client_ip) AS client_display_name FROM query_log q LEFT JOIN clients c ON c.ip = q.client_ip"
             if w: sql += " WHERE " + " AND ".join(w)
-            sql += " ORDER BY id DESC LIMIT 300"
+            sql += " ORDER BY q.id DESC LIMIT 300"
             self.send_json(rows(sql, v))
         elif path == "/api/explain":
             domain = params.get("domain", [""])[0]
@@ -6742,7 +6818,7 @@ class WebHandler(BaseHTTPRequestHandler):
             else:
                 self.send_json(explain_decision(domain, client))
         elif path == "/api/querylog.csv":
-            data = rows("SELECT * FROM query_log ORDER BY id DESC LIMIT 5000")
+            data = rows("SELECT * FROM query_log ORDER BY id DESC")
             data = [{k: v for k, v in row.items() if k != "matched_rule"} for row in data]
             output = io.StringIO()
             writer = csv.DictWriter(output, fieldnames=data[0].keys() if data else ["id"])
