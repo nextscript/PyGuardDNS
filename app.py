@@ -32,6 +32,20 @@ import bcrypt
 from dns_engine import FilterEngine, FilterResult
 from blocklist_manager import BlocklistManager
 from client_manager import ClientManager, SERVICE_DOMAINS, SAFESEARCH_REWRITES, YOUTUBE_SAFESEARCH_REWRITES, SAFESEARCH_PROFILE_COLUMNS
+try:
+    from dnssec_validator import DNSSECValidator, DNSSECValidationStatus, get_dnssec_metrics
+    import dns.message
+    import dns.flags
+    _dnssec_available = True
+except ModuleNotFoundError:
+    _dnssec_available = False
+    DNSSECValidator = None
+    DNSSECValidationStatus = None
+    def get_dnssec_metrics():
+        return {"secure": 0, "insecure": 0, "bogus": 0, "indeterminate": 0, "validation_seconds_total": 0.0}
+
+import logging
+logger = logging.getLogger("dnssec")
 
 APP_NAME = "PyGuardDNS"
 DB_PATH = os.environ.get("LOCALDNSGUARD_DB", "localdnsguard.sqlite3")
@@ -89,6 +103,8 @@ _healthcheck_lock = threading.Lock()
 
 _active_engine = FilterEngine()
 _active_engine_lock = threading.RLock()
+_dnssec_validator = None
+_dnssec_validator_lock = threading.Lock()
 blocklist_manager = None
 client_manager = None
 web_server = None
@@ -150,6 +166,51 @@ def build_filter_engine():
             if blocked_services:
                 engine.set_profile_blocked_services(pid, blocked_services)
     return engine
+
+
+def get_dnssec_validator():
+    if not _dnssec_available:
+        return None
+    global _dnssec_validator
+    if _dnssec_validator is None:
+        with _dnssec_validator_lock:
+            if _dnssec_validator is None:
+                import dns.resolver
+                import dns.flags
+                upstream_dns = []
+                for up in active_upstreams():
+                    if plain_upstream_supported(up):
+                        upstream_dns.append(up["address"])
+                if not upstream_dns:
+                    upstream_dns = ["1.1.1.1", "8.8.8.8"]
+                resolver = dns.resolver.Resolver(configure=False)
+                resolver.nameservers = upstream_dns
+                resolver.timeout = 3.0
+                resolver.lifetime = 3.0
+                resolver.use_edns(edns=True, payload=1232, ednsflags=dns.flags.DO)
+                _dnssec_validator = DNSSECValidator(resolver)
+                _dnssec_validator.reload_trust_anchor()
+    return _dnssec_validator
+
+
+def add_do_bit_to_query(request_bytes):
+    if not _dnssec_available:
+        return request_bytes
+    try:
+        import dns.message
+        import dns.flags
+        msg = dns.message.from_wire(request_bytes)
+        if msg.edns != 0:
+            msg.use_edns(edns=True, payload=1232, ednsflags=dns.flags.DO)
+        return msg.to_wire()
+    except Exception:
+        return request_bytes
+
+
+def clear_dnssec_validator():
+    global _dnssec_validator
+    with _dnssec_validator_lock:
+        _dnssec_validator = None
 
 
 def reload_filter_engine():
@@ -3020,11 +3081,51 @@ def handle_dns_request(request, client_ip, connection_type=""):
             log_query(client_ip, domain, normalized, qtype_name, "cached", response_ips=extract_response_ips(cached), cache_status="hit", duration_ms=(time.perf_counter() - started) * 1000, client_name=dc, profile_name=dp, connection_type=connection_type)
             return cached
 
-        response, upstream = forward_query(request)
+        forwarding_request = request
+        if get_setting("dnssec_validation_enabled", "0") == "1":
+            forwarding_request = add_do_bit_to_query(request)
+        response, upstream = forward_query(forwarding_request)
         response = apply_ipv6_disabled_policy(response)
         filtering_on = get_setting("filtering_enabled", "1") == "1" and client_filtering_enabled(client_ip)
         profile_id = decision.get("profile_id")
         engine = get_filter_engine()
+
+        client_cd_flag = bool(question.get("flags", 0) & 0x0100)
+
+        if _dnssec_available and get_setting("dnssec_validation_enabled", "0") == "1" and not client_cd_flag:
+            try:
+                import dns.message
+                import dns.flags
+                qmsg = dns.message.from_wire(forwarding_request)
+                rmsg = dns.message.from_wire(response)
+                validator = get_dnssec_validator()
+                if validator:
+                    dnssec_result = validator.validate_response(qmsg, rmsg)
+                    if dnssec_result.status in ("bogus", "indeterminate"):
+                        servfail_response = build_error_response(request, 2)
+                        log_query(client_ip, domain, normalized, qtype_name, "blocked",
+                                  upstream=upstream, matched_rule="dnssec_bogus",
+                                  blocked=1, reason=dnssec_result.reason,
+                                  duration_ms=(time.perf_counter() - started) * 1000,
+                                  client_name=dc, profile_name=dp, connection_type=connection_type)
+                        return servfail_response
+                    response_bytes = rmsg.to_wire()
+                    if dnssec_result.ad_flag_allowed:
+                        ad_mask = ~dns.flags.AD & 0xFFFF
+                        response_bytes = bytearray(response_bytes)
+                        flags = struct.unpack("!H", response_bytes[2:4])[0]
+                        flags = (flags & ad_mask) | dns.flags.AD
+                        response_bytes[2:4] = struct.pack("!H", flags)
+                        response = bytes(response_bytes)
+                    else:
+                        response_bytes = bytearray(response_bytes)
+                        flags = struct.unpack("!H", response_bytes[2:4])[0]
+                        flags = flags & ~dns.flags.AD
+                        response_bytes[2:4] = struct.pack("!H", flags)
+                        response = bytes(response_bytes)
+            except Exception as e:
+                logger.warning("DNSSEC validation error for %s: %s", normalized, e)
+
         for cname in extract_cname_targets(response):
             cname_result = engine.check(cname, filtering_enabled=filtering_on, profile_id=profile_id)
             if cname_result.action == "BLOCK":
@@ -4964,7 +5065,7 @@ def settings_page(message="", is_error=False, values=None):
       </div>
       <div class="settings-section-body settings-stack">
         {switch("filtering_enabled", "Filtering", "Apply rules, rewrites, and blocklists.", "1")}
-        {switch("dnssec_validation_enabled", "DNSSEC Validation", "Validate DNSSEC signatures when supported by the resolver path.", "0")}
+        {switch("dnssec_validation_enabled", "DNSSEC Self-Validation", "Validate DNSSEC signatures locally using a root trust anchor. Bogus signed responses are returned as SERVFAIL.", "0")}
         {switch("query_log_enabled", "Query Log", "Store DNS query history for the dashboard and log view.", "1")}
         <div>
           <label class="form-label">Log Retention (days)</label>
@@ -5640,6 +5741,9 @@ def collect_metrics():
     cache_stats_data = cache_stats()
     dot_metrics = dot_pool_metrics()
     queue_metrics = upstream_queue_wait_metrics()
+    dnssec_metrics = get_dnssec_metrics()
+    validator = get_dnssec_validator()
+    dnssec_cache = validator.cache_stats() if validator else {}
     return {
         "total_queries": summary.get("total", 0),
         "blocked_queries": summary.get("blocked", 0),
@@ -5651,6 +5755,12 @@ def collect_metrics():
         "active_upstreams": summary.get("upstreams", 0),
         "cache_entries": cache_stats_data.get("entries", 0),
         "cache_bytes": cache_stats_data.get("bytes_used", 0),
+        "dnssec_secure": dnssec_metrics.get("secure", 0),
+        "dnssec_insecure": dnssec_metrics.get("insecure", 0),
+        "dnssec_bogus": dnssec_metrics.get("bogus", 0),
+        "dnssec_indeterminate": dnssec_metrics.get("indeterminate", 0),
+        "dnssec_validation_seconds": dnssec_metrics.get("validation_seconds_total", 0.0),
+        "dnssec_dnskey_cache_entries": dnssec_cache.get("dnskey_cache_entries", 0),
         **dot_metrics,
         **queue_metrics,
     }
@@ -6758,6 +6868,32 @@ class WebHandler(BaseHTTPRequestHandler):
             "# TYPE pyguarddns_upstream_queue_wait_seconds gauge",
             f"pyguarddns_upstream_queue_wait_seconds {m['upstream_queue_wait_ms_avg'] / 1000}",
         ]
+        lines += [
+            "",
+            "# HELP pyguarddns_dnssec_secure_total DNSSEC secure validations",
+            "# TYPE pyguarddns_dnssec_secure_total counter",
+            f"pyguarddns_dnssec_secure_total {m['dnssec_secure']}",
+            "",
+            "# HELP pyguarddns_dnssec_insecure_total DNSSEC insecure results",
+            "# TYPE pyguarddns_dnssec_insecure_total counter",
+            f"pyguarddns_dnssec_insecure_total {m['dnssec_insecure']}",
+            "",
+            "# HELP pyguarddns_dnssec_bogus_total DNSSEC bogus results",
+            "# TYPE pyguarddns_dnssec_bogus_total counter",
+            f"pyguarddns_dnssec_bogus_total {m['dnssec_bogus']}",
+            "",
+            "# HELP pyguarddns_dnssec_indeterminate_total DNSSEC indeterminate results",
+            "# TYPE pyguarddns_dnssec_indeterminate_total counter",
+            f"pyguarddns_dnssec_indeterminate_total {m['dnssec_indeterminate']}",
+            "",
+            "# HELP pyguarddns_dnssec_validation_seconds Total seconds spent on DNSSEC validation",
+            "# TYPE pyguarddns_dnssec_validation_seconds counter",
+            f"pyguarddns_dnssec_validation_seconds {m['dnssec_validation_seconds']}",
+            "",
+            "# HELP pyguarddns_dnssec_dnskey_cache_entries DNSKEY cache entries",
+            "# TYPE pyguarddns_dnssec_dnskey_cache_entries gauge",
+            f"pyguarddns_dnssec_dnskey_cache_entries {m['dnssec_dnskey_cache_entries']}",
+        ]
         body = "\n".join(lines).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -7558,8 +7694,48 @@ def console_loop():
             break
 
 
+def ensure_requirements():
+    try:
+        import subprocess, json, sys
+        req_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
+        if not os.path.exists(req_path):
+            return
+        with open(req_path) as f:
+            required = []
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and not line.startswith("-"):
+                    required.append(line)
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "list", "--format=json", "--disable-pip-version-check"],
+            capture_output=True, text=True, timeout=30
+        )
+        installed = {pkg["name"].lower(): pkg["version"] for pkg in json.loads(result.stdout)}
+        to_install = []
+        for req in required:
+            name = req.split(">=")[0].split("==")[0].split("<")[0].split("~=")[0].split("!=")[0].strip().lower()
+            if name == "pip":
+                continue
+            if name not in installed:
+                to_install.append(req)
+        if not to_install:
+            return
+        print(f"Missing packages: {', '.join(to_install)} — installing...", flush=True)
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install"] + to_install,
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode != 0:
+            print(f"pip install failed (exit {result.returncode}):\n{result.stdout}\n{result.stderr}", flush=True)
+        else:
+            print("Done.", flush=True)
+    except Exception as e:
+        print(f"Warning: could not verify requirements: {e}", flush=True)
+
+
 def main():
     global dns_servers, encrypted_dns_servers
+    ensure_requirements()
     install_crash_handlers()
     if not acquire_instance_lock():
         print(f"{APP_NAME} is already running. Please do not start a second window.", flush=True)
