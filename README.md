@@ -45,7 +45,7 @@ By default, the application listens on DNS port `53` for UDP/TCP and serves the 
 - Administrator/root privileges if the DNS server should listen on port `53`
 - Network access for external upstream resolvers and blocklist downloads
 
-Python dependencies are listed in `requirements.txt`.
+Runtime dependencies are listed in `requirements.txt`. Test and development dependencies are listed in `requirements-dev.txt`.
 
 ## Quick Start
 
@@ -258,6 +258,39 @@ localdnsguard.sqlite3
 
 Backups can be exported and restored through the web interface or CLI. Backups include settings, rules, DNS rewrites, upstreams, profiles, clients, profile rules, profile blocklist mappings, and blocklist metadata. Query logs are not part of the normal backup.
 
+## Development and Tests
+
+The normal start scripts install only runtime dependencies. Development dependencies such as `pytest` are installed only when requested.
+
+The development dependency install is a startup option, not a web UI setting, because it runs before the application starts. Use one of these commands when you want the start script to install test tools:
+
+```bat
+start-pyguarddns.bat --dev-deps
+```
+
+```sh
+sudo ./start-pyguarddns.sh --dev-deps
+```
+
+Install development dependencies and run tests:
+
+```sh
+python -m pip install -r requirements-dev.txt
+python -m pytest
+```
+
+Syntax check:
+
+```sh
+python -m py_compile app.py dns_engine.py blocklist_manager.py client_manager.py benchmark_filter_engine.py
+```
+
+Benchmark the filter engine with generated rules:
+
+```sh
+python benchmark_filter_engine.py --rules 100000 --samples 5000
+```
+
 ## Security Notes
 
 - Do not expose the web interface to the public internet without additional protection.
@@ -273,7 +306,8 @@ dns_engine.py             Filter engine for rules, rewrites, SafeSearch, and ser
 blocklist_manager.py      Import, parsing, update, and storage of blocklists
 client_manager.py         Profiles, clients, profile rules, and service blocks
 benchmark_filter_engine.py Synthetic filter-engine benchmark
-requirements.txt          Python dependencies
+requirements.txt          Runtime Python dependencies
+requirements-dev.txt      Test/development Python dependencies
 start-pyguarddns.bat      Windows start script
 start-pyguarddns.sh       Linux/macOS start script
 tests/                    Pytest test suite
