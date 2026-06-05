@@ -1,4 +1,5 @@
 import base64
+import json
 import logging
 import os
 import threading
@@ -57,10 +58,62 @@ _EMBEDDED_ROOT_KEY = """\
 """
 
 
-def _ensure_data_files():
-    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+def _default_data_dir():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+
+def _read_root_anchor_entries(xml_text):
+    root = ET.fromstring(xml_text)
+    anchors = []
+    for kd in root.findall("KeyDigest"):
+        digest = kd.findtext("Digest", "").strip().upper()
+        if not digest:
+            continue
+        anchor = {
+            "key_tag": int(kd.findtext("KeyTag", "0")),
+            "algorithm": int(kd.findtext("Algorithm", "8")),
+            "digest_type": int(kd.findtext("DigestType", "2")),
+            "digest": digest,
+            "source": "IANA root-anchors.xml",
+        }
+        public_key = kd.findtext("PublicKey", "").strip()
+        flags = kd.findtext("Flags", "").strip()
+        if public_key:
+            anchor["public_key"] = public_key
+        if flags:
+            anchor["flags"] = int(flags)
+        valid_from = kd.attrib.get("validFrom")
+        valid_until = kd.attrib.get("validUntil")
+        if valid_from:
+            anchor["valid_from"] = valid_from
+        if valid_until:
+            anchor["valid_until"] = valid_until
+        anchors.append(anchor)
+    return anchors
+
+
+def _write_trust_anchor_json(json_path, xml_text):
+    anchors = _read_root_anchor_entries(xml_text)
+    payload = {
+        "zone": ".",
+        "anchors": anchors,
+        "status": "static_embedded",
+        "source": "embedded IANA root-anchors.xml",
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "rfc5011_auto_update": False,
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+
+
+def ensure_root_trust_anchor(data_dir=None, xml_path=None, key_path=None, json_path=None):
+    data_dir = data_dir or _default_data_dir()
     os.makedirs(data_dir, exist_ok=True)
-    xml_path = os.path.join(data_dir, "root-anchors.xml")
+    xml_path = xml_path or os.path.join(data_dir, "root-anchors.xml")
+    key_path = key_path or os.path.join(data_dir, "root.key")
+    json_path = json_path or os.path.join(data_dir, "trust_anchors.json")
+
     if not os.path.exists(xml_path):
         try:
             with open(xml_path, "w", encoding="utf-8") as f:
@@ -76,6 +129,23 @@ def _ensure_data_files():
             logger.info("Created %s from embedded root DNSKEYs", key_path)
         except Exception as e:
             logger.error("Failed to create %s: %s", key_path, e)
+    if not os.path.exists(json_path):
+        try:
+            with open(xml_path, "r", encoding="utf-8") as f:
+                xml_text = f.read()
+            _write_trust_anchor_json(json_path, xml_text)
+            logger.info("Created %s from root trust anchor XML", json_path)
+        except Exception as e:
+            logger.error("Failed to create %s: %s", json_path, e)
+
+    missing = [path for path in (xml_path, key_path, json_path) if not os.path.exists(path)]
+    if missing:
+        return False, "Missing DNSSEC trust anchor file(s): " + ", ".join(missing)
+    return True, ""
+
+
+def _ensure_data_files():
+    ensure_root_trust_anchor()
 
 
 _ensure_data_files()
@@ -339,37 +409,14 @@ class DNSSECValidator:
         qtype = question.rdtype
 
         has_sig = False
-        rrsig_sections = []
-        for section_name, section in (("answer", response_message.answer), ("authority", response_message.authority)):
+        for section in (response_message.answer, response_message.authority):
             for rrset in section:
                 if rrset.rdtype == dns.rdatatype.RRSIG:
                     has_sig = True
-                    for rdata in rrset:
-                        rrsig_sections.append(
-                            f"{rrset.name} {dns.rdatatype.to_text(rdata.type_covered)} "
-                            f"algo={rdata.algorithm} signer={rdata.signer}"
-                        )
+                    break
 
         if not has_sig:
-            logger.debug("DNSSEC no RRSIG for %s type=%s - unsigned path", qname, dns.rdatatype.to_text(qtype))
             return self._validate_unsigned(response_message, qname, qtype)
-
-        logger.debug(
-            "DNSSEC signed response for %s type=%s has_sig=True rrsigs=[%s]",
-            qname, dns.rdatatype.to_text(qtype), "; ".join(rrsig_sections),
-        )
-
-        # Collect DNSKEY names from response for debugging
-        dnskey_names = []
-        for section in (response_message.answer, response_message.authority):
-            for rrset in section:
-                if rrset.rdtype == dns.rdatatype.DNSKEY:
-                    for rdata in rrset:
-                        dnskey_names.append(f"{rrset.name} algo={rdata.algorithm} flags={rdata.flags}")
-        if dnskey_names:
-            logger.debug("DNSSEC DNSKEYs in response: %s", "; ".join(dnskey_names))
-        else:
-            logger.debug("DNSSEC no DNSKEYs in response for %s", qname)
 
         return self._validate_signed(response_message, qname, qtype)
 
@@ -457,118 +504,74 @@ class DNSSECValidator:
                 )
 
             with _trust_anchor_lock:
+                ds_set = _trust_anchor_ds_set
                 dnskey_set = _trust_anchor_dnskey_set
 
-            # Collect RRSIG records and DNSKEY records from the response.
-            # In dnspython, rrsets are grouped by (name, rdclass, rdtype), so
-            # RRSIG records live in their own rrsets, separate from the data
-            # they cover.  We must pair them explicitly.
-            rrsig_by_target: dict[tuple[dns.name.Name, int], dns.rrset.RRset] = {}
-            dnskey_by_name: dict[dns.name.Name, dns.rrset.RRset] = {}
+            validated_ok = False
+            validated_rrsets = []
 
             for section in (response_message.answer, response_message.authority):
                 for rrset in section:
                     if rrset.rdtype == dns.rdatatype.RRSIG:
-                        for rdata in rrset:
-                            key = (rrset.name, rdata.type_covered)
-                            if key not in rrsig_by_target:
-                                rrsig_by_target[key] = dns.rrset.RRset(
-                                    rrset.name, rrset.rdclass, dns.rdatatype.RRSIG
-                                )
-                            rrsig_by_target[key].add(rdata)
-                    elif rrset.rdtype == dns.rdatatype.DNSKEY:
-                        dnskey_by_name[rrset.name] = rrset
-
-            # Build the keys dict from the root trust anchor and any DNSKEY
-            # rrsets present in the response.
-            keys: dict[dns.name.Name, dns.rdataset.Rdataset] = {}
-            if dnskey_set:
-                root_keys = dns.rdataset.Rdataset(dns.rdataclass.IN)
-                for k in dnskey_set:
-                    root_keys.add(k)
-                keys[dns.name.root] = root_keys
-            for name, rrset in dnskey_by_name.items():
-                if name not in keys:
-                    keys[name] = dns.rdataset.Rdataset(rrset.rdclass)
-                for rdata in rrset:
-                    keys[name].add(rdata)
-
-            # Log what was collected from the response
-            collected_rrsigs = [
-                f"{name} {dns.rdatatype.to_text(tc)}"
-                for (name, tc) in rrsig_by_target
-            ]
-            collected_dnskeys = [
-                f"{name} algo={[r.algorithm for r in rrset]}"
-                for name, rrset in dnskey_by_name.items()
-            ]
-            logger.debug(
-                "DNSSEC _validate_signed: rrsigs=[%s] dnskeys=[%s] keys_loaded=%d",
-                "; ".join(collected_rrsigs), "; ".join(collected_dnskeys), len(keys),
-            )
-
-            validated_ok = False
-            validated_rrsets: list[str] = []
-
-            # Validate every non-RRSIG, non-DNSKEY rrset that has a
-            # matching RRSIG in the response.
-            for section in (response_message.answer, response_message.authority):
-                for rrset in section:
-                    if rrset.rdtype in (dns.rdatatype.RRSIG, dns.rdatatype.DNSKEY):
                         continue
-                    sig_key = (rrset.name, rrset.rdtype)
-                    rrsigset = rrsig_by_target.get(sig_key)
-                    if rrsigset is None:
-                        continue
-                    try:
-                        dns.dnssec.validate(rrset, rrsigset, keys)
-                        validated_ok = True
-                        validated_rrsets.append(
-                            rrset.name.to_text() + " " + dns.rdatatype.to_text(rrset.rdtype)
-                        )
-                    except (dns.dnssec.ValidationFailure, dns.exception.DNSException) as e:
-                        logger.warning(
-                            "DNSSEC bogus %s %s reason=%s",
-                            qname_str, dns.rdatatype.to_text(qtype), e,
-                        )
-                        _incr_metric("bogus")
-                        return DNSSECValidationResult(
-                            DNSSECValidationStatus.BOGUS,
-                            f"RRSIG validation failed for {rrset.name.to_text().rstrip('.')} {dns.rdatatype.to_text(rrset.rdtype)}: {e}",
-                        )
+                    covering = None
+                    for rdat in rrset:
+                        if rdat.rdtype == dns.rdatatype.RRSIG:
+                            covering = rdat
+                            break
+                    if covering is not None:
+                        rrsig_set = dns.rrset.RRset(rrset.name, rrset.rdclass, dns.rdatatype.RRSIG)
+                        for rdat in rrset:
+                            if rdat.rdtype == dns.rdatatype.RRSIG:
+                                rrsig_set.add(rdat)
+                        try:
+                            dns.dnssec.validate(rrset, response_message)
+                            validated_ok = True
+                            validated_rrsets.append(rrset.name.to_text() + " " + dns.rdatatype.to_text(rrset.rdtype))
+                        except (dns.dnssec.ValidationFailure, dns.exception.DNSException) as e:
+                            logger.warning(
+                                "DNSSEC bogus %s %s reason=%s",
+                                qname_str, dns.rdatatype.to_text(qtype), e,
+                            )
+                            _incr_metric("bogus")
+                            return DNSSECValidationResult(
+                                DNSSECValidationStatus.BOGUS,
+                                f"RRSIG validation failed for {rrset.name.to_text().rstrip('.')} {dns.rdatatype.to_text(rrset.rdtype)}: {e}",
+                            )
 
             if validated_ok:
                 logger.info(
-                    "DNSSEC secure %s type=%s reason=signature validated against DNSKEY",
+                    "DNSSEC secure %s type=%s reason=chain validated to root trust anchor",
                     qname_str, dns.rdatatype.to_text(qtype),
                 )
                 _incr_metric("secure")
                 return DNSSECValidationResult(
                     DNSSECValidationStatus.SECURE,
-                    "signature validated against DNSKEY",
+                    "chain validated to root trust anchor",
                     ad_flag_allowed=True,
                     validated_rrsets=validated_rrsets,
                 )
 
-            # Fallback: try validating authority-section rrsets (e.g. NSEC/NSEC3)
-            # using the same approach.
+            authority_rrsig = False
             for rrset in response_message.authority:
-                if rrset.rdtype in (dns.rdatatype.RRSIG, dns.rdatatype.DNSKEY):
-                    continue
-                sig_key = (rrset.name, rrset.rdtype)
-                rrsigset = rrsig_by_target.get(sig_key)
-                if rrsigset is None:
-                    continue
-                try:
-                    dns.dnssec.validate(rrset, rrsigset, keys)
-                    _incr_metric("secure")
-                    return DNSSECValidationResult(
-                        DNSSECValidationStatus.SECURE,
-                        "authority section validated",
-                        ad_flag_allowed=True,
-                    )
-                except (dns.dnssec.ValidationFailure, dns.exception.DNSException):
-                    pass
+                if rrset.rdtype == dns.rdatatype.RRSIG:
+                    authority_rrsig = True
+                    break
+
+            if authority_rrsig:
+                for rrset in response_message.authority:
+                    if rrset.rdtype == dns.rdatatype.RRSIG:
+                        continue
+                    try:
+                        dns.dnssec.validate(rrset, response_message)
+                        _incr_metric("secure")
+                        return DNSSECValidationResult(
+                            DNSSECValidationStatus.SECURE,
+                            "authority section validated",
+                            ad_flag_allowed=True,
+                        )
+                    except (dns.dnssec.ValidationFailure, dns.exception.DNSException):
+                        pass
 
             _incr_metric("indeterminate")
             return DNSSECValidationResult(

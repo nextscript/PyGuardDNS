@@ -33,7 +33,7 @@ from dns_engine import FilterEngine, FilterResult
 from blocklist_manager import BlocklistManager
 from client_manager import ClientManager, SERVICE_DOMAINS, SAFESEARCH_REWRITES, YOUTUBE_SAFESEARCH_REWRITES, SAFESEARCH_PROFILE_COLUMNS
 try:
-    from dnssec_validator import DNSSECValidator, DNSSECValidationStatus, get_dnssec_metrics
+    from dnssec_validator import DNSSECValidator, DNSSECValidationStatus, ensure_root_trust_anchor, get_dnssec_metrics
     import dns.message
     import dns.flags
     _dnssec_available = True
@@ -41,6 +41,8 @@ except ModuleNotFoundError:
     _dnssec_available = False
     DNSSECValidator = None
     DNSSECValidationStatus = None
+    def ensure_root_trust_anchor(*args, **kwargs):
+        return False, "dnspython DNSSEC support is not available"
     def get_dnssec_metrics():
         return {"secure": 0, "insecure": 0, "bogus": 0, "indeterminate": 0, "validation_seconds_total": 0.0}
 
@@ -170,6 +172,10 @@ def build_filter_engine():
 
 def get_dnssec_validator():
     if not _dnssec_available:
+        return None
+    ok, err = ensure_root_trust_anchor()
+    if not ok:
+        logger.error("DNSSEC trust anchor bootstrap failed: %s", err)
         return None
     global _dnssec_validator
     if _dnssec_validator is None:
@@ -6414,11 +6420,21 @@ class WebHandler(BaseHTTPRequestHandler):
                     validate_certificate_pair(cert, key, domain)
                     if encrypted_enabled and (not cert.strip() or not key.strip()):
                         raise ValueError("DNS-over-TLS/QUIC requires both certificate and private key")
+                dnssec_was_enabled = get_setting("dnssec_validation_enabled", "0") == "1"
+                dnssec_will_be_enabled = form.get("dnssec_validation_enabled") == "1"
+                if dnssec_will_be_enabled:
+                    if not _dnssec_available:
+                        raise ValueError("DNSSEC Self-Validation requires dnspython with DNSSEC support")
+                    ok, err = ensure_root_trust_anchor()
+                    if not ok:
+                        raise ValueError(f"DNSSEC trust anchor bootstrap failed: {err}")
             except ValueError as exc:
                 self.send_html(settings_page(str(exc), True, form), 400)
                 return
             for key in settings_keys:
                 set_setting(key, form.get(key, ""))
+            if dnssec_will_be_enabled or dnssec_was_enabled:
+                clear_dnssec_validator()
             load_runtime_network_settings()
             set_runtime_status("Reboot DNS ...", ready=False)
             schedule_dns_runtime_restart()
