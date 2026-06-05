@@ -3408,12 +3408,14 @@ def template(content, title="Dashboard"):
     .panel-title{{font-size:.92rem;font-weight:700}}
     .panel-link{{font-size:.82rem;color:var(--accent)}}
     .page-toolbar{{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-bottom:1.05rem}}
-    .three-col{{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin-bottom:1.3rem;max-width:100%;min-width:0}}
-    .three-col .panel{{width:100%;max-width:100%;min-width:0;overflow:hidden}}
-    .three-col table{{table-layout:fixed}}
-    .three-col th,.three-col td{{min-width:0}}
-    .three-col .td-num{{width:96px}}
-    .three-col th:last-child,.three-col td:last-child{{width:104px}}
+    .three-col,.two-col{{display:grid;gap:1rem;margin-bottom:1.3rem;max-width:100%;min-width:0}}
+    .three-col{{grid-template-columns:repeat(3,1fr)}}
+    .two-col{{grid-template-columns:repeat(2,1fr)}}
+    .three-col .panel,.two-col .panel{{width:100%;max-width:100%;min-width:0;overflow:hidden}}
+    .three-col table,.two-col table{{table-layout:fixed}}
+    .three-col th,.three-col td,.two-col th,.two-col td{{min-width:0}}
+    .three-col .td-num,.two-col .td-num{{width:96px}}
+    .three-col th:last-child,.three-col td:last-child,.two-col th:last-child,.two-col td:last-child{{width:104px}}
     table{{width:100%;border-collapse:collapse}}
     .table{{width:100%;border-collapse:collapse;margin-bottom:0}}
     th,.table th{{font-size:.78rem;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.05em;padding:.58rem 1rem;text-align:left;border-bottom:1px solid var(--border)}}
@@ -3486,7 +3488,7 @@ def template(content, title="Dashboard"):
     .modal-overlay{{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:1000;display:flex;align-items:center;justify-content:center;opacity:0;visibility:hidden;transition:.2s}}
     .modal-overlay.show{{opacity:1;visibility:visible}}
     .modal-box{{background:#101721;border:1px solid #223044;border-radius:.6rem;width:calc(100% - 2rem);max-width:520px;padding:1.5rem;max-height:90vh;overflow-y:auto}}
-    @media(max-width:1100px){{.card-grid{{grid-template-columns:repeat(2,1fr)}}.three-col{{grid-template-columns:1fr}}}}
+    @media(max-width:1100px){{.card-grid{{grid-template-columns:repeat(2,1fr)}}.three-col,.two-col{{grid-template-columns:1fr}}}}
     @media(max-width:768px){{
       html,body{{height:auto;min-height:100%;font-size:14px}}
       .layout{{grid-template-columns:1fr;grid-template-rows:auto auto 1fr;min-height:100vh}}
@@ -3508,10 +3510,10 @@ def template(content, title="Dashboard"):
       body.nav-open{{overflow:hidden}}
       .card-grid{{grid-template-columns:1fr 1fr}}
       .setup-grid{{grid-template-columns:1fr}}
-      .three-col{{grid-template-columns:1fr;gap:.75rem;margin-bottom:1rem;width:100%}}
-      .three-col table{{width:100%;max-width:100%;min-width:0}}
-      .three-col .td-num{{width:82px}}
-      .three-col th:last-child,.three-col td:last-child{{width:86px}}
+      .three-col,.two-col{{grid-template-columns:1fr;gap:.75rem;margin-bottom:1rem;width:100%}}
+      .three-col table,.two-col table{{width:100%;max-width:100%;min-width:0}}
+      .three-col .td-num,.two-col .td-num{{width:82px}}
+      .three-col th:last-child,.three-col td:last-child,.two-col th:last-child,.two-col td:last-child{{width:86px}}
       main{{padding:.9rem;overflow:visible}}
       .page-title{{font-size:1.05rem;margin-bottom:.8rem}}
       .page-toolbar{{align-items:flex-start;flex-wrap:wrap;margin-bottom:.85rem}}
@@ -3558,8 +3560,8 @@ def template(content, title="Dashboard"):
       .table-responsive>.table,.table-responsive>table{{min-width:640px}}
       .table-responsive>.mobile-card-table{{min-width:0!important}}
       .table-responsive>.domain-test-table{{min-width:0!important}}
-      .three-col .td-num{{width:70px}}
-      .three-col th:last-child,.three-col td:last-child{{width:74px}}
+      .three-col .td-num,.two-col .td-num{{width:70px}}
+      .three-col th:last-child,.three-col td:last-child,.two-col th:last-child,.two-col td:last-child{{width:74px}}
       .d-flex.flex-wrap>.form-control,.d-flex.flex-wrap>.form-select,.d-flex.flex-wrap>.btn,.d-flex.flex-wrap>form{{flex:1 1 100%!important;max-width:none!important;width:100%}}
       .d-flex.flex-wrap>form>.btn{{width:100%}}
       #bl-type{{width:100%!important}}
@@ -3905,7 +3907,7 @@ def extended_dashboard_data():
     top_domains = rows("""
         SELECT normalized_domain as domain, COUNT(*) as cnt
         FROM query_log WHERE timestamp >= datetime('now','localtime','-24 hours')
-          AND normalized_domain != '' AND status NOT IN ('local')
+          AND normalized_domain != '' AND blocked=0 AND status NOT IN ('local')
         GROUP BY normalized_domain ORDER BY cnt DESC LIMIT 8
     """)
     top_blocked = rows("""
@@ -3913,6 +3915,19 @@ def extended_dashboard_data():
         FROM query_log WHERE blocked=1 AND timestamp >= datetime('now','localtime','-24 hours')
           AND normalized_domain != ''
         GROUP BY normalized_domain ORDER BY cnt DESC LIMIT 8
+    """)
+    top_cache_domains = rows("""
+        SELECT normalized_domain as domain, COUNT(*) as cnt
+        FROM query_log WHERE cache_status='hit' AND timestamp >= datetime('now','localtime','-24 hours')
+          AND normalized_domain != ''
+        GROUP BY normalized_domain ORDER BY cnt DESC LIMIT 8
+    """)
+    top_upstreams = rows("""
+        SELECT upstream, COUNT(*) as requests,
+               COALESCE(AVG(CASE WHEN duration_ms<1000 THEN duration_ms END),0) as avg_ms
+        FROM query_log WHERE timestamp >= datetime('now','localtime','-24 hours')
+          AND upstream != ''
+        GROUP BY upstream ORDER BY requests DESC LIMIT 8
     """)
     top_clients = rows("""
         SELECT client_ip, COUNT(*) as requests, COALESCE(SUM(blocked),0) as blocked,
@@ -3928,9 +3943,12 @@ def extended_dashboard_data():
             "avg_ms": pct_change(combined["avg_ms"], prev["avg_ms"]),
         },
         "sparklines": {"total": sparkline_total, "blocked": sparkline_blocked, "cache": sparkline_cache, "avgms": sparkline_avgms},
-        "top_domains": top_domains, "top_blocked": top_blocked, "top_clients": top_clients,
+        "top_domains": top_domains, "top_blocked": top_blocked,
+        "top_cache_domains": top_cache_domains, "top_upstreams": top_upstreams,
+        "top_clients": top_clients,
         "total_q": combined["total"] or 1,
         "cache_rate": round((combined["cache_hits"] / combined["total"] * 100) if combined["total"] else 0, 1),
+        "total_cache_hits": combined["cache_hits"] or 1,
         "rules_count": one("SELECT COUNT(*) c FROM rules WHERE enabled=1")["c"]
         + one("SELECT COALESCE(SUM(bl.rule_count),0) c FROM blocklists bl WHERE bl.enabled=1")["c"],
         "upstreams_count": one("SELECT COUNT(*) c FROM upstreams WHERE enabled=1")["c"],
@@ -3946,6 +3964,7 @@ def dashboard_page():
     today = d["today"]
     sp = d["sparklines"]
     total_q = d["total_q"]
+    total_cache_hits = d["total_cache_hits"]
     changes = d["changes"]
     blue = "#3b82f6"; red = "#ef4444"; orange = "#f59e0b"; purple = "#a78bfa"
 
@@ -4015,6 +4034,19 @@ def dashboard_page():
         for r in d["top_blocked"]
     ) or '<tr><td colspan="3" style="color:var(--muted);text-align:center;padding:1rem">No blocked domains</td></tr>'
 
+    def cache_row(r):
+        pct = round(r["cnt"] / total_cache_hits * 100, 1) if total_cache_hits else 0
+        return f'<tr><td class="td-domain">{r["domain"]}</td><td class="td-num">{r["cnt"]:,}</td><td class="td-num">{pct}%</td></tr>'
+
+    top_cache_html = "".join(cache_row(r) for r in d["top_cache_domains"]) or \
+        '<tr><td colspan="3" style="color:var(--muted);text-align:center;padding:1rem">No cache hits yet</td></tr>'
+
+    top_upstream_html = "".join(
+        f'<tr><td class="td-domain">{r["upstream"]}</td><td class="td-num">{r["requests"]:,}</td>'
+        f'<td class="td-num">{round(r["avg_ms"], 1)} ms</td></tr>'
+        for r in d["top_upstreams"]
+    ) or '<tr><td colspan="3" style="color:var(--muted);text-align:center;padding:1rem">No upstream data yet</td></tr>'
+
     def client_row(r):
         req = r["requests"]; blk = r["blocked"]
         pct_blk = round(blk / req * 100, 1) if req else 0
@@ -4039,7 +4071,10 @@ def dashboard_page():
 
     return template(f"""
 <div class="page-toolbar">
-  <span class="page-title" style="margin-bottom:0">Dashboard</span>
+  <div style="display:flex;align-items:center;gap:.65rem;flex-wrap:wrap">
+    <span class="page-title" style="margin-bottom:0">Dashboard</span>
+    <button class="btn btn-outline-light btn-sm" type="button" id="dash-refresh-btn" onclick="manualRefreshDash()">Refresh stats</button>
+  </div>
   <span style="font-size:.72rem;color:var(--muted)">Live &bull; updated <span id="last-refresh">—</span></span>
 </div>
 <div class="card-grid">{cards_html}</div>
@@ -4055,6 +4090,16 @@ def dashboard_page():
   <div class="panel">
     <div class="panel-head"><span class="panel-title">Top Blocked Domains</span><a class="panel-link" href="/querylog?status=blocked">View all</a></div>
     <table><thead><tr><th>Domain</th><th class="td-num">Blocked</th><th>Status</th></tr></thead><tbody id="top-blk-body">{top_blk_html}</tbody></table>
+  </div>
+</div>
+<div class="two-col">
+  <div class="panel">
+    <div class="panel-head"><span class="panel-title">Top Cache Domains</span><a class="panel-link" href="/querylog?status=cached">View cached</a></div>
+    <table><thead><tr><th>Domain</th><th class="td-num">Hits</th><th class="td-num">% Cache</th></tr></thead><tbody id="top-cache-body">{top_cache_html}</tbody></table>
+  </div>
+  <div class="panel">
+    <div class="panel-head"><span class="panel-title">Top Upstreams</span><a class="panel-link" href="/upstreams">Manage</a></div>
+    <table><thead><tr><th>Upstream</th><th class="td-num">Requests</th><th class="td-num">Avg ms</th></tr></thead><tbody id="top-upstream-body">{top_upstream_html}</tbody></table>
   </div>
 </div>
 <div class="panel">
@@ -4092,12 +4137,13 @@ function esc(s) {{
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
   }}[c]));
 }}
-async function refreshDash() {{
+async function refreshDash(force=false) {{
   try {{
-    const r = await fetch('/api/dashboard', {{cache:'no-store'}});
+    const r = await fetch(force ? '/api/dashboard?refresh=1' : '/api/dashboard', {{cache:'no-store'}});
     if (!r.ok) return;
     const d = await r.json();
     const t=d.today, ch=d.changes, sp=d.sparklines, tq=d.total_q||1;
+    const tch=d.total_cache_hits||1;
     // Stat cards
     const cards = [
       {{id:'total',   val:t.total.toLocaleString(),                 pct:ch.total,   lower:false, spark:sp.total,               color:'#3b82f6'}},
@@ -4136,6 +4182,16 @@ async function refreshDash() {{
     if (bb) bb.innerHTML = d.top_blocked.length
       ? d.top_blocked.map(r=>`<tr><td class="td-domain">${{esc(r.domain)}}</td><td class="td-num">${{r.cnt.toLocaleString()}}</td><td><span class="badge badge-red">Blocked</span></td></tr>`).join('')
       : `<tr><td colspan="3" style="color:var(--muted);text-align:center;padding:1rem">No blocked domains</td></tr>`;
+    // Top cache domains
+    const cacheb = document.getElementById('top-cache-body');
+    if (cacheb) cacheb.innerHTML = d.top_cache_domains.length
+      ? d.top_cache_domains.map(r=>`<tr><td class="td-domain">${{esc(r.domain)}}</td><td class="td-num">${{r.cnt.toLocaleString()}}</td><td class="td-num">${{(r.cnt/tch*100).toFixed(1)}}%</td></tr>`).join('')
+      : `<tr><td colspan="3" style="color:var(--muted);text-align:center;padding:1rem">No cache hits yet</td></tr>`;
+    // Top upstreams
+    const ub = document.getElementById('top-upstream-body');
+    if (ub) ub.innerHTML = d.top_upstreams.length
+      ? d.top_upstreams.map(r=>`<tr><td class="td-domain">${{esc(r.upstream)}}</td><td class="td-num">${{r.requests.toLocaleString()}}</td><td class="td-num">${{(Math.round((r.avg_ms||0)*10)/10)}} ms</td></tr>`).join('')
+      : `<tr><td colspan="3" style="color:var(--muted);text-align:center;padding:1rem">No upstream data yet</td></tr>`;
     // Top clients
     const cb = document.getElementById('dash-clients');
     if (cb) cb.innerHTML = d.top_clients.length
@@ -4151,6 +4207,18 @@ async function refreshDash() {{
     const ts = document.getElementById('last-refresh');
     if (ts) ts.textContent = new Date().toLocaleTimeString('de-DE',{{hour:'2-digit',minute:'2-digit',second:'2-digit'}});
   }} catch(e) {{}}
+}}
+async function manualRefreshDash() {{
+  const btn = document.getElementById('dash-refresh-btn');
+  if (btn) {{
+    btn.disabled = true;
+    btn.textContent = 'Refreshing...';
+  }}
+  await refreshDash(true);
+  if (btn) {{
+    btn.disabled = false;
+    btn.textContent = 'Refresh stats';
+  }}
 }}
 setInterval(refreshDash, 3000);
 refreshDash();
@@ -5305,7 +5373,7 @@ def api_docs_page():
              '{\n  "app": "PyGuardDNS",\n  "dns": {"host": "0.0.0.0", "port": 53},\n  "web": {"host": "0.0.0.0", "port": 8080},\n  "summary": { "total": 1024, "blocked": 312, ... }\n}'),
             ("GET", "/api/dashboard", "Live dashboard data: statistics for the last 24 h, sparklines, top domains, top clients.",
              None,
-             '{\n  "today": {"total": 1024, "blocked": 312, "avg_ms": 14.2},\n  "sparklines": {"total": [...24 values...], "blocked": [...24 values...]},\n  "top_domains": [{"domain": "example.com", "cnt": 45}],\n  "top_blocked": [...],\n  "top_clients": [...]\n}'),
+             '{\n  "today": {"total": 1024, "blocked": 312, "avg_ms": 14.2},\n  "sparklines": {"total": [...24 values...], "blocked": [...24 values...]},\n  "top_domains": [{"domain": "example.com", "cnt": 45}],\n  "top_blocked": [...],\n  "top_cache_domains": [...],\n  "top_upstreams": [...],\n  "top_clients": [...]\n}'),
             ("GET", "/api/stats/summary", "Short statistics: total requests, blocked requests, cache rate, clients, uptime.",
              None,
              '{\n  "total": 1024, "blocked": 312, "block_rate": 30.5,\n  "avg_ms": 14.2, "cache_rate": 18.3,\n  "clients": 5, "rules": 87432, "upstreams": 2, "uptime": 3600\n}'),
@@ -7035,6 +7103,9 @@ class WebHandler(BaseHTTPRequestHandler):
                 "healthcheck_last_run": hc_last,
             })
         elif path == "/api/dashboard":
+            if params.get("refresh", [""])[0] == "1":
+                dash_cache["data"] = None
+                dash_cache["ts"] = 0.0
             self.send_json(extended_dashboard_data())
         elif path == "/api/stats/summary":
             self.send_json(stats_summary())
