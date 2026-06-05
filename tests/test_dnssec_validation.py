@@ -33,7 +33,16 @@ from dnssec_validator import (
 def _reset_metrics():
     with _metrics_lock:
         _metrics.clear()
-        _metrics.update({"secure": 0, "insecure": 0, "bogus": 0, "indeterminate": 0, "validation_seconds_total": 0.0})
+        _metrics.update({
+            "secure": 0,
+            "insecure": 0,
+            "bogus": 0,
+            "indeterminate": 0,
+            "validation_seconds_total": 0.0,
+            "nsec_validations": 0,
+            "nsec3_validations": 0,
+            "nsec3_failures": 0,
+        })
 
 
 class TestDNSSECCache(unittest.TestCase):
@@ -176,6 +185,35 @@ class TestTrustAnchorStore(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(tmpdir, "root-anchors.xml")))
             self.assertTrue(os.path.exists(os.path.join(tmpdir, "root.key")))
             self.assertTrue(os.path.exists(os.path.join(tmpdir, "trust_anchors.json")))
+            with open(os.path.join(tmpdir, "trust_anchors.json"), "r", encoding="utf-8") as f:
+                payload = __import__("json").load(f)
+            self.assertTrue(payload["rfc5011_auto_update"])
+            self.assertIn("anchors", payload)
+
+    def test_corrupted_trust_anchor_state_is_backed_up(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ok, err = ensure_root_trust_anchor(data_dir=tmpdir)
+            self.assertTrue(ok, err)
+            json_path = os.path.join(tmpdir, "trust_anchors.json")
+            with open(json_path, "w", encoding="utf-8") as f:
+                f.write("{not-json")
+            ok, err = ensure_root_trust_anchor(data_dir=tmpdir)
+            self.assertTrue(ok, err)
+            backups = [name for name in os.listdir(tmpdir) if ".broken." in name]
+            self.assertTrue(backups)
+
+    def test_rfc5011_pending_anchor_is_not_promoted_immediately(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ok, err = ensure_root_trust_anchor(data_dir=tmpdir)
+            self.assertTrue(ok, err)
+            json_path = os.path.join(tmpdir, "trust_anchors.json")
+            with open(json_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            pending = [a for a in payload["anchors"] if a.get("state") == "pending"]
+            self.assertTrue(pending)
+            self.assertTrue(all(a.get("state") != "active" for a in pending))
 
     def test_bootstrapped_trust_anchor_loads(self):
         import dnssec_validator
@@ -203,6 +241,35 @@ class TestDNSSECMetrics(unittest.TestCase):
         self.assertEqual(metrics["bogus"], 0)
         self.assertEqual(metrics["indeterminate"], 0)
         self.assertEqual(metrics["validation_seconds_total"], 0.0)
+
+
+class TestNSEC3Proofs(TestDNSSECValidatorBase):
+    def test_nsec3_hash_uses_dnssec_algorithm(self):
+        rdata = dns.rdata.from_text(
+            dns.rdataclass.IN,
+            dns.rdatatype.NSEC3,
+            "1 0 12 AABBCC 2T7B4G4VSA5SMI47K61MV5BV1A22BOJR A NS SOA",
+        )
+        result = self.validator._nsec3_hash_name(dns.name.from_text("example.com."), rdata)
+        self.assertIsInstance(result, str)
+        self.assertTrue(result)
+
+    def test_nsec3_is_not_valid_just_because_rrset_exists(self):
+        name = dns.name.from_text("2t7b4g4vsa5smi47k61mv5bv1a22bojr.example.com.")
+        rrset = dns.rrset.RRset(name, dns.rdataclass.IN, dns.rdatatype.NSEC3)
+        rrset.add(dns.rdata.from_text(
+            dns.rdataclass.IN,
+            dns.rdatatype.NSEC3,
+            "1 0 12 AABBCC 2T7B4G4VSA5SMI47K61MV5BV1A22BOJR A NS SOA",
+        ))
+        ok, reason = self.validator._prove_nsec3_denial(
+            [rrset],
+            dns.name.from_text("missing.example.com."),
+            dns.rdatatype.A,
+            dns.rcode.NXDOMAIN,
+        )
+        self.assertFalse(ok)
+        self.assertIn("proof", reason)
 
     def test_metrics_are_isolated(self):
         from dnssec_validator import _incr_metric

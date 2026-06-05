@@ -181,20 +181,11 @@ def get_dnssec_validator():
     if _dnssec_validator is None:
         with _dnssec_validator_lock:
             if _dnssec_validator is None:
-                import dns.resolver
-                import dns.flags
-                upstream_dns = []
-                for up in active_upstreams():
-                    if plain_upstream_supported(up):
-                        upstream_dns.append(up["address"])
-                if not upstream_dns:
-                    upstream_dns = ["1.1.1.1", "8.8.8.8"]
-                resolver = dns.resolver.Resolver(configure=False)
-                resolver.nameservers = upstream_dns
-                resolver.timeout = 3.0
-                resolver.lifetime = 3.0
-                resolver.use_edns(edns=True, payload=1232, ednsflags=dns.flags.DO)
-                _dnssec_validator = DNSSECValidator(resolver)
+                def dnssec_fetch(request_wire):
+                    response_wire, _ = forward_query(request_wire)
+                    return response_wire
+
+                _dnssec_validator = DNSSECValidator(query_func=dnssec_fetch)
                 _dnssec_validator.reload_trust_anchor()
     return _dnssec_validator
 
@@ -206,8 +197,7 @@ def add_do_bit_to_query(request_bytes):
         import dns.message
         import dns.flags
         msg = dns.message.from_wire(request_bytes)
-        if msg.edns != 0:
-            msg.use_edns(edns=True, payload=1232, ednsflags=dns.flags.DO)
+        msg.use_edns(edns=True, payload=1232, ednsflags=dns.flags.DO)
         return msg.to_wire()
     except Exception:
         return request_bytes
@@ -5750,6 +5740,7 @@ def collect_metrics():
     dnssec_metrics = get_dnssec_metrics()
     validator = get_dnssec_validator()
     dnssec_cache = validator.cache_stats() if validator else {}
+    dnssec_anchor = validator.trust_anchor_info() if validator else {}
     return {
         "total_queries": summary.get("total", 0),
         "blocked_queries": summary.get("blocked", 0),
@@ -5766,7 +5757,17 @@ def collect_metrics():
         "dnssec_bogus": dnssec_metrics.get("bogus", 0),
         "dnssec_indeterminate": dnssec_metrics.get("indeterminate", 0),
         "dnssec_validation_seconds": dnssec_metrics.get("validation_seconds_total", 0.0),
+        "dnssec_nsec_validations": dnssec_metrics.get("nsec_validations", 0),
+        "dnssec_nsec3_validations": dnssec_metrics.get("nsec3_validations", 0),
+        "dnssec_nsec3_failures": dnssec_metrics.get("nsec3_failures", 0),
         "dnssec_dnskey_cache_entries": dnssec_cache.get("dnskey_cache_entries", 0),
+        "dnssec_rfc5011_enabled": dnssec_anchor.get("rfc5011_auto_update", False),
+        "dnssec_active_ksks": len(dnssec_anchor.get("active_ksks", [])),
+        "dnssec_pending_ksks": len(dnssec_anchor.get("pending_ksks", [])),
+        "dnssec_revoked_ksks": len(dnssec_anchor.get("revoked_ksks", [])),
+        "dnssec_last_rfc5011_check": dnssec_anchor.get("last_checked", ""),
+        "dnssec_next_rfc5011_check": dnssec_anchor.get("next_check", ""),
+        "dnssec_last_error": dnssec_anchor.get("last_error", ""),
         **dot_metrics,
         **queue_metrics,
     }
@@ -6909,6 +6910,34 @@ class WebHandler(BaseHTTPRequestHandler):
             "# HELP pyguarddns_dnssec_dnskey_cache_entries DNSKEY cache entries",
             "# TYPE pyguarddns_dnssec_dnskey_cache_entries gauge",
             f"pyguarddns_dnssec_dnskey_cache_entries {m['dnssec_dnskey_cache_entries']}",
+            "",
+            "# HELP pyguarddns_dnssec_nsec_validations_total DNSSEC NSEC negative proof validations",
+            "# TYPE pyguarddns_dnssec_nsec_validations_total counter",
+            f"pyguarddns_dnssec_nsec_validations_total {m['dnssec_nsec_validations']}",
+            "",
+            "# HELP pyguarddns_dnssec_nsec3_validations_total DNSSEC NSEC3 negative proof validations",
+            "# TYPE pyguarddns_dnssec_nsec3_validations_total counter",
+            f"pyguarddns_dnssec_nsec3_validations_total {m['dnssec_nsec3_validations']}",
+            "",
+            "# HELP pyguarddns_dnssec_nsec3_failures_total DNSSEC NSEC3 negative proof failures",
+            "# TYPE pyguarddns_dnssec_nsec3_failures_total counter",
+            f"pyguarddns_dnssec_nsec3_failures_total {m['dnssec_nsec3_failures']}",
+            "",
+            "# HELP pyguarddns_dnssec_rfc5011_enabled DNSSEC RFC5011 trust anchor rollover enabled",
+            "# TYPE pyguarddns_dnssec_rfc5011_enabled gauge",
+            f"pyguarddns_dnssec_rfc5011_enabled {1 if m['dnssec_rfc5011_enabled'] else 0}",
+            "",
+            "# HELP pyguarddns_dnssec_active_root_ksks Active RFC5011 root KSKs",
+            "# TYPE pyguarddns_dnssec_active_root_ksks gauge",
+            f"pyguarddns_dnssec_active_root_ksks {m['dnssec_active_ksks']}",
+            "",
+            "# HELP pyguarddns_dnssec_pending_root_ksks Pending RFC5011 root KSKs",
+            "# TYPE pyguarddns_dnssec_pending_root_ksks gauge",
+            f"pyguarddns_dnssec_pending_root_ksks {m['dnssec_pending_ksks']}",
+            "",
+            "# HELP pyguarddns_dnssec_revoked_root_ksks Revoked or retired RFC5011 root KSKs",
+            "# TYPE pyguarddns_dnssec_revoked_root_ksks gauge",
+            f"pyguarddns_dnssec_revoked_root_ksks {m['dnssec_revoked_ksks']}",
         ]
         body = "\n".join(lines).encode("utf-8")
         self.send_response(200)
@@ -6928,6 +6957,9 @@ class WebHandler(BaseHTTPRequestHandler):
                 "FROM upstreams u LEFT JOIN upstream_health uh ON uh.upstream_id=u.id "
                 "ORDER BY u.id ASC"
             )
+            validator = get_dnssec_validator()
+            dnssec_anchor = validator.trust_anchor_info() if validator else {}
+            dnssec_metrics = get_dnssec_metrics()
             self.send_json({
                 "app": APP_NAME, "dns": {"host": DNS_HOST, "port": DNS_PORT},
                 "web": {"host": WEB_HOST, "port": WEB_PORT},
@@ -6956,6 +6988,23 @@ class WebHandler(BaseHTTPRequestHandler):
                         "connect_url": f"quic://{encrypted_status['domain']}:{DNS_QUIC_PORT}" if encrypted_status["domain"] else "",
                         "upstream_disabled_reason": "DoQ upstream forwarding needs persistent QUIC pooling before it can be enabled by default",
                     },
+                },
+                "dnssec": {
+                    "enabled": get_setting("dnssec_validation_enabled", "0") == "1",
+                    "trust_anchor_loaded": bool(dnssec_anchor.get("loaded")),
+                    "rfc5011_enabled": bool(dnssec_anchor.get("rfc5011_auto_update")),
+                    "active_root_ksks": dnssec_anchor.get("active_ksks", []),
+                    "pending_root_ksks": dnssec_anchor.get("pending_ksks", []),
+                    "revoked_root_ksks": dnssec_anchor.get("revoked_ksks", []),
+                    "last_rfc5011_check": dnssec_anchor.get("last_checked", ""),
+                    "next_rfc5011_check": dnssec_anchor.get("next_check", ""),
+                    "last_error": dnssec_anchor.get("last_error") or dnssec_anchor.get("error", ""),
+                    "nsec_validations": dnssec_metrics.get("nsec_validations", 0),
+                    "nsec3_validations": dnssec_metrics.get("nsec3_validations", 0),
+                    "nsec3_failures": dnssec_metrics.get("nsec3_failures", 0),
+                    "bogus": dnssec_metrics.get("bogus", 0),
+                    "indeterminate": dnssec_metrics.get("indeterminate", 0),
+                    "validation_seconds_total": dnssec_metrics.get("validation_seconds_total", 0.0),
                 },
                 "summary": stats_summary(),
                 "upstream_health": upstream_health,
