@@ -200,10 +200,8 @@ def add_do_bit_to_query(request_bytes):
         import dns.message
         import dns.flags
         msg = dns.message.from_wire(request_bytes)
-        # Always (re-)set EDNS with the DO bit so DNSSEC records are
-        # requested from the upstream.  msg.edns is -1 when no EDNS is
-        # present, otherwise the EDNS version (normally 0).
-        msg.use_edns(edns=True, payload=1232, ednsflags=dns.flags.DO)
+        if msg.edns != 0:
+            msg.use_edns(edns=True, payload=1232, ednsflags=dns.flags.DO)
         return msg.to_wire()
     except Exception:
         return request_bytes
@@ -683,8 +681,7 @@ def discover_system_dns_servers():
 
 
 def get_setting(key, default=""):
-    with db_lock:
-        row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     return row["value"] if row else default
 
 
@@ -3104,11 +3101,6 @@ def handle_dns_request(request, client_ip, connection_type=""):
                 validator = get_dnssec_validator()
                 if validator:
                     dnssec_result = validator.validate_response(qmsg, rmsg)
-                    logger.debug(
-                        "DNSSEC result for %s: status=%s reason=%s ad_allowed=%s",
-                        normalized, dnssec_result.status, dnssec_result.reason,
-                        dnssec_result.ad_flag_allowed,
-                    )
                     if dnssec_result.status in ("bogus", "indeterminate"):
                         servfail_response = build_error_response(request, 2)
                         log_query(client_ip, domain, normalized, qtype_name, "blocked",
@@ -7376,6 +7368,7 @@ class DoQRuntimeServer:
                 def __init__(self, *args, **kwargs):
                     super().__init__(*args, **kwargs)
                     self._buffers = {}
+                    self._responded = set()
 
                 def quic_event_received(self, event):
                     if isinstance(event, ProtocolNegotiated):
@@ -7427,7 +7420,10 @@ class DoQRuntimeServer:
                         update_doq_metric("last_error", str(exc))
                         log_doq_event(f"handler: {exc}")
                         payload = b""
+                    if sid in self._responded:
+                        return
                     self._quic.send_stream_data(sid, payload, end_stream=True)
+                    self._responded.add(sid)
                     self.transmit()
 
             cert = get_setting("encrypted_dns_certificate_pem", "")
@@ -7490,34 +7486,34 @@ class DoQRuntimeServer:
 
 def start_encrypted_dns_servers():
     servers = []
-    try:
-        context = None
-        def ssl_context():
-            nonlocal context
-            if context is None:
-                context = make_encrypted_dns_ssl_context()
-            return context
-        if get_setting("dns_over_tls_enabled", "0") == "1":
+    context = None
+    def ssl_context():
+        nonlocal context
+        if context is None:
+            context = make_encrypted_dns_ssl_context()
+        return context
+    if get_setting("dns_over_tls_enabled", "0") == "1":
+        try:
             dot = ReusableThreadingTLSDNSServer((ENCRYPTED_DNS_HOST, DNS_TLS_PORT), DNSTCPHandler, ssl_context())
             threading.Thread(target=dot.serve_forever, name="dns-over-tls-server", daemon=True).start()
             servers.append(dot)
-        if get_setting("dns_over_https_enabled", "0") == "1":
+        except Exception as exc:
+            print(f"Failed to start DoT server: {exc}", flush=True)
+    if get_setting("dns_over_https_enabled", "0") == "1":
+        try:
             doh = ReusableThreadingHTTPSServer((ENCRYPTED_DNS_HOST, DNS_HTTPS_PORT), DNSHTTPSHandler, ssl_context())
             threading.Thread(target=doh.serve_forever, name="dns-over-https-server", daemon=True).start()
             servers.append(doh)
-        if get_setting("dns_over_quic_enabled", "0") == "1":
+        except Exception as exc:
+            print(f"Failed to start DoH server: {exc}", flush=True)
+    if get_setting("dns_over_quic_enabled", "0") == "1":
+        try:
             doq = DoQRuntimeServer(ENCRYPTED_DNS_HOST, DNS_QUIC_PORT, make_encrypted_dns_ssl_context())
             doq.start()
             servers.append(doq)
-        return servers
-    except Exception:
-        for srv in servers:
-            try:
-                srv.shutdown()
-                srv.server_close()
-            except Exception:
-                pass
-        raise
+        except Exception as exc:
+            print(f"Failed to start DoQ server: {exc}", flush=True)
+    return servers
 
 
 def start_web_server():
