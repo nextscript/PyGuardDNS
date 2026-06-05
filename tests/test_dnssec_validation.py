@@ -2,6 +2,7 @@ import base64
 import os
 import sys
 import time
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -22,6 +23,7 @@ from dnssec_validator import (
     DNSSECValidationStatus,
     DNSSECValidator,
     TrustAnchorStore,
+    ensure_root_trust_anchor,
     get_dnssec_metrics,
     _metrics,
     _metrics_lock,
@@ -166,6 +168,28 @@ class TestTrustAnchorStore(unittest.TestCase):
         store = TrustAnchorStore(xml_path="", key_path=self.key_path)
         ok, err = store.load()
         self.assertTrue(ok, f"Trust anchor should load: {err}")
+
+    def test_ensure_root_trust_anchor_creates_missing_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ok, err = ensure_root_trust_anchor(data_dir=tmpdir)
+            self.assertTrue(ok, err)
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "root-anchors.xml")))
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "root.key")))
+            self.assertTrue(os.path.exists(os.path.join(tmpdir, "trust_anchors.json")))
+
+    def test_bootstrapped_trust_anchor_loads(self):
+        import dnssec_validator
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ok, err = ensure_root_trust_anchor(data_dir=tmpdir)
+            self.assertTrue(ok, err)
+            dnssec_validator._trust_anchor_loaded = False
+            store = TrustAnchorStore(
+                xml_path=os.path.join(tmpdir, "root-anchors.xml"),
+                key_path=os.path.join(tmpdir, "root.key"),
+            )
+            ok, err = store.load()
+            self.assertTrue(ok, f"Bootstrapped trust anchor should load: {err}")
 
 
 class TestDNSSECMetrics(unittest.TestCase):
