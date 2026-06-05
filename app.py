@@ -7635,6 +7635,108 @@ def print_console_status():
     print(f"  Cache entries:   {cache_info.get('entries', 0)}", flush=True)
 
 
+def run_dnssec_self_validation_test(server_host=None, server_port=None, timeout=4.0):
+    server_host = server_host or "127.0.0.1"
+    server_port = int(server_port or DNS_PORT)
+    tests = [
+        {
+            "name": "valid signed domain",
+            "domain": "cloudflare.com.",
+            "qtype": "A",
+            "expected_rcode": "NOERROR",
+            "expect_ad": True,
+        },
+        {
+            "name": "broken DNSSEC domain",
+            "domain": "dnssec-failed.org.",
+            "qtype": "A",
+            "expected_rcode": "SERVFAIL",
+            "expect_ad": False,
+        },
+    ]
+    results = []
+    if not _dnssec_available:
+        return {
+            "server": f"{server_host}:{server_port}",
+            "enabled": False,
+            "overall": "fail",
+            "error": "DNSSEC support is not available in this Python environment",
+            "tests": [],
+        }
+
+    import dns.flags
+    import dns.message
+    import dns.rcode
+    import dns.rdatatype
+
+    dnssec_enabled = get_setting("dnssec_validation_enabled", "0") == "1"
+    overall_ok = dnssec_enabled
+
+    for item in tests:
+        started = time.perf_counter()
+        result = {
+            "name": item["name"],
+            "domain": item["domain"].rstrip("."),
+            "qtype": item["qtype"],
+            "expected_rcode": item["expected_rcode"],
+            "ok": False,
+            "rcode": "",
+            "ad": False,
+            "duration_ms": 0.0,
+            "error": "",
+        }
+        try:
+            query = dns.message.make_query(
+                item["domain"],
+                dns.rdatatype.from_text(item["qtype"]),
+                want_dnssec=True,
+            )
+            query.use_edns(edns=True, payload=1232, ednsflags=dns.flags.DO)
+            wire = query.to_wire()
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(timeout)
+                sock.sendto(wire, (server_host, server_port))
+                response_wire, _ = sock.recvfrom(4096)
+            response = dns.message.from_wire(response_wire)
+            rcode_text = dns.rcode.to_text(response.rcode())
+            ad_flag = bool(response.flags & dns.flags.AD)
+            result["rcode"] = rcode_text
+            result["ad"] = ad_flag
+            result["ok"] = (
+                rcode_text == item["expected_rcode"]
+                and (not item["expect_ad"] or ad_flag)
+                and (item["expect_ad"] or not ad_flag)
+            )
+        except Exception as exc:
+            result["error"] = str(exc)
+        finally:
+            result["duration_ms"] = round((time.perf_counter() - started) * 1000, 2)
+        overall_ok = overall_ok and result["ok"]
+        results.append(result)
+
+    return {
+        "server": f"{server_host}:{server_port}",
+        "enabled": dnssec_enabled,
+        "overall": "pass" if overall_ok else "fail",
+        "tests": results,
+    }
+
+
+def print_dnssec_self_validation_test():
+    result = run_dnssec_self_validation_test()
+    print(f"DNSSEC Self-Validation test against {result['server']}", flush=True)
+    if not result.get("enabled"):
+        print("  WARNING: dnssec_validation_enabled is off.", flush=True)
+    if result.get("error"):
+        print(f"  ERROR: {result['error']}", flush=True)
+    for item in result.get("tests", []):
+        status = "OK" if item["ok"] else "FAIL"
+        ad_text = "AD" if item["ad"] else "no AD"
+        details = item["error"] or f"rcode={item['rcode']} {ad_text} expected={item['expected_rcode']}"
+        print(f"  [{status}] {item['domain']} {item['qtype']} - {details} ({item['duration_ms']} ms)", flush=True)
+    print(f"  Overall: {result['overall'].upper()}", flush=True)
+
+
 def run_console_command(command):
     global dns_servers
     command = command.replace(chr(0xFEFF), "")
@@ -7643,10 +7745,13 @@ def run_console_command(command):
     if not cmd:
         return True
     if cmd in {"help", "?"}:
-        print("Commands: restart, stop, status, cache clear, update blocklist, help", flush=True)
+        print("Commands: restart, stop, status, dnssec test, cache clear, update blocklist, help", flush=True)
         return True
     if cmd == "status":
         print_console_status()
+        return True
+    if cmd in {"dnssec test", "test dnssec", "dnssec"}:
+        print_dnssec_self_validation_test()
         return True
     if cmd == "cache clear":
         result = clear_dns_cache()
@@ -7701,7 +7806,7 @@ def run_console_command(command):
 
 
 def console_loop():
-    print("Console commands: restart, stop, status, cache clear, update blocklist, help", flush=True)
+    print("Console commands: restart, stop, status, dnssec test, cache clear, update blocklist, help", flush=True)
     while not server_shutdown_event.is_set():
         try:
             command = input("pyguarddns> ")
@@ -7814,7 +7919,7 @@ def cli_main():
     import argparse
     parser = argparse.ArgumentParser(prog=APP_NAME, description="LocalDNSGuard DNS filtering server")
     parser.add_argument("command", nargs="?", default="serve",
-                        help="Command: serve, status, reload, update-lists, backup, restore, test-domain")
+                        help="Command: serve, status, reload, update-lists, backup, restore, test-domain, dnssec-test")
     parser.add_argument("--domain", help="Domain for test-domain command")
     parser.add_argument("--query-type", default="A", help="Query type for test-domain (default: A)")
     parser.add_argument("--client", default="127.0.0.1", help="Client IP for test-domain (default: 127.0.0.1)")
@@ -7898,6 +8003,9 @@ def cli_main():
             print(json.dumps(result, ensure_ascii=False, indent=2))
         except Exception as exc:
             print(f"Domain test failed: {exc}", file=sys.stderr)
+
+    elif cmd == "dnssec-test":
+        print_dnssec_self_validation_test()
 
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)
