@@ -190,6 +190,25 @@ def get_dnssec_validator():
     return _dnssec_validator
 
 
+def process_dnssec_trust_anchor_startup():
+    if not _dnssec_available:
+        logger.warning("DNSSEC startup trust-anchor processing skipped: dnspython is not available")
+        return False, "dnspython DNSSEC support is not available"
+    ok, err = ensure_root_trust_anchor()
+    if not ok:
+        logger.error("DNSSEC startup trust-anchor bootstrap failed: %s", err)
+        return False, err
+    validator = DNSSECValidator()
+    changed = validator.process_rfc5011_state()
+    ok, err = validator.reload_trust_anchor()
+    if not ok:
+        logger.error("DNSSEC startup trust-anchor reload failed: %s", err)
+        return False, err
+    if changed:
+        logger.warning("DNSSEC startup RFC5011 trust-anchor state promoted")
+    return True, "promoted" if changed else "unchanged"
+
+
 def add_do_bit_to_query(request_bytes):
     if not _dnssec_available:
         return request_bytes
@@ -5765,6 +5784,7 @@ def collect_metrics():
         "dnssec_active_ksks": len(dnssec_anchor.get("active_ksks", [])),
         "dnssec_pending_ksks": len(dnssec_anchor.get("pending_ksks", [])),
         "dnssec_revoked_ksks": len(dnssec_anchor.get("revoked_ksks", [])),
+        "dnssec_retired_ksks": len(dnssec_anchor.get("retired_ksks", [])),
         "dnssec_last_rfc5011_check": dnssec_anchor.get("last_checked", ""),
         "dnssec_next_rfc5011_check": dnssec_anchor.get("next_check", ""),
         "dnssec_last_error": dnssec_anchor.get("last_error", ""),
@@ -6935,9 +6955,12 @@ class WebHandler(BaseHTTPRequestHandler):
             "# TYPE pyguarddns_dnssec_pending_root_ksks gauge",
             f"pyguarddns_dnssec_pending_root_ksks {m['dnssec_pending_ksks']}",
             "",
-            "# HELP pyguarddns_dnssec_revoked_root_ksks Revoked or retired RFC5011 root KSKs",
+            "# HELP pyguarddns_dnssec_revoked_root_ksks Revoked RFC5011 root KSKs",
             "# TYPE pyguarddns_dnssec_revoked_root_ksks gauge",
             f"pyguarddns_dnssec_revoked_root_ksks {m['dnssec_revoked_ksks']}",
+            "# HELP pyguarddns_dnssec_retired_root_ksks Retired RFC5011 root KSKs",
+            "# TYPE pyguarddns_dnssec_retired_root_ksks gauge",
+            f"pyguarddns_dnssec_retired_root_ksks {m['dnssec_retired_ksks']}",
         ]
         body = "\n".join(lines).encode("utf-8")
         self.send_response(200)
@@ -6996,6 +7019,7 @@ class WebHandler(BaseHTTPRequestHandler):
                     "active_root_ksks": dnssec_anchor.get("active_ksks", []),
                     "pending_root_ksks": dnssec_anchor.get("pending_ksks", []),
                     "revoked_root_ksks": dnssec_anchor.get("revoked_ksks", []),
+                    "retired_root_ksks": dnssec_anchor.get("retired_ksks", []),
                     "last_rfc5011_check": dnssec_anchor.get("last_checked", ""),
                     "next_rfc5011_check": dnssec_anchor.get("next_check", ""),
                     "last_error": dnssec_anchor.get("last_error") or dnssec_anchor.get("error", ""),
@@ -7921,6 +7945,9 @@ def main():
         log.flush()
         init_db()
         log.write(f"{now_iso()} database ready\n")
+        log.flush()
+        dnssec_ok, dnssec_state = process_dnssec_trust_anchor_startup()
+        log.write(f"{now_iso()} dnssec trust-anchor startup {'ready' if dnssec_ok else 'failed'} {dnssec_state}\n")
         log.flush()
         start_web_server()
         log.write(f"{now_iso()} web ready on {WEB_HOST}:{WEB_PORT}\n")

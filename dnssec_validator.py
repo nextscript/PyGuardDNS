@@ -25,6 +25,7 @@ logger = logging.getLogger("dnssec")
 
 RFC5011_ADD_HOLD_DOWN_DAYS = 30
 RFC5011_REMOVE_HOLD_DOWN_DAYS = 30
+RETIRED_KEY_RETENTION_DAYS = 90
 DNSKEY_REVOKE_FLAG = 0x0080
 DNSKEY_ZONE_FLAG = 0x0100
 DNSKEY_SEP_FLAG = 0x0001
@@ -90,6 +91,14 @@ def _parse_iso(value):
         return None
 
 
+def _as_utc(dt):
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _read_root_anchor_entries(xml_text):
     root = ET.fromstring(xml_text)
     anchors = []
@@ -122,15 +131,17 @@ def _read_root_anchor_entries(xml_text):
 
 def _write_trust_anchor_json(json_path, xml_text):
     anchors = _read_root_anchor_entries(xml_text)
-    now = _iso()
-    add_until = _iso(_utc_now() + timedelta(days=RFC5011_ADD_HOLD_DOWN_DAYS))
+    now_dt = _utc_now()
+    now = _iso(now_dt)
     state_anchors = []
     for anchor in anchors:
         valid_until = anchor.get("valid_until")
+        first_seen_dt = _as_utc(_parse_iso(anchor.get("valid_from"))) or now_dt
+        add_until_dt = first_seen_dt + timedelta(days=RFC5011_ADD_HOLD_DOWN_DAYS)
         has_public_key = bool(anchor.get("public_key"))
         state = "retired" if valid_until else "active"
         if state == "active" and has_public_key and anchor.get("key_tag") not in (20326,):
-            state = "pending"
+            state = "active" if now_dt >= add_until_dt else "pending"
         state_anchor = dict(anchor)
         state_anchor.update({
             "state": state,
@@ -139,7 +150,7 @@ def _write_trust_anchor_json(json_path, xml_text):
             "revoked": False,
         })
         if state == "pending":
-            state_anchor["hold_down_until"] = add_until
+            state_anchor["hold_down_until"] = _iso(add_until_dt)
         state_anchors.append(state_anchor)
     payload = {
         "zone": ".",
@@ -331,7 +342,7 @@ class TrustAnchorStore:
             if not isinstance(payload, dict) or payload.get("zone") != ".":
                 raise ValueError("invalid trust anchor JSON")
             for anchor in payload.get("anchors", []):
-                if anchor.get("state") != "active" or anchor.get("revoked"):
+                if anchor.get("state") not in ("active", "revoked"):
                     continue
                 key_tag = int(anchor.get("key_tag", 0))
                 algorithm = int(anchor.get("algorithm", 0))
@@ -451,6 +462,10 @@ class DNSSECValidator:
         with _trust_anchor_lock:
             _trust_anchor_loaded = False
         ok, err = self._anchor.load()
+        if ok and self.process_rfc5011_state():
+            with _trust_anchor_lock:
+                _trust_anchor_loaded = False
+            ok, err = self._anchor.load()
         self._anchor_ok = ok
         self._anchor_error = err
         return ok, err
@@ -475,6 +490,7 @@ class DNSSECValidator:
             "active_ksks": [],
             "pending_ksks": [],
             "revoked_ksks": [],
+            "retired_ksks": [],
             "last_checked": "",
             "next_check": "",
             "last_error": "",
@@ -497,8 +513,10 @@ class DNSSECValidator:
                     info["active_ksks"].append(item)
                 elif anchor.get("state") == "pending":
                     info["pending_ksks"].append(item)
-                elif anchor.get("state") in ("revoked", "retired"):
+                elif anchor.get("state") == "revoked":
                     info["revoked_ksks"].append(item)
+                elif anchor.get("state") == "retired":
+                    info["retired_ksks"].append(item)
         except Exception as e:
             info["last_error"] = str(e)
         return info
@@ -523,6 +541,77 @@ class DNSSECValidator:
             json.dump(payload, f, indent=2, sort_keys=True)
             f.write("\n")
         os.replace(tmp, self._trust_anchor_json_path)
+
+    def process_rfc5011_state(self):
+        try:
+            payload = self._load_anchor_state_payload()
+        except Exception as e:
+            logger.warning("RFC5011 state processing skipped: %s", e)
+            return False
+
+        now = _utc_now()
+        now_text = _iso(now)
+        changed = False
+        for anchor in payload.get("anchors", []):
+            remove_until = _as_utc(_parse_iso(anchor.get("remove_hold_down_until")))
+            if anchor.get("revoked", False) and anchor.get("state") != "retired":
+                if remove_until is not None and now >= remove_until:
+                    anchor["state"] = "retired"
+                    anchor["retired_at"] = now_text
+                    anchor["last_seen"] = now_text
+                    anchor.pop("hold_down_until", None)
+                    logger.warning("RFC5011 retired key_tag=%s", anchor.get("key_tag"))
+                    changed = True
+                continue
+
+            if anchor.get("state") != "pending":
+                continue
+            hold_until = _parse_iso(anchor.get("hold_down_until"))
+            first_seen = _parse_iso(anchor.get("first_seen") or anchor.get("valid_from"))
+            effective_hold_until = None
+            if first_seen is not None:
+                effective_hold_until = _as_utc(first_seen) + timedelta(days=RFC5011_ADD_HOLD_DOWN_DAYS)
+            if hold_until is None:
+                hold_until = effective_hold_until
+            else:
+                hold_until = _as_utc(hold_until)
+                if effective_hold_until is not None and effective_hold_until < hold_until:
+                    hold_until = effective_hold_until
+            if hold_until is None:
+                continue
+            if now < hold_until:
+                continue
+
+            anchor["state"] = "active"
+            anchor["promoted_at"] = now_text
+            anchor["last_seen"] = now_text
+            anchor.pop("hold_down_until", None)
+            logger.warning("RFC5011 promoted key_tag=%s to active", anchor.get("key_tag"))
+            changed = True
+
+        retained_anchors = []
+        for anchor in payload.get("anchors", []):
+            if anchor.get("state") != "retired":
+                retained_anchors.append(anchor)
+                continue
+            retired_at = _as_utc(_parse_iso(anchor.get("retired_at")))
+            if retired_at is None:
+                retained_anchors.append(anchor)
+                continue
+            if now < retired_at + timedelta(days=RETIRED_KEY_RETENTION_DAYS):
+                retained_anchors.append(anchor)
+                continue
+            logger.warning("RFC5011 removed retired key_tag=%s", anchor.get("key_tag"))
+            changed = True
+        if len(retained_anchors) != len(payload.get("anchors", [])):
+            payload["anchors"] = retained_anchors
+
+        if not changed:
+            return False
+
+        payload["updated_at"] = now_text
+        self._save_anchor_state_payload(payload)
+        return True
 
     def update_rfc5011_trust_anchors(self, root_dnskey_rrset):
         if root_dnskey_rrset is None:
@@ -570,10 +659,11 @@ class DNSSECValidator:
                 }
                 if revoked:
                     anchor["remove_hold_down_until"] = _iso(now + timedelta(days=RFC5011_REMOVE_HOLD_DOWN_DAYS))
-                    logger.warning("RFC5011 revoked root KSK detected key_tag=%s algorithm=%s", key_tag, algorithm)
+                    anchor["revoked_at"] = now_text
+                    logger.warning("RFC5011 revoked key_tag=%s", key_tag)
                 else:
                     anchor["hold_down_until"] = _iso(now + timedelta(days=RFC5011_ADD_HOLD_DOWN_DAYS))
-                    logger.info("RFC5011 new root KSK detected key_tag=%s algorithm=%s state=pending", key_tag, algorithm)
+                    logger.info("RFC5011 detected new key_tag=%s", key_tag)
                 payload["anchors"].append(anchor)
                 by_key[ident] = anchor
                 changed = True
@@ -587,8 +677,9 @@ class DNSSECValidator:
                 if revoked and not anchor.get("revoked"):
                     anchor["revoked"] = True
                     anchor["state"] = "revoked"
+                    anchor["revoked_at"] = now_text
                     anchor["remove_hold_down_until"] = _iso(now + timedelta(days=RFC5011_REMOVE_HOLD_DOWN_DAYS))
-                    logger.warning("RFC5011 revoked root KSK detected key_tag=%s algorithm=%s", key_tag, algorithm)
+                    logger.warning("RFC5011 revoked key_tag=%s", key_tag)
                     changed = True
 
         for anchor in payload.get("anchors", []):
@@ -604,16 +695,9 @@ class DNSSECValidator:
                 remove_until = _parse_iso(anchor.get("remove_hold_down_until"))
                 if remove_until and now >= remove_until:
                     anchor["state"] = "retired"
-                    logger.warning("RFC5011 revoked root KSK retired key_tag=%s algorithm=%s", anchor.get("key_tag"), anchor.get("algorithm"))
+                    anchor["retired_at"] = now_text
+                    logger.warning("RFC5011 retired key_tag=%s", anchor.get("key_tag"))
                     changed = True
-
-        before = len(payload.get("anchors", []))
-        payload["anchors"] = [
-            a for a in payload.get("anchors", [])
-            if not (a.get("state") == "retired" and _parse_iso(a.get("remove_hold_down_until")) and now >= _parse_iso(a.get("remove_hold_down_until")))
-        ]
-        if len(payload["anchors"]) != before:
-            changed = True
 
         payload["last_checked"] = now_text
         payload["next_check"] = _iso(now + timedelta(hours=24))
@@ -624,6 +708,8 @@ class DNSSECValidator:
             self.reload_trust_anchor()
         else:
             self._save_anchor_state_payload(payload)
+            if self.process_rfc5011_state():
+                self.reload_trust_anchor()
         return True
 
     def _get_upstream_response(self, qname, rdtype, want_dnssec=True):
