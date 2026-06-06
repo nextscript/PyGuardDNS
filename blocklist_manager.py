@@ -7,6 +7,7 @@ import re
 import threading
 import time
 import zipfile
+import os
 from datetime import datetime
 from typing import Optional
 from urllib.parse import urlparse
@@ -312,10 +313,25 @@ def fetch_url_text(url: str, max_bytes: int = 100_000_000, etag: str = "", last_
         url,
         headers=headers,
     )
+    timeout = float(os.environ.get("LOCALDNSGUARD_BLOCKLIST_DOWNLOAD_TIMEOUT", "20") or "20")
+    chunk_size = 1024 * 1024
     try:
-        with urlopen(request, timeout=10) as response:
+        deadline = time.monotonic() + timeout
+        with urlopen(request, timeout=min(10, timeout)) as response:
             status = getattr(response, "status", 200)
-            data = response.read(max_bytes + 1)
+            chunks = []
+            total = 0
+            while True:
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"Blocklist download timed out after {timeout:g}s")
+                chunk = response.read(min(chunk_size, max_bytes + 1 - total))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > max_bytes:
+                    break
+            data = b"".join(chunks)
             return {
                 "status": status,
                 "text": decode_blocklist_content(data, url, max_bytes),
@@ -425,11 +441,11 @@ class BlocklistManager:
                 self.db.execute(f"ALTER TABLE blocklists ADD COLUMN {column} {definition}")
         self.db.commit()
 
-    def add_from_url(self, name: str, url: str, list_type: str = "block") -> int:
+    def add_from_url(self, name: str, url: str, list_type: str = "block", notify_reload: bool = True) -> int:
         fetched = fetch_url_text(url)
-        return self.add_from_text(name, fetched["text"], list_type, source=url, sha256=fetched.get("sha256", ""), etag=fetched.get("etag", ""), last_modified=fetched.get("last_modified", ""))
+        return self.add_from_text(name, fetched["text"], list_type, source=url, sha256=fetched.get("sha256", ""), etag=fetched.get("etag", ""), last_modified=fetched.get("last_modified", ""), notify_reload=notify_reload)
 
-    def add_from_text(self, name: str, text: str, list_type: str = "block", source: str = "", sha256: str = "", etag: str = "", last_modified: str = "", replace_by_name: bool = True) -> int:
+    def add_from_text(self, name: str, text: str, list_type: str = "block", source: str = "", sha256: str = "", etag: str = "", last_modified: str = "", replace_by_name: bool = True, notify_reload: bool = True) -> int:
         list_type = "allow" if list_type == "allow" else "block"
         entries = parse_filter_list(text, default_action=list_type)
         if list_type == "allow":
@@ -453,7 +469,8 @@ class BlocklistManager:
                 [(bl_id, action, pt, pattern, created) for action, pt, pattern in entries],
             )
             self.db.commit()
-        self._notify_reload()
+        if notify_reload:
+            self._notify_reload()
         return len(entries)
 
     def update(self, list_id: int, background: bool = True) -> dict:
@@ -625,7 +642,7 @@ class BlocklistManager:
         self._notify_reload()
         return True
 
-    def delete(self, list_id: int) -> bool:
+    def delete(self, list_id: int, notify_reload: bool = True) -> bool:
         item = self._get(list_id)
         if not item:
             return False
@@ -633,7 +650,8 @@ class BlocklistManager:
             self._delete_entries(list_id)
             self.db.execute("DELETE FROM blocklists WHERE id=?", (list_id,))
             self.db.commit()
-        self._notify_reload()
+        if notify_reload:
+            self._notify_reload()
         return True
 
     def get_all(self):

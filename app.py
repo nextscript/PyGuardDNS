@@ -32,7 +32,7 @@ from urllib.request import urlopen
 import bcrypt
 
 from dns_engine import FilterEngine, FilterResult
-from blocklist_manager import BlocklistManager, fetch_url_text, parse_filter_list
+from blocklist_manager import BlocklistManager, fetch_url_text as fetch_blocklist_url_text, parse_filter_list
 from client_manager import ClientManager, SERVICE_DOMAINS, SAFESEARCH_REWRITES, YOUTUBE_SAFESEARCH_REWRITES, SAFESEARCH_PROFILE_COLUMNS
 try:
     from dnssec_validator import DNSSECValidator, DNSSECValidationStatus, ensure_root_trust_anchor, get_dnssec_metrics
@@ -150,6 +150,35 @@ runtime_status_lock = threading.Lock()
 runtime_status_message = "DNS server starting ..."
 doq_metrics = {"handshakes": 0, "queries": 0, "errors": 0, "last_peer": "", "last_error": ""}
 doq_metrics_lock = threading.Lock()
+blocklist_import_queue = []
+blocklist_import_lock = threading.Lock()
+blocklist_import_running = False
+blocklist_import_status = {
+    "running": False,
+    "queued": 0,
+    "total": 0,
+    "done": 0,
+    "failed": 0,
+    "current": "",
+    "last_error": "",
+    "started_at": "",
+    "finished_at": "",
+}
+blocklist_delete_queue = []
+blocklist_delete_lock = threading.Lock()
+blocklist_delete_running = False
+blocklist_delete_status = {
+    "running": False,
+    "queued": 0,
+    "total": 0,
+    "done": 0,
+    "failed": 0,
+    "current_id": None,
+    "current": "",
+    "last_error": "",
+    "started_at": "",
+    "finished_at": "",
+}
 
 
 def build_filter_engine():
@@ -4739,6 +4768,226 @@ def ensure_manual_blocklist_not_duplicate(url, text, list_type):
     return entry_set
 
 
+def enqueue_blocklist_imports(jobs):
+    global blocklist_import_running
+    if not jobs:
+        return
+    with blocklist_import_lock:
+        was_running = blocklist_import_status["running"]
+        blocklist_import_queue.extend(jobs)
+        blocklist_import_status["queued"] = len(blocklist_import_queue)
+        blocklist_import_status["total"] = blocklist_import_status["total"] + len(jobs) if was_running else len(jobs)
+        if not was_running:
+            blocklist_import_status.update({
+                "running": True,
+                "done": 0,
+                "failed": 0,
+                "current_id": None,
+                "current": "",
+                "last_error": "",
+                "started_at": now_iso(),
+                "finished_at": "",
+            })
+        if not blocklist_import_running:
+            blocklist_import_running = True
+            threading.Thread(target=blocklist_import_worker, name="blocklist-import", daemon=True).start()
+
+
+def blocklist_import_worker():
+    global blocklist_import_running
+    should_reload = False
+    try:
+        while True:
+            with blocklist_import_lock:
+                if not blocklist_import_queue:
+                    blocklist_import_status["running"] = False
+                    blocklist_import_status["queued"] = 0
+                    blocklist_import_status["current"] = ""
+                    blocklist_import_status["finished_at"] = now_iso()
+                    return
+                job = blocklist_import_queue.pop(0)
+                blocklist_import_status["queued"] = len(blocklist_import_queue)
+                blocklist_import_status["current"] = job.get("name", "")
+            try:
+                list_type = "allow" if job.get("list_type") == "allow" else "block"
+                if job.get("source") == "text":
+                    print(f"[blocklist import] starting {job.get('name', '')} from pasted content", flush=True)
+                    with blocklist_import_lock:
+                        blocklist_import_status["current"] = f"{job.get('name', '')} - checking"
+                    if job.get("check_duplicates"):
+                        ensure_manual_blocklist_not_duplicate("", job.get("content", ""), list_type)
+                    with blocklist_import_lock:
+                        blocklist_import_status["current"] = f"{job.get('name', '')} - saving"
+                    count = blocklist_manager.add_from_text(
+                        job.get("name", ""),
+                        job.get("content", ""),
+                        list_type,
+                        replace_by_name=job.get("replace_by_name", True),
+                        notify_reload=False,
+                    )
+                    if count <= 0:
+                        raise ValueError("List contains no supported rules")
+                else:
+                    url = job.get("url", "")
+                    print(f"[blocklist import] starting {job.get('name', '')} from {url}", flush=True)
+                    with blocklist_import_lock:
+                        blocklist_import_status["current"] = f"{job.get('name', '')} - checking"
+                    if job.get("check_duplicates"):
+                        duplicate = duplicate_blocklist_by_url(url, list_type)
+                        if duplicate:
+                            raise ValueError(f"List URL is already added as {duplicate.get('name', 'existing list')}")
+                    with blocklist_import_lock:
+                        blocklist_import_status["current"] = f"{job.get('name', '')} - downloading"
+                    fetched = fetch_blocklist_url_text(url)
+                    with blocklist_import_lock:
+                        blocklist_import_status["current"] = f"{job.get('name', '')} - checking entries"
+                    if job.get("check_duplicates"):
+                        ensure_manual_blocklist_not_duplicate("", fetched["text"], list_type)
+                    with blocklist_import_lock:
+                        blocklist_import_status["current"] = f"{job.get('name', '')} - saving"
+                    count = blocklist_manager.add_from_text(
+                        job.get("name", ""),
+                        fetched["text"],
+                        list_type,
+                        source=url,
+                        sha256=fetched.get("sha256", ""),
+                        etag=fetched.get("etag", ""),
+                        last_modified=fetched.get("last_modified", ""),
+                        replace_by_name=job.get("replace_by_name", True),
+                        notify_reload=False,
+                    )
+                    if count <= 0:
+                        raise ValueError("Downloaded list contains no supported rules")
+                should_reload = True
+                with blocklist_import_lock:
+                    blocklist_import_status["done"] += 1
+                print(f"[blocklist import] added {job.get('name', '')} ({count} rules)", flush=True)
+            except Exception as exc:
+                with blocklist_import_lock:
+                    blocklist_import_status["failed"] += 1
+                    blocklist_import_status["last_error"] = f"{job.get('name', 'List')}: {exc}"
+                print(f"[blocklist import] failed {job.get('name', 'List')}: {exc}", flush=True)
+            finally:
+                if should_reload and not blocklist_import_queue:
+                    try:
+                        with blocklist_import_lock:
+                            blocklist_import_status["current"] = "Reloading filter engine"
+                        print("[blocklist import] reloading filter engine", flush=True)
+                        reload_filter_engine()
+                        print("[blocklist import] filter engine reloaded", flush=True)
+                    except Exception as exc:
+                        with blocklist_import_lock:
+                            blocklist_import_status["last_error"] = f"Filter reload failed: {exc}"
+                    finally:
+                        should_reload = False
+    finally:
+        with blocklist_import_lock:
+            blocklist_import_running = False
+            if not blocklist_import_queue:
+                blocklist_import_status["running"] = False
+                blocklist_import_status["queued"] = 0
+                blocklist_import_status["current"] = ""
+                blocklist_import_status["finished_at"] = blocklist_import_status.get("finished_at") or now_iso()
+
+
+def current_blocklist_import_status():
+    with blocklist_import_lock:
+        return dict(blocklist_import_status)
+
+
+def enqueue_blocklist_deletes(jobs):
+    global blocklist_delete_running
+    if not jobs:
+        return
+    with blocklist_delete_lock:
+        was_running = blocklist_delete_status["running"]
+        blocklist_delete_queue.extend(jobs)
+        blocklist_delete_status["queued"] = len(blocklist_delete_queue)
+        blocklist_delete_status["total"] = blocklist_delete_status["total"] + len(jobs) if was_running else len(jobs)
+        if not was_running:
+            blocklist_delete_status.update({
+                "running": True,
+                "done": 0,
+                "failed": 0,
+                "current": "",
+                "last_error": "",
+                "started_at": now_iso(),
+                "finished_at": "",
+            })
+        if not blocklist_delete_running:
+            blocklist_delete_running = True
+            threading.Thread(target=blocklist_delete_worker, name="blocklist-delete", daemon=True).start()
+
+
+def blocklist_delete_worker():
+    global blocklist_delete_running
+    should_reload = False
+    try:
+        while True:
+            with blocklist_delete_lock:
+                if not blocklist_delete_queue:
+                    blocklist_delete_status["running"] = False
+                    blocklist_delete_status["queued"] = 0
+                    blocklist_delete_status["current"] = ""
+                    blocklist_delete_status["current_id"] = None
+                    blocklist_delete_status["finished_at"] = now_iso()
+                    return
+                job = blocklist_delete_queue.pop(0)
+                job_name = job.get("name") or f"ID {job.get('id', '')}"
+                blocklist_delete_status["queued"] = len(blocklist_delete_queue)
+                blocklist_delete_status["current_id"] = job.get("id")
+                blocklist_delete_status["current"] = job_name
+            try:
+                print(f"[blocklist delete] starting {job_name}", flush=True)
+                if blocklist_manager.delete(job.get("id"), notify_reload=False):
+                    should_reload = True
+                with blocklist_delete_lock:
+                    blocklist_delete_status["done"] += 1
+                print(f"[blocklist delete] deleted {job_name}", flush=True)
+            except Exception as exc:
+                with blocklist_delete_lock:
+                    blocklist_delete_status["failed"] += 1
+                    blocklist_delete_status["last_error"] = f"{job.get('name', 'List')}: {exc}"
+                print(f"[blocklist delete] failed {job.get('name', 'List')}: {exc}", flush=True)
+            finally:
+                if should_reload and not blocklist_delete_queue:
+                    try:
+                        print("[blocklist delete] reloading filter engine", flush=True)
+                        reload_filter_engine()
+                        print("[blocklist delete] filter engine reloaded", flush=True)
+                    except Exception as exc:
+                        with blocklist_delete_lock:
+                            blocklist_delete_status["last_error"] = f"Filter reload failed: {exc}"
+                    finally:
+                        should_reload = False
+    finally:
+        with blocklist_delete_lock:
+            blocklist_delete_running = False
+            if not blocklist_delete_queue:
+                blocklist_delete_status["running"] = False
+                blocklist_delete_status["queued"] = 0
+                blocklist_delete_status["current"] = ""
+                blocklist_delete_status["current_id"] = None
+                blocklist_delete_status["finished_at"] = blocklist_delete_status.get("finished_at") or now_iso()
+
+
+def current_blocklist_delete_status():
+    with blocklist_delete_lock:
+        return dict(blocklist_delete_status)
+
+
+def queued_blocklist_delete_ids():
+    with blocklist_delete_lock:
+        ids = {int(job.get("id")) for job in blocklist_delete_queue if str(job.get("id", "")).isdigit()}
+        current_id = blocklist_delete_status.get("current_id")
+        if current_id is not None:
+            try:
+                ids.add(int(current_id))
+            except (TypeError, ValueError):
+                pass
+        return ids
+
+
 def blocklists_page(error="", selected_type="block", success=""):
     global blocklist_manager
     lists = blocklist_manager.get_all() if blocklist_manager else []
@@ -4792,6 +5041,28 @@ def blocklists_page(error="", selected_type="block", success=""):
             "border-color:rgba(239,68,68,.55);background:#2a1217;color:#fecdd3'>"
             f"<strong>Fail</strong><br>{html_escape(error)}</div>"
         )
+    import_status = current_blocklist_import_status()
+    delete_status = current_blocklist_delete_status()
+    import_notice = ""
+    if import_status.get("running"):
+        current = import_status.get("current") or "Preparing import"
+        import_notice = (
+            "<div id='bl-job-status' class='alert alert-info py-2 mb-3'>"
+            f"Blocklist import running: {html_escape(current)} "
+            f"({import_status.get('done', 0)} done, {import_status.get('failed', 0)} failed, "
+            f"{import_status.get('queued', 0)} queued)."
+            "</div>"
+        )
+    if delete_status.get("running"):
+        current = delete_status.get("current") or "Preparing delete"
+        import_notice += (
+            "<div id='bl-delete-status' class='alert alert-warning py-2 mb-3'>"
+            f"Blocklist delete running: {html_escape(current)} "
+            f"({delete_status.get('done', 0)} done, {delete_status.get('failed', 0)} failed, "
+            f"{delete_status.get('queued', 0)} queued)."
+            "</div>"
+        )
+    deleting_ids = queued_blocklist_delete_ids()
     bl_edit_modals = ""
 
     def bl_table(rows):
@@ -4814,6 +5085,13 @@ def blocklists_page(error="", selected_type="block", success=""):
             )
         for bl in rows:
             eid = f"blEdit-{bl['id']}"
+            deleting = bl["id"] in deleting_ids
+            delete_action = (
+                "<button class='btn btn-sm btn-outline-danger ms-2' disabled>Deleting</button>"
+                if deleting else
+                f"<form method='post' action='/blocklists/delete' class='d-inline ms-2'><input type='hidden' name='id' value='{bl['id']}'>"
+                f"<button class='btn btn-sm btn-outline-danger' title='Delete'>&#x2716;</button></form>"
+            )
             rows_html += (
                 f"<tr><td data-label='Activate'>{bl_enabled_toggle(bl)}</td><td data-label='Name'>{html_escape(bl['name'])}</td><td data-label='URL' class='text-break' style='max-width:300px'>{html_escape(bl['url'] or '-')}</td>"
                 f"<td data-label='Rules'>{bl['rule_count']}</td><td data-label='Updated'>{bl['last_update'] or '—'}</td>"
@@ -4821,8 +5099,7 @@ def blocklists_page(error="", selected_type="block", success=""):
                 f"<td data-label='Actions'><button class='btn btn-sm btn-outline-light' onclick=\"document.getElementById('{eid}').classList.add('show')\">&#x270E;</button>"
                 f"<form method='post' action='/blocklists/update' class='d-inline ms-2'><input type='hidden' name='id' value='{bl['id']}'>"
                 f"<button class='btn btn-sm btn-outline-light' title='Update'>&#x21bb;</button></form>"
-                f"<form method='post' action='/blocklists/delete' class='d-inline ms-2'><input type='hidden' name='id' value='{bl['id']}'>"
-                f"<button class='btn btn-sm btn-outline-danger' title='Delete'>&#x2716;</button></form></td></tr>"
+                f"{delete_action}</td></tr>"
             )
             bl_edit_modals += f"""
 <div id="{eid}" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('show')">
@@ -4851,7 +5128,7 @@ def blocklists_page(error="", selected_type="block", success=""):
 <div class="page-toolbar">
   <span class="page-title" style="margin-bottom:0">Blocklist Manager</span>
   <button class="btn btn-success" onclick="openBlocklistModal()">+ Add</button>
-</div>{notification}
+</div>{notification}{import_notice}
 <div class="panel rounded-2 border border-secondary-subtle p-3">
   <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.75rem;flex-wrap:wrap">
     <select id="bl-type" class="form-select" style="width:auto;min-width:160px" onchange="blSwitch()">
@@ -4910,6 +5187,50 @@ function validateBlocklistAdd() {{
   alert('Please select a list first.');
   return false;
 }}
+let blJobWasActive = false;
+let blReloadScheduled = false;
+function blEnsureStatusBox(id, cls) {{
+  let el = document.getElementById(id);
+  if (!el) {{
+    el = document.createElement('div');
+    el.id = id;
+    el.className = cls + ' py-2 mb-3';
+    const panel = document.querySelector('.panel');
+    if (panel && panel.parentNode) panel.parentNode.insertBefore(el, panel);
+  }}
+  return el;
+}}
+function blFormatStatus(prefix, s) {{
+  const current = s.current || (prefix === 'Blocklist import' ? 'Preparing import' : 'Preparing delete');
+  return `${{prefix}} running: ${{current}} (${{s.done || 0}} done, ${{s.failed || 0}} failed, ${{s.queued || 0}} queued).`;
+}}
+async function refreshBlocklistJobStatus() {{
+  try {{
+    const r = await fetch('/api/blocklists/job-status', {{cache:'no-store'}});
+    if (!r.ok) return;
+    const data = await r.json();
+    const imp = data.import || {{}};
+    const del = data.delete || {{}};
+    const active = !!(imp.running || del.running);
+    const impEl = document.getElementById('bl-job-status');
+    const delEl = document.getElementById('bl-delete-status');
+    if (imp.running) {{
+      blEnsureStatusBox('bl-job-status', 'alert alert-info').textContent = blFormatStatus('Blocklist import', imp);
+    }} else if (impEl) {{
+      impEl.remove();
+    }}
+    if (del.running) {{
+      blEnsureStatusBox('bl-delete-status', 'alert alert-warning').textContent = blFormatStatus('Blocklist delete', del);
+    }} else if (delEl) {{
+      delEl.remove();
+    }}
+    if (active) blJobWasActive = true;
+    if (!active && blJobWasActive && !blReloadScheduled) {{
+      blReloadScheduled = true;
+      setTimeout(function() {{ window.location.reload(); }}, 700);
+    }}
+  }} catch (e) {{}}
+}}
 setTimeout(function() {{
   var n = document.getElementById('bl-notification');
   if (!n) return;
@@ -4918,6 +5239,8 @@ setTimeout(function() {{
   n.style.transform = 'translateY(-8px)';
   setTimeout(function() {{ n.remove(); }}, 280);
 }}, 3500);
+refreshBlocklistJobStatus();
+setInterval(refreshBlocklistJobStatus, 1000);
 </script>
 <style>
 .preset-list-option {{
@@ -6694,7 +7017,7 @@ class WebHandler(BaseHTTPRequestHandler):
             list_type = "allow" if form.get("list_type") == "allow" else "block"
             content = form.get("content", "")
             try:
-                added_count = 1
+                queued_jobs = []
                 if form.get("add_mode") == "from-list":
                     preset_choices = form.get_all("preset_choice")
                     prefix = f"{list_type}-"
@@ -6723,32 +7046,44 @@ class WebHandler(BaseHTTPRequestHandler):
                     ]
                     if not selected_presets:
                         raise ValueError("Selected lists are already added")
-                    for preset in selected_presets:
-                        blocklist_manager.add_from_url(preset["name"], preset["url"], list_type)
-                    added_count = len(selected_presets)
+                    queued_jobs = [
+                        {
+                            "source": "url",
+                            "name": preset["name"],
+                            "url": preset["url"],
+                            "list_type": list_type,
+                            "replace_by_name": True,
+                            "check_duplicates": False,
+                        }
+                        for preset in selected_presets
+                    ]
                 else:
                     if url:
                         duplicate = duplicate_blocklist_by_url(url, list_type)
                         if duplicate:
                             raise ValueError(f"List URL is already added as {duplicate.get('name', 'existing list')}")
-                        fetched = fetch_url_text(url)
-                        ensure_manual_blocklist_not_duplicate("", fetched["text"], list_type)
-                        blocklist_manager.add_from_text(
-                            name,
-                            fetched["text"],
-                            list_type,
-                            source=url,
-                            sha256=fetched.get("sha256", ""),
-                            etag=fetched.get("etag", ""),
-                            last_modified=fetched.get("last_modified", ""),
-                            replace_by_name=False,
-                        )
+                        queued_jobs = [{
+                            "source": "url",
+                            "name": name,
+                            "url": url,
+                            "list_type": list_type,
+                            "replace_by_name": False,
+                            "check_duplicates": True,
+                        }]
                     elif content.strip():
-                        ensure_manual_blocklist_not_duplicate("", content, list_type)
-                        blocklist_manager.add_from_text(name, content, list_type, replace_by_name=False)
+                        queued_jobs = [{
+                            "source": "text",
+                            "name": name,
+                            "content": content,
+                            "list_type": list_type,
+                            "replace_by_name": False,
+                            "check_duplicates": True,
+                        }]
                     else:
                         raise ValueError("Provide URL or paste content")
-                success_msg = "List added successfully" if added_count == 1 else f"{added_count} lists added successfully"
+                enqueue_blocklist_imports(queued_jobs)
+                queued_count = len(queued_jobs)
+                success_msg = "List import queued" if queued_count == 1 else f"{queued_count} list imports queued"
                 self.redirect(f"/blocklists?type={list_type}&success={quote(success_msg)}")
             except Exception as exc:
                 self.redirect(f"/blocklists?type={list_type}&error={quote(str(exc))}")
@@ -6761,8 +7096,15 @@ class WebHandler(BaseHTTPRequestHandler):
             blocklist_manager.set_enabled(bl_id, enabled)
             self.redirect("/blocklists")
         elif path == "/blocklists/delete":
-            blocklist_manager.delete(form.get("id"))
-            self.redirect("/blocklists")
+            bl_id = int(form.get("id"))
+            item = blocklist_manager.get_by_id(bl_id) if blocklist_manager else None
+            if item:
+                list_type = "allow" if item.get("list_type") == "allow" else "block"
+                if bl_id not in queued_blocklist_delete_ids():
+                    enqueue_blocklist_deletes([{"id": bl_id, "name": item.get("name", f"ID {bl_id}")}])
+                self.redirect(f"/blocklists?type={list_type}&success={quote('List delete queued')}")
+            else:
+                self.redirect(f"/blocklists?error={quote('List not found')}")
         elif path == "/blocklists/edit":
             bl_id = int(form.get("id"))
             name = form.get("name", "").strip()
@@ -7626,6 +7968,11 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_json(blocklist_manager.get_stats() if blocklist_manager else [])
         elif path == "/api/blocklists/update-status":
             self.send_json(blocklist_manager.update_status() if blocklist_manager else {"running": False, "status": "not_available"})
+        elif path == "/api/blocklists/job-status":
+            self.send_json({
+                "import": current_blocklist_import_status(),
+                "delete": current_blocklist_delete_status(),
+            })
         elif path == "/api/clients":
             if client_manager is not None:
                 self.send_json(client_manager.get_clients())
