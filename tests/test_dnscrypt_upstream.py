@@ -1,4 +1,5 @@
 import struct
+import socket
 import time
 
 import app
@@ -33,6 +34,44 @@ def test_dnscrypt_xchacha20poly1305_round_trip():
     assert app.dnscrypt_xchacha20poly1305_decrypt(key, nonce, ciphertext) == plaintext
 
 
+def test_dnscrypt_ipv6_stamp_parses_address_and_uses_ipv6_family():
+    stamp = "sdns://AQcAAAAAAAAAF1syMDAxOjRiYTA6ZmZlZDo3Njo6NTNdIDEzcq1ZVjLCQWuHLwmPhRvduWUoTGy-mk8ZCWQw26laHjIuZG5zY3J5cHQtY2VydC5jcnlwdG9zdG9ybS5pcw"
+
+    parsed = app.parse_dnscrypt_stamp(stamp)
+
+    assert parsed["address"] == "2001:4ba0:ffed:76::53"
+    assert parsed["port"] == 443
+    assert app.socket_family_for_host(parsed["address"]) == socket.AF_INET6
+
+
+def test_dnscrypt_query_retries_over_tcp_when_udp_fails(monkeypatch):
+    calls = []
+    upstream = {"resolver": "sdns://AQcAAAAAAAAADTM3LjEyMC4yMTcuNzUgMTNyrVlWMsJBa4cvCY-FG925ZShMbL6aTxkJZDDbqVoeMi5kbnNjcnlwdC1jZXJ0LmNyeXB0b3N0b3JtLmlz"}
+    cert = {
+        "es_version": 1,
+        "resolver_public_key": b"r" * 32,
+        "client_magic": b"12345678",
+        "serial": 1,
+        "not_before": 1,
+        "not_after": int(time.time()) + 3600,
+    }
+
+    monkeypatch.setattr(app, "fetch_dnscrypt_certificate", lambda *_args, **_kwargs: cert)
+    monkeypatch.setattr(app, "dnscrypt_encrypt_query", lambda *_args: (b"packet", b"nonce", lambda *_decrypt_args: b""))
+
+    def fake_send(_stamp_info, _packet, timeout=4.0, transport="udp"):
+        calls.append(transport)
+        if transport == "udp":
+            raise OSError("udp failed")
+        return b"tcp-response"
+
+    monkeypatch.setattr(app, "send_dnscrypt_packet", fake_send)
+    monkeypatch.setattr(app, "decrypt_dnscrypt_response", lambda response, *_args: response)
+
+    assert app.query_dnscrypt_upstream(upstream, b"\x00" * 12) == b"tcp-response"
+    assert calls == ["udp", "tcp"]
+
+
 def test_dnscrypt_certificate_fetch_falls_back_to_tcp_on_truncated_udp(monkeypatch):
     calls = []
     stamp_info = {
@@ -53,6 +92,22 @@ def test_dnscrypt_certificate_fetch_falls_back_to_tcp_on_truncated_udp(monkeypat
 
     assert app.fetch_dnscrypt_certificate(stamp_info) == cert
     assert calls == ["udp", "tcp"]
+
+
+def test_dnscrypt_certificate_fetch_reports_transport_failure(monkeypatch):
+    stamp_info = {
+        "address": "2001:db8::53",
+        "port": 443,
+        "provider_name": "2.dnscrypt-cert.example.test",
+        "provider_public_key": b"x" * 32,
+    }
+
+    monkeypatch.setattr(app, "query_plain_upstream", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("network unavailable")))
+    app.dnscrypt_cert_cache.clear()
+
+    import pytest
+    with pytest.raises(OSError, match="DNSCrypt certificate transport failed: network unavailable"):
+        app.fetch_dnscrypt_certificate(stamp_info)
 
 
 def test_dnscrypt_certificate_fetch_uses_udp_when_certificate_is_valid(monkeypatch):

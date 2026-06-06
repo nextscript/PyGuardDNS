@@ -1758,7 +1758,7 @@ def query_plain_upstream(upstream, request, timeout=2.5):
                 chunks.append(chunk)
                 remaining -= len(chunk)
             return b"".join(chunks)
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+    with socket.socket(socket_family_for_host(upstream["address"]), socket.SOCK_DGRAM) as s:
         s.settimeout(timeout)
         s.sendto(request, (upstream["address"], int(upstream["port"])))
         response, _ = s.recvfrom(4096)
@@ -2414,9 +2414,11 @@ def extract_txt_answers(response):
 def _dnscrypt_certificate_response_candidates(stamp_info, request, timeout):
     base = {"address": stamp_info["address"], "port": stamp_info["port"]}
     udp_response = None
+    last_error = None
     try:
         udp_response = query_plain_upstream({**base, "transport": "udp"}, request, timeout=timeout)
     except OSError:
+        last_error = sys.exc_info()[1]
         udp_response = None
     if udp_response is not None and not dns_response_truncated(udp_response):
         yield udp_response
@@ -2424,8 +2426,11 @@ def _dnscrypt_certificate_response_candidates(stamp_info, request, timeout):
         return
     try:
         yield query_plain_upstream({**base, "transport": "tcp"}, request, timeout=timeout)
-    except OSError:
         return
+    except OSError:
+        last_error = sys.exc_info()[1]
+    if udp_response is None and last_error is not None:
+        raise OSError(f"DNSCrypt certificate transport failed: {last_error}") from last_error
 
 
 def fetch_dnscrypt_certificate(stamp_info, timeout=4.0):
@@ -2620,19 +2625,38 @@ def dnscrypt_encrypt_query(cert, client_key, request):
     return packet, client_nonce, decrypt_response
 
 
-def query_dnscrypt_upstream(upstream, request, timeout=4.0):
-    try:
-        from nacl.public import PrivateKey
-    except ImportError:
-        raise OSError("DNSCrypt requires PyNaCl (pip install pynacl)")
-    stamp_info = parse_dnscrypt_stamp(upstream["resolver"])
-    cert = fetch_dnscrypt_certificate(stamp_info, timeout=timeout)
-    client_key = PrivateKey.generate()
-    packet, client_nonce, decrypt_response = dnscrypt_encrypt_query(cert, client_key, request)
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+def _read_dnscrypt_tcp_response(conn):
+    header = conn.recv(2)
+    if len(header) != 2:
+        raise OSError("short DNSCrypt TCP length header")
+    length = struct.unpack("!H", header)[0]
+    chunks = []
+    remaining = length
+    while remaining:
+        chunk = conn.recv(remaining)
+        if not chunk:
+            raise OSError("short DNSCrypt TCP response")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def send_dnscrypt_packet(stamp_info, packet, timeout=4.0, transport="udp"):
+    address = stamp_info["address"]
+    port = int(stamp_info["port"])
+    if transport == "tcp":
+        with socket.create_connection((address, port), timeout=timeout) as s:
+            s.settimeout(timeout)
+            s.sendall(struct.pack("!H", len(packet)) + packet)
+            return _read_dnscrypt_tcp_response(s)
+    with socket.socket(socket_family_for_host(address), socket.SOCK_DGRAM) as s:
         s.settimeout(timeout)
-        s.sendto(packet, (stamp_info["address"], int(stamp_info["port"])))
+        s.sendto(packet, (address, port))
         response, _ = s.recvfrom(4096)
+        return response
+
+
+def decrypt_dnscrypt_response(response, client_nonce, decrypt_response):
     if len(response) < 32:
         raise OSError("short DNSCrypt response")
     response_nonce = response[8:32]
@@ -2643,6 +2667,26 @@ def query_dnscrypt_upstream(upstream, request, timeout=4.0):
     if len(decrypted) < 12:
         raise OSError("invalid DNSCrypt DNS response")
     return decrypted
+
+
+def query_dnscrypt_upstream(upstream, request, timeout=4.0):
+    try:
+        from nacl.public import PrivateKey
+    except ImportError:
+        raise OSError("DNSCrypt requires PyNaCl (pip install pynacl)")
+    stamp_info = parse_dnscrypt_stamp(upstream["resolver"])
+    cert = fetch_dnscrypt_certificate(stamp_info, timeout=timeout)
+    client_key = PrivateKey.generate()
+    packet, client_nonce, decrypt_response = dnscrypt_encrypt_query(cert, client_key, request)
+    try:
+        response = send_dnscrypt_packet(stamp_info, packet, timeout=timeout, transport="udp")
+        decrypted = decrypt_dnscrypt_response(response, client_nonce, decrypt_response)
+        if not dns_response_truncated(decrypted):
+            return decrypted
+    except OSError:
+        pass
+    response = send_dnscrypt_packet(stamp_info, packet, timeout=timeout, transport="tcp")
+    return decrypt_dnscrypt_response(response, client_nonce, decrypt_response)
 
 
 def bootstrap_doh_query(provider_ip, provider_host, hostname, qtype):
@@ -2777,6 +2821,13 @@ def split_host_port(value, default_port):
         if port.isdigit():
             return host, int(port)
     return value, default_port
+
+
+def socket_family_for_host(host):
+    try:
+        return socket.AF_INET6 if ipaddress.ip_address(host.strip("[]")).version == 6 else socket.AF_INET
+    except ValueError:
+        return socket.AF_INET
 
 
 def looks_like_ip(value):
