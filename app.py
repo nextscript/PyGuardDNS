@@ -812,10 +812,10 @@ def run_migrations():
             try:
                 fn()
             except Exception as exc:
-                print(f"Migration {version} ({name}) failed: {exc}", flush=True)
+                console_event("error", f"Migration {version} ({name}) failed", exc)
                 raise
             db.execute("INSERT INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)", (version, name, now_iso()))
-            print(f"Migration {version} ({name}) applied.", flush=True)
+            console_event("ok", f"Migration {version} ({name}) applied")
 
 
 def _ensure_column(table, column, definition):
@@ -4873,7 +4873,7 @@ def blocklist_import_worker():
             try:
                 list_type = "allow" if job.get("list_type") == "allow" else "block"
                 if job.get("source") == "text":
-                    print(f"[blocklist import] starting {job.get('name', '')} from pasted content", flush=True)
+                    console_event("work", "Blocklist import started", f"{job.get('name', '')} from pasted content")
                     with blocklist_import_lock:
                         blocklist_import_status["current"] = f"{job.get('name', '')} - checking"
                     if job.get("check_duplicates"):
@@ -4891,7 +4891,7 @@ def blocklist_import_worker():
                         raise ValueError("List contains no new rules")
                 else:
                     url = job.get("url", "")
-                    print(f"[blocklist import] starting {job.get('name', '')} from {url}", flush=True)
+                    console_event("work", "Blocklist import started", f"{job.get('name', '')} from {url}")
                     with blocklist_import_lock:
                         blocklist_import_status["current"] = f"{job.get('name', '')} - checking"
                     if job.get("check_duplicates"):
@@ -4923,20 +4923,20 @@ def blocklist_import_worker():
                 should_reload = True
                 with blocklist_import_lock:
                     blocklist_import_status["done"] += 1
-                print(f"[blocklist import] added {job.get('name', '')} ({count} rules)", flush=True)
+                console_event("ok", "Blocklist imported", f"{job.get('name', '')} ({count} rules)")
             except Exception as exc:
                 with blocklist_import_lock:
                     blocklist_import_status["failed"] += 1
                     blocklist_import_status["last_error"] = f"{job.get('name', 'List')}: {exc}"
-                print(f"[blocklist import] failed {job.get('name', 'List')}: {exc}", flush=True)
+                console_event("error", "Blocklist import failed", f"{job.get('name', 'List')}: {exc}")
             finally:
                 if should_reload and not blocklist_import_queue:
                     try:
                         with blocklist_import_lock:
                             blocklist_import_status["current"] = "Reloading filter engine"
-                        print("[blocklist import] reloading filter engine", flush=True)
+                        console_event("work", "Reloading filter engine")
                         reload_filter_engine()
-                        print("[blocklist import] filter engine reloaded", flush=True)
+                        console_event("ok", "Filter engine reloaded")
                     except Exception as exc:
                         with blocklist_import_lock:
                             blocklist_import_status["last_error"] = f"Filter reload failed: {exc}"
@@ -5000,23 +5000,23 @@ def blocklist_delete_worker():
                 blocklist_delete_status["current_id"] = job.get("id")
                 blocklist_delete_status["current"] = job_name
             try:
-                print(f"[blocklist delete] starting {job_name}", flush=True)
+                console_event("work", "Blocklist delete started", job_name)
                 if blocklist_manager.delete(job.get("id"), notify_reload=False):
                     should_reload = True
                 with blocklist_delete_lock:
                     blocklist_delete_status["done"] += 1
-                print(f"[blocklist delete] deleted {job_name}", flush=True)
+                console_event("ok", "Blocklist deleted", job_name)
             except Exception as exc:
                 with blocklist_delete_lock:
                     blocklist_delete_status["failed"] += 1
                     blocklist_delete_status["last_error"] = f"{job.get('name', 'List')}: {exc}"
-                print(f"[blocklist delete] failed {job.get('name', 'List')}: {exc}", flush=True)
+                console_event("error", "Blocklist delete failed", f"{job.get('name', 'List')}: {exc}")
             finally:
                 if should_reload and not blocklist_delete_queue:
                     try:
-                        print("[blocklist delete] reloading filter engine", flush=True)
+                        console_event("work", "Reloading filter engine")
                         reload_filter_engine()
-                        print("[blocklist delete] filter engine reloaded", flush=True)
+                        console_event("ok", "Filter engine reloaded")
                     except Exception as exc:
                         with blocklist_delete_lock:
                             blocklist_delete_status["last_error"] = f"Filter reload failed: {exc}"
@@ -8598,21 +8598,21 @@ def start_encrypted_dns_servers():
             threading.Thread(target=dot.serve_forever, name="dns-over-tls-server", daemon=True).start()
             servers.append(dot)
         except Exception as exc:
-            print(f"Failed to start DoT server: {exc}", flush=True)
+            console_event("error", "Failed to start DoT server", exc)
     if get_setting("dns_over_https_enabled", "0") == "1":
         try:
             doh = ReusableThreadingHTTPSServer((ENCRYPTED_DNS_HOST, DNS_HTTPS_PORT), DNSHTTPSHandler, ssl_context())
             threading.Thread(target=doh.serve_forever, name="dns-over-https-server", daemon=True).start()
             servers.append(doh)
         except Exception as exc:
-            print(f"Failed to start DoH server: {exc}", flush=True)
+            console_event("error", "Failed to start DoH server", exc)
     if get_setting("dns_over_quic_enabled", "0") == "1":
         try:
             doq = DoQRuntimeServer(ENCRYPTED_DNS_HOST, DNS_QUIC_PORT, make_encrypted_dns_ssl_context())
             doq.start()
             servers.append(doq)
         except Exception as exc:
-            print(f"Failed to start DoQ server: {exc}", flush=True)
+            console_event("error", "Failed to start DoQ server", exc)
     return servers
 
 
@@ -8632,7 +8632,7 @@ def shutdown_runtime_servers():
             web_server.shutdown()
             web_server.server_close()
         except Exception as exc:
-            print(f"Web shutdown error: {exc}", flush=True)
+            console_event("error", "Web shutdown error", exc)
         web_server = None
     shutdown_dns_runtime_servers()
 
@@ -8644,14 +8644,14 @@ def shutdown_dns_runtime_servers():
             srv.shutdown()
             srv.server_close()
         except Exception as exc:
-            print(f"DNS shutdown error: {exc}", flush=True)
+            console_event("error", "DNS shutdown error", exc)
     dns_servers = []
     for srv in encrypted_dns_servers:
         try:
             srv.shutdown()
             srv.server_close()
         except Exception as exc:
-            print(f"Encrypted DNS shutdown error: {exc}", flush=True)
+            console_event("error", "Encrypted DNS shutdown error", exc)
     encrypted_dns_servers = []
 
 
@@ -8693,7 +8693,7 @@ def safe_restart_dns_runtime_servers():
                 log.write(f"{now_iso()} dns restart failed: {type(exc).__name__}: {exc}\n")
         except Exception:
             pass
-        print(f"DNS restart failed: {exc}", flush=True)
+        console_event("error", "DNS restart failed", exc)
 
 
 def schedule_dns_runtime_restart(delay=0.6):
@@ -8702,21 +8702,94 @@ def schedule_dns_runtime_restart(delay=0.6):
     timer.start()
 
 
+def console_style(text, style):
+    return text
+
+
+def console_print(text="", style=None):
+    print(console_style(str(text), style) if style else str(text), flush=True)
+
+
+CONSOLE_COMMANDS = [
+    "status",
+    "dnssec test",
+    "cache clear",
+    "update blocklist",
+    "dedupe blocklists",
+    "restart",
+    "stop",
+    "help",
+]
+
+
+def console_event(level, message, detail=""):
+    labels = {
+        "ok": ("OK", "ok"),
+        "info": ("INFO", "info"),
+        "warn": ("WARN", "warn"),
+        "error": ("ERROR", "error"),
+        "work": ("...", "info"),
+    }
+    label, style = labels.get(level, ("INFO", "info"))
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    prefix = f"{timestamp} [{label:5}]"
+    line = f"{console_style(prefix, style)} {message}"
+    if detail:
+        line += f" {console_style(str(detail), 'muted')}"
+    print(line, flush=True)
+
+
+def console_box(title, rows):
+    normalized = [(str(label), str(value)) for label, value in rows]
+    label_width = max([len(label) for label, _ in normalized] + [0])
+    value_width = max([len(value) for _, value in normalized] + [0])
+    width = max(len(title), label_width + value_width + 5, 36)
+    border = "+" + "-" * (width + 2) + "+"
+    console_print(border, "muted")
+    console_print(f"| {title.ljust(width)} |", "title")
+    console_print(border, "muted")
+    for label, value in normalized:
+        left = label.ljust(label_width)
+        body = f"{left} : {value}"
+        console_print(f"| {body.ljust(width)} |")
+    console_print(border, "muted")
+
+
+def console_help():
+    descriptions = {
+        "status": "Show runtime metrics",
+        "dnssec test": "Run DNSSEC self-validation",
+        "cache clear": "Clear DNS cache",
+        "update blocklist": "Update remote blocklists",
+        "dedupe blocklists": "Remove duplicate blocklist entries",
+        "restart": "Restart runtime servers",
+        "stop": "Stop server",
+        "help": "Show this help",
+    }
+    console_box("Console commands", [(command, descriptions[command]) for command in CONSOLE_COMMANDS])
+
+
 def print_console_status():
     summary = stats_summary()
     cache_info = cache_stats()
-    print(f"{APP_NAME} Status", flush=True)
-    print(f"  Web UI:          http://127.0.0.1:{WEB_PORT}", flush=True)
-    print(f"  DNS:             {DNS_HOST}:{DNS_PORT} UDP/TCP", flush=True)
     public_name = ENCRYPTED_DNS_DOMAIN or ENCRYPTED_DNS_HOST
-    print(f"  Encrypted DNS:   tls://{public_name}:{DNS_TLS_PORT}, https://{public_name}{'' if DNS_HTTPS_PORT == 443 else ':' + str(DNS_HTTPS_PORT)}/dns-query, quic://{public_name}:{DNS_QUIC_PORT}", flush=True)
-    print(f"  Total queries:   {summary.get('total', 0)}", flush=True)
-    print(f"  Blocked queries: {summary.get('blocked', 0)}", flush=True)
-    print(f"  Block rate:      {summary.get('block_rate', 0.0):.1f}%", flush=True)
-    print(f"  Avg response:    {summary.get('avg_ms', 0.0):.1f} ms", flush=True)
-    print(f"  Active clients:  {summary.get('clients', 0)}", flush=True)
-    print(f"  Filter rules:    {summary.get('rules', 0)}", flush=True)
-    print(f"  Cache entries:   {cache_info.get('entries', 0)}", flush=True)
+    encrypted_dns = (
+        f"tls://{public_name}:{DNS_TLS_PORT} | "
+        f"https://{public_name}{'' if DNS_HTTPS_PORT == 443 else ':' + str(DNS_HTTPS_PORT)}/dns-query | "
+        f"quic://{public_name}:{DNS_QUIC_PORT}"
+    )
+    console_box(f"{APP_NAME} status", [
+        ("Web UI", f"http://127.0.0.1:{WEB_PORT}"),
+        ("DNS", f"{DNS_HOST}:{DNS_PORT} UDP/TCP"),
+        ("Encrypted DNS", encrypted_dns),
+        ("Total queries", summary.get("total", 0)),
+        ("Blocked queries", summary.get("blocked", 0)),
+        ("Block rate", f"{summary.get('block_rate', 0.0):.1f}%"),
+        ("Avg response", f"{summary.get('avg_ms', 0.0):.1f} ms"),
+        ("Active clients", summary.get("clients", 0)),
+        ("Filter rules", summary.get("rules", 0)),
+        ("Cache entries", cache_info.get("entries", 0)),
+    ])
 
 
 def run_dnssec_self_validation_test(server_host=None, server_port=None, timeout=4.0):
@@ -8808,17 +8881,22 @@ def run_dnssec_self_validation_test(server_host=None, server_port=None, timeout=
 
 def print_dnssec_self_validation_test():
     result = run_dnssec_self_validation_test()
-    print(f"DNSSEC Self-Validation test against {result['server']}", flush=True)
+    console_box("DNSSEC self-validation", [
+        ("Server", result["server"]),
+        ("Validation", "enabled" if result.get("enabled") else "disabled"),
+    ])
     if not result.get("enabled"):
-        print("  WARNING: dnssec_validation_enabled is off.", flush=True)
+        console_event("warn", "dnssec_validation_enabled is off")
     if result.get("error"):
-        print(f"  ERROR: {result['error']}", flush=True)
+        console_event("error", result["error"])
     for item in result.get("tests", []):
+        level = "ok" if item["ok"] else "error"
         status = "OK" if item["ok"] else "FAIL"
         ad_text = "AD" if item["ad"] else "no AD"
         details = item["error"] or f"rcode={item['rcode']} {ad_text} expected={item['expected_rcode']}"
-        print(f"  [{status}] {item['domain']} {item['qtype']} - {details} ({item['duration_ms']} ms)", flush=True)
-    print(f"  Overall: {result['overall'].upper()}", flush=True)
+        console_event(level, f"{status} {item['domain']} {item['qtype']}", f"{details} ({item['duration_ms']} ms)")
+    overall_level = "ok" if result["overall"] == "pass" else "error"
+    console_event(overall_level, f"Overall: {result['overall'].upper()}")
 
 
 def run_console_command(command):
@@ -8829,7 +8907,7 @@ def run_console_command(command):
     if not cmd:
         return True
     if cmd in {"help", "?"}:
-        print("Commands: restart, stop, status, dnssec test, cache clear, update blocklist, dedupe blocklists, help", flush=True)
+        console_help()
         return True
     if cmd == "status":
         print_console_status()
@@ -8839,56 +8917,56 @@ def run_console_command(command):
         return True
     if cmd == "cache clear":
         result = clear_dns_cache()
-        print(f"Cache cleared: {result['entries']} entries, {result['bytes_used']} bytes", flush=True)
+        console_event("ok", "Cache cleared", f"{result['entries']} entries, {result['bytes_used']} bytes")
         return True
     if cmd in {"update blocklist", "update blocklists"}:
         if blocklist_manager is None:
-            print("Blocklist manager is not available.", flush=True)
+            console_event("warn", "Blocklist manager is not available")
         else:
             lists = [
                 bl for bl in blocklist_manager.get_all()
                 if bl.get("url", "").startswith(("http://", "https://"))
             ]
             if not lists:
-                print("No remote blocklists found.", flush=True)
+                console_event("info", "No remote blocklists found")
                 return True
             total = len(lists)
             for idx, bl in enumerate(lists, 1):
                 name = bl.get("name") or f"ID {bl.get('id')}"
-                print(f"[{idx}/{total}] Updating {name}...", flush=True)
+                console_event("work", f"Updating blocklist {idx}/{total}", name)
                 try:
                     blocklist_manager.update(bl["id"], background=False)
                     updated = blocklist_manager.get_by_id(bl["id"]) or {}
                     if updated.get("last_error"):
-                        print(f"[{idx}/{total}] {name}: ERROR - {updated['last_error']}", flush=True)
+                        console_event("error", f"Blocklist {idx}/{total} failed", f"{name}: {updated['last_error']}")
                     else:
-                        print(f"[{idx}/{total}] {name}: updated ({updated.get('rule_count', 0)} rules)", flush=True)
+                        console_event("ok", f"Blocklist {idx}/{total} updated", f"{name} ({updated.get('rule_count', 0)} rules)")
                 except Exception as exc:
-                    print(f"[{idx}/{total}] {name}: ERROR - {exc}", flush=True)
-            print("All Blocklist Updated", flush=True)
+                    console_event("error", f"Blocklist {idx}/{total} failed", f"{name}: {exc}")
+            console_event("ok", "Blocklist update finished")
         return True
     if cmd in {"dedupe blocklists", "dedupe blocklist", "dedupe lists", "blocklist dedupe", "duplicate blocklists", "doppelte blocklists"}:
-        print("Checking existing blocklist entries for duplicates...", flush=True)
+        console_event("work", "Checking existing blocklist entries for duplicates")
         try:
             result = dedupe_existing_blocklist_entries()
             removed = result["removed"]
             if removed == 0:
-                print("No duplicate blocklist entries found.", flush=True)
+                console_event("ok", "No duplicate blocklist entries found")
             else:
-                print(f"Removed {removed} duplicate blocklist entries.", flush=True)
+                console_event("ok", "Removed duplicate blocklist entries", removed)
                 for item in result["lists"]:
-                    print(f"  {item['name']}: removed {item['removed']}", flush=True)
-                print("Filter engine reloaded.", flush=True)
+                    console_event("info", item["name"], f"removed {item['removed']}")
+                console_event("ok", "Filter engine reloaded")
         except Exception as exc:
-            print(f"Blocklist dedupe failed: {exc}", flush=True)
+            console_event("error", "Blocklist dedupe failed", exc)
         return True
     if cmd == "restart":
-        print("Restarting runtime servers...", flush=True)
+        console_event("work", "Restarting runtime servers")
         try:
             restart_runtime_servers()
-            print(f"Runtime restarted. Web UI: http://127.0.0.1:{WEB_PORT} | DNS: {DNS_HOST}:{DNS_PORT}", flush=True)
+            console_event("ok", "Runtime restarted", f"Web UI: http://127.0.0.1:{WEB_PORT} | DNS: {DNS_HOST}:{DNS_PORT}")
         except Exception as exc:
-            print(f"Runtime restart failed: {exc}", flush=True)
+            console_event("error", "Runtime restart failed", exc)
             try:
                 with open("startup.log", "a", encoding="utf-8") as log:
                     log.write(f"{now_iso()} runtime restart failed: {type(exc).__name__}: {exc}\n")
@@ -8896,19 +8974,93 @@ def run_console_command(command):
                 pass
         return True
     if cmd == "stop":
-        print("Stopping server...", flush=True)
+        console_event("info", "Stopping server")
         server_shutdown_event.set()
         shutdown_runtime_servers()
         return False
-    print(f"Unknown command: {command}. Type 'help'.", flush=True)
+    console_event("warn", f"Unknown command: {command}", "Type 'help'.")
     return True
 
 
+def console_input(prompt):
+    if os.name != "nt" or not getattr(sys.stdin, "isatty", lambda: False)():
+        return input(prompt)
+
+    import msvcrt
+
+    buffer = ""
+    last_len = 0
+    tab_prefix = None
+    tab_matches = []
+    tab_index = -1
+
+    def redraw():
+        nonlocal last_len
+        clear_len = max(last_len, len(buffer))
+        sys.stdout.write("\r" + " " * (len(prompt) + clear_len) + "\r" + prompt + buffer)
+        sys.stdout.flush()
+        last_len = len(buffer)
+
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+
+    while True:
+        char = msvcrt.getwch()
+        if char in ("\x00", "\xe0"):
+            msvcrt.getwch()
+            continue
+        if char in ("\r", "\n"):
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            return buffer
+        if char == "\x03":
+            raise KeyboardInterrupt
+        if char == "\x1a":
+            raise EOFError
+        if char == "\x08":
+            if buffer:
+                buffer = buffer[:-1]
+                tab_prefix = None
+                tab_matches = []
+                tab_index = -1
+                redraw()
+            continue
+        if char == "\x1b":
+            if buffer:
+                buffer = ""
+                tab_prefix = None
+                tab_matches = []
+                tab_index = -1
+                redraw()
+            continue
+        if char == "\t":
+            if tab_matches and buffer == tab_matches[tab_index]:
+                pass
+            else:
+                tab_prefix = buffer.lower()
+                tab_matches = [command for command in CONSOLE_COMMANDS if command.startswith(tab_prefix)]
+                tab_index = -1
+            if tab_matches:
+                tab_index = (tab_index + 1) % len(tab_matches)
+                buffer = tab_matches[tab_index]
+                redraw()
+            else:
+                sys.stdout.write("\a")
+                sys.stdout.flush()
+            continue
+        if char.isprintable():
+            buffer += char
+            tab_prefix = None
+            tab_matches = []
+            tab_index = -1
+            redraw()
+
+
 def console_loop():
-    print("Console commands: restart, stop, status, dnssec test, cache clear, update blocklist, dedupe blocklists, help", flush=True)
+    console_help()
     while not server_shutdown_event.is_set():
         try:
-            command = input("pyguarddns> ")
+            command = console_input("pyguarddns> ")
         except EOFError:
             time.sleep(0.5)
             continue
@@ -8944,17 +9096,17 @@ def ensure_requirements():
                 to_install.append(req)
         if not to_install:
             return
-        print(f"Missing packages: {', '.join(to_install)} — installing...", flush=True)
+        console_event("work", "Missing packages; installing", ", ".join(to_install))
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install"] + to_install,
             capture_output=True, text=True, timeout=120
         )
         if result.returncode != 0:
-            print(f"pip install failed (exit {result.returncode}):\n{result.stdout}\n{result.stderr}", flush=True)
+            console_event("error", f"pip install failed (exit {result.returncode})", f"{result.stdout}\n{result.stderr}")
         else:
-            print("Done.", flush=True)
+            console_event("ok", "Dependencies installed")
     except Exception as e:
-        print(f"Warning: could not verify requirements: {e}", flush=True)
+        console_event("warn", "Could not verify requirements", e)
 
 
 def main():
@@ -8962,7 +9114,7 @@ def main():
     ensure_requirements()
     install_crash_handlers()
     if not acquire_instance_lock():
-        print(f"{APP_NAME} is already running. Please do not start a second window.", flush=True)
+        console_event("warn", f"{APP_NAME} is already running", "Please do not start a second window.")
         return
     server_shutdown_event.clear()
     set_runtime_status("DNS server starting ...", ready=False)
@@ -9011,11 +9163,8 @@ def main():
             log.write(f"{now_iso()} encrypted dns disabled\n")
         log.flush()
         set_runtime_status("DNS server ready", ready=True)
-        public_dns_name = ENCRYPTED_DNS_DOMAIN or ENCRYPTED_DNS_HOST
-        print(f"{APP_NAME} Web UI: http://127.0.0.1:{WEB_PORT}", flush=True)
-        print(f"{APP_NAME} DNS UDP/TCP: {DNS_HOST}:{DNS_PORT}", flush=True)
-        if encrypted_dns_servers:
-            print(f"{APP_NAME} encrypted DNS: tls://{public_dns_name}:{DNS_TLS_PORT} | https://{public_dns_name}{'' if DNS_HTTPS_PORT == 443 else ':' + str(DNS_HTTPS_PORT)}/dns-query | quic://{public_dns_name}:{DNS_QUIC_PORT}", flush=True)
+        console_event("ok", f"{APP_NAME} is ready")
+        print_console_status()
     try:
         console_loop()
     finally:
@@ -9046,30 +9195,18 @@ def cli_main():
     start_db_writer()
 
     if cmd == "status":
-        summary = stats_summary()
-        cache_info = cache_stats()
-        print(f"{APP_NAME} Status")
-        print(f"  Total queries:   {summary.get('total', 0)}")
-        print(f"  Blocked queries: {summary.get('blocked', 0)}")
-        print(f"  Block rate:      {summary.get('block_rate', 0.0):.1f}%")
-        print(f"  Avg response:    {summary.get('avg_ms', 0.0):.1f} ms")
-        print(f"  Cache rate:      {summary.get('cache_rate', 0.0):.1f}%")
-        print(f"  Active clients:  {summary.get('clients', 0)}")
-        print(f"  Filter rules:    {summary.get('rules', 0)}")
-        print(f"  Upstreams:       {summary.get('upstreams', 0)}")
-        print(f"  Cache entries:   {cache_info.get('entries', 0)}")
-        print(f"  Cache bytes:     {cache_info.get('bytes_used', 0)}")
+        print_console_status()
 
     elif cmd == "reload":
         invalidate_rules_cache()
-        print("Rules cache invalidated.")
+        console_event("ok", "Rules cache invalidated")
 
     elif cmd == "update-lists":
         if blocklist_manager is not None:
             result = blocklist_manager.update_all()
-            print(f"Updated blocklists: {result}")
+            console_event("ok", "Updated blocklists", result)
         else:
-            print("No blocklist manager available.")
+            console_event("warn", "No blocklist manager available")
 
     elif cmd == "backup":
         sensitive_keys = {"admin_password_set", "api_token", "encrypted_dns_private_key_pem"}
@@ -9089,35 +9226,35 @@ def cli_main():
         backup_path = args.backup_file or f"localdnsguard_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         with open(backup_path, "w", encoding="utf-8") as f:
             f.write(body)
-        print(f"Backup written to {backup_path}")
+        console_event("ok", "Backup written", backup_path)
 
     elif cmd == "restore":
         if not args.file:
-            print("Error: --file argument required for restore command", file=sys.stderr)
+            console_event("error", "--file argument required for restore command")
             return
         try:
             with open(args.file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             handle_restore_data(data)
-            print(f"Restore from {args.file} completed.")
+            console_event("ok", "Restore completed", args.file)
         except Exception as exc:
-            print(f"Restore failed: {exc}", file=sys.stderr)
+            console_event("error", "Restore failed", exc)
 
     elif cmd == "test-domain":
         if not args.domain:
-            print("Error: --domain argument required for test-domain command", file=sys.stderr)
+            console_event("error", "--domain argument required for test-domain command")
             return
         try:
             result = run_domain_test({"domain": args.domain, "query_type": args.query_type, "client": args.client})
             print(json.dumps(result, ensure_ascii=False, indent=2))
         except Exception as exc:
-            print(f"Domain test failed: {exc}", file=sys.stderr)
+            console_event("error", "Domain test failed", exc)
 
     elif cmd == "dnssec-test":
         print_dnssec_self_validation_test()
 
     else:
-        print(f"Unknown command: {cmd}", file=sys.stderr)
+        console_event("warn", f"Unknown command: {cmd}")
         parser.print_help()
 
 
