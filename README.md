@@ -100,6 +100,7 @@ Important runtime values can be configured through environment variables:
 | `LOCALDNSGUARD_DB` | `localdnsguard.sqlite3` | Path to the SQLite database |
 | `LOCALDNSGUARD_DB_IN_MEMORY` | `1` | Load SQLite into RAM at startup and sync changes back to disk |
 | `LOCALDNSGUARD_DB_MEMORY_SYNC_INTERVAL` | `60` | Seconds between RAM database syncs to disk |
+| `LOCALDNSGUARD_BLOCKLIST_DOWNLOAD_TIMEOUT` | `20` | Maximum seconds for one blocklist download before the import job fails |
 | `LOCALDNSGUARD_WEB_HOST` | `0.0.0.0` | Host/IP for the web interface |
 | `LOCALDNSGUARD_WEB_PORT` | `8080` | Port for the web interface |
 | `LOCALDNSGUARD_DNS_HOST` | `0.0.0.0` | Host/IP for DNS UDP/TCP |
@@ -188,6 +189,8 @@ For `.zip` blocklists, PyGuardDNS reads only likely text files, rejects path tra
 
 The blocklist schema stores update metadata such as `last_successful_update`, `last_failed_update`, `last_error`, `last_rule_count`, `last_unique_rule_count`, `last_sha256`, `etag`, `last_modified`, `duplicate_rule_count`, and `import_report`.
 
+The `From List` preset picker in the Blocklist Manager uses built-in presets. No external `adlist.txt` file is required at runtime.
+
 ## Profiles and Clients
 
 Clients can be assigned to a profile by IP address or CIDR range. A profile can have its own rules, blocklists, service blocks, SafeSearch settings, and YouTube Restricted Mode. This makes it possible to apply different DNS policies to specific devices or groups in the network.
@@ -267,7 +270,7 @@ The application stores its data in this file by default:
 localdnsguard.sqlite3
 ```
 
-By default, PyGuardDNS loads this SQLite file into an in-memory database at startup. Runtime reads and writes use the RAM database, and changes are synchronized back to `localdnsguard.sqlite3` every `5` seconds and again during normal shutdown. This improves database responsiveness while keeping the on-disk file as the persistent copy.
+By default, PyGuardDNS loads this SQLite file into an in-memory database at startup. Runtime reads and writes use the RAM database, and changes are synchronized back to `localdnsguard.sqlite3` every `60` seconds and again during normal shutdown. Background syncs use a snapshot so normal saves are not blocked by the full disk write. This improves database responsiveness while keeping the on-disk file as the persistent copy.
 
 To force direct on-disk SQLite access instead, set:
 
@@ -334,5 +337,7 @@ requirements.txt          Runtime Python dependencies
 requirements-dev.txt      Test/development Python dependencies
 start-pyguarddns.bat      Windows start script
 start-pyguarddns.sh       Linux/macOS start script
+tests/                    Pytest test suite
+```
 tests/                    Pytest test suite
 ```
