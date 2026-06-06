@@ -192,6 +192,23 @@ blocklist_delete_status = {
     "started_at": "",
     "finished_at": "",
 }
+blocklist_toggle_lock = threading.Lock()
+blocklist_toggle_running = False
+blocklist_toggle_pending = 0
+blocklist_toggle_status = {
+    "running": False,
+    "queued": 0,
+    "total": 0,
+    "done": 0,
+    "failed": 0,
+    "current": "",
+    "last_error": "",
+    "started_at": "",
+    "finished_at": "",
+}
+rules_reload_lock = threading.Lock()
+rules_reload_running = False
+rules_reload_pending = 0
 
 
 def build_filter_engine():
@@ -1541,12 +1558,52 @@ def pattern_matches(pattern_type, pattern, domain):
     return False
 
 
-def invalidate_rules_cache():
+def invalidate_rules_cache(reload_now: bool = True):
     global rules_cache
     with rules_lock:
         rules_cache = None
-    reload_filter_engine()
-    clear_dns_cache()
+    if reload_now:
+        reload_filter_engine()
+        clear_dns_cache()
+
+
+def enqueue_rules_reload(reason: str = "Rule changes"):
+    global rules_reload_running, rules_reload_pending
+    with rules_reload_lock:
+        rules_reload_pending += 1
+        if rules_reload_running:
+            return
+        rules_reload_running = True
+    threading.Thread(target=rules_reload_worker, args=(reason,), name="rules-reload", daemon=True).start()
+
+
+def rules_reload_worker(reason: str = "Rule changes"):
+    global rules_reload_running, rules_reload_pending
+    try:
+        while True:
+            with rules_reload_lock:
+                seen_pending = rules_reload_pending
+            time.sleep(1.0)
+            with rules_reload_lock:
+                if rules_reload_pending != seen_pending:
+                    continue
+            try:
+                console_event("work", "Reloading filter engine", reason)
+                reload_filter_engine()
+                clear_dns_cache()
+                console_event("ok", "Filter engine reloaded", reason)
+            except Exception as exc:
+                console_event("error", "Rule reload failed", exc)
+            with rules_reload_lock:
+                if rules_reload_pending == seen_pending:
+                    rules_reload_pending = 0
+                    rules_reload_running = False
+                    return
+                rules_reload_pending = max(0, rules_reload_pending - seen_pending)
+    finally:
+        with rules_reload_lock:
+            if not rules_reload_pending:
+                rules_reload_running = False
 
 
 def rebuild_rules_cache_background():
@@ -5038,6 +5095,82 @@ def current_blocklist_delete_status():
         return dict(blocklist_delete_status)
 
 
+def enqueue_blocklist_toggle_reload():
+    global blocklist_toggle_running, blocklist_toggle_pending
+    with blocklist_toggle_lock:
+        was_running = blocklist_toggle_status["running"]
+        blocklist_toggle_pending += 1
+        blocklist_toggle_status["queued"] = blocklist_toggle_pending
+        blocklist_toggle_status["total"] = blocklist_toggle_status["total"] + 1 if was_running else 1
+        if not was_running:
+            blocklist_toggle_status.update({
+                "running": True,
+                "done": 0,
+                "failed": 0,
+                "current": "Waiting for more changes",
+                "last_error": "",
+                "started_at": now_iso(),
+                "finished_at": "",
+            })
+        if not blocklist_toggle_running:
+            blocklist_toggle_running = True
+            threading.Thread(target=blocklist_toggle_reload_worker, name="blocklist-toggle-reload", daemon=True).start()
+
+
+def blocklist_toggle_reload_worker():
+    global blocklist_toggle_running, blocklist_toggle_pending
+    try:
+        while True:
+            with blocklist_toggle_lock:
+                seen_pending = blocklist_toggle_pending
+                blocklist_toggle_status["queued"] = seen_pending
+                blocklist_toggle_status["current"] = "Waiting for more changes"
+            time.sleep(1.0)
+            with blocklist_toggle_lock:
+                if blocklist_toggle_pending != seen_pending:
+                    continue
+                blocklist_toggle_status["current"] = "Reloading filter engine"
+            try:
+                console_event("work", "Reloading filter engine", "Blocklist state changes")
+                reload_filter_engine()
+                console_event("ok", "Filter engine reloaded", "Blocklist state changes")
+                with blocklist_toggle_lock:
+                    blocklist_toggle_status["done"] += seen_pending
+                    if blocklist_toggle_pending == seen_pending:
+                        blocklist_toggle_pending = 0
+                        blocklist_toggle_status["queued"] = 0
+                        blocklist_toggle_status["running"] = False
+                        blocklist_toggle_status["current"] = ""
+                        blocklist_toggle_status["finished_at"] = now_iso()
+                        return
+                    blocklist_toggle_pending = max(0, blocklist_toggle_pending - seen_pending)
+            except Exception as exc:
+                with blocklist_toggle_lock:
+                    blocklist_toggle_status["failed"] += seen_pending or 1
+                    blocklist_toggle_status["last_error"] = f"Filter reload failed: {exc}"
+                    if blocklist_toggle_pending == seen_pending:
+                        blocklist_toggle_pending = 0
+                        blocklist_toggle_status["queued"] = 0
+                        blocklist_toggle_status["running"] = False
+                        blocklist_toggle_status["current"] = ""
+                        blocklist_toggle_status["finished_at"] = now_iso()
+                        return
+                    blocklist_toggle_pending = max(0, blocklist_toggle_pending - seen_pending)
+    finally:
+        with blocklist_toggle_lock:
+            blocklist_toggle_running = False
+            if not blocklist_toggle_pending:
+                blocklist_toggle_status["running"] = False
+                blocklist_toggle_status["queued"] = 0
+                blocklist_toggle_status["current"] = ""
+                blocklist_toggle_status["finished_at"] = blocklist_toggle_status.get("finished_at") or now_iso()
+
+
+def current_blocklist_toggle_status():
+    with blocklist_toggle_lock:
+        return dict(blocklist_toggle_status)
+
+
 def dedupe_existing_blocklist_entries():
     removed_by_list = {}
     kept_keys = set()
@@ -5313,11 +5446,12 @@ function blEnsureStatusBox(id, cls) {{
   return el;
 }}
 function blFormatStatus(prefix, s) {{
-  const current = s.current || (prefix === 'Blocklist import' ? 'Preparing import' : 'Preparing delete');
+  const fallback = prefix === 'Blocklist import' ? 'Preparing import' : (prefix === 'Blocklist delete' ? 'Preparing delete' : 'Preparing reload');
+  const current = s.current || fallback;
   return `${{prefix}} running: ${{current}} (${{s.done || 0}} done, ${{s.failed || 0}} failed, ${{s.queued || 0}} queued).`;
 }}
 function blClearStatusBoxes() {{
-  document.querySelectorAll('#bl-job-status,#bl-delete-status').forEach(function(el) {{ el.remove(); }});
+  document.querySelectorAll('#bl-job-status,#bl-delete-status,#bl-toggle-status').forEach(function(el) {{ el.remove(); }});
 }}
 async function refreshBlocklistJobStatus() {{
   try {{
@@ -5326,9 +5460,10 @@ async function refreshBlocklistJobStatus() {{
     const data = await r.json();
     const imp = data.import || {{}};
     const del = data.delete || {{}};
-    const active = !!(imp.running || del.running);
+    const tog = data.toggle || {{}};
+    const active = !!(imp.running || del.running || tog.running);
     if (!active) {{
-      const hadStatusBox = !!document.querySelector('#bl-job-status,#bl-delete-status');
+      const hadStatusBox = !!document.querySelector('#bl-job-status,#bl-delete-status,#bl-toggle-status');
       blClearStatusBoxes();
       if ((blJobWasActive || hadStatusBox) && !blReloadScheduled) {{
         blReloadScheduled = true;
@@ -5345,6 +5480,11 @@ async function refreshBlocklistJobStatus() {{
       blEnsureStatusBox('bl-delete-status', 'alert alert-warning').textContent = blFormatStatus('Blocklist delete', del);
     }} else {{
       document.querySelectorAll('#bl-delete-status').forEach(function(el) {{ el.remove(); }});
+    }}
+    if (tog.running) {{
+      blEnsureStatusBox('bl-toggle-status', 'alert alert-info').textContent = blFormatStatus('Blocklist reload', tog);
+    }} else {{
+      document.querySelectorAll('#bl-toggle-status').forEach(function(el) {{ el.remove(); }});
     }}
     blJobWasActive = true;
   }} catch (e) {{}}
@@ -7123,13 +7263,19 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_html(template("<div class='alert alert-danger'>Invalid CSRF token. Reload the page and try again.</div>", "Security"), 403)
             return
         if path == "/rules/add":
+            action = form.get("action", "block")
+            pattern_type = form.get("pattern_type", "domain")
+            pattern = normalize_domain(form.get("pattern", ""))
+            target = form.get("target", "")
             with db_lock:
-                db.execute(
+                cur = db.execute(
                     "INSERT INTO rules(action,pattern_type,pattern,target,comment,created_at) VALUES(?,?,?,?,?,?)",
-                    (form.get("action", "block"), form.get("pattern_type", "domain"), normalize_domain(form.get("pattern", "")), form.get("target", ""), form.get("comment", ""), now_iso()),
+                    (action, pattern_type, pattern, target, form.get("comment", ""), now_iso()),
                 )
                 db.commit()
-            invalidate_rules_cache()
+            console_event("ok", "Rule added", f"#{cur.lastrowid} {action} {pattern_type} {pattern}")
+            invalidate_rules_cache(reload_now=False)
+            enqueue_rules_reload("Rule added")
             self.redirect("/rules")
         elif path == "/blocklists/add":
             global blocklist_manager
@@ -7214,7 +7360,14 @@ class WebHandler(BaseHTTPRequestHandler):
         elif path == "/blocklists/toggle":
             bl_id = int(form.get("id"))
             enabled = form.get("enabled") == "1"
-            blocklist_manager.set_enabled(bl_id, enabled)
+            item = blocklist_manager.get_by_id(bl_id) if blocklist_manager else None
+            if blocklist_manager and blocklist_manager.set_enabled(bl_id, enabled, notify_reload=False):
+                name = item.get("name") if item else f"ID {bl_id}"
+                state = "active" if enabled else "inactive"
+                console_event("ok", f"Blocklist set {state}", name)
+                enqueue_blocklist_toggle_reload()
+            else:
+                console_event("warn", "Blocklist toggle failed", f"ID {bl_id} not found")
             self.redirect("/blocklists")
         elif path == "/blocklists/delete":
             bl_id = int(form.get("id"))
@@ -7236,24 +7389,41 @@ class WebHandler(BaseHTTPRequestHandler):
             self.redirect("/blocklists")
         elif path == "/rules/delete":
             with db_lock:
+                rule = db.execute("SELECT id,action,pattern_type,pattern FROM rules WHERE id=?", (form.get("id"),)).fetchone()
                 db.execute("DELETE FROM rules WHERE id=?", (form.get("id"),))
                 db.commit()
-            invalidate_rules_cache()
+            if rule:
+                console_event("ok", "Rule deleted", f"#{rule['id']} {rule['action']} {rule['pattern_type']} {rule['pattern']}")
+            else:
+                console_event("warn", "Rule delete failed", f"ID {form.get('id')} not found")
+            invalidate_rules_cache(reload_now=False)
+            enqueue_rules_reload("Rule deleted")
             self.redirect("/rules")
         elif path == "/rewrites/add":
+            pattern_type = form.get("pattern_type", "domain")
+            pattern = normalize_domain(form.get("pattern", ""))
+            target = form.get("target", "")
             with db_lock:
-                db.execute(
+                cur = db.execute(
                     "INSERT INTO rules(action,pattern_type,pattern,target,comment,created_at) VALUES(?,?,?,?,?,?)",
-                    ("rewrite", form.get("pattern_type", "domain"), normalize_domain(form.get("pattern", "")), form.get("target", ""), form.get("comment", ""), now_iso()),
+                    ("rewrite", pattern_type, pattern, target, form.get("comment", ""), now_iso()),
                 )
                 db.commit()
-            invalidate_rules_cache()
+            console_event("ok", "Rewrite rule added", f"#{cur.lastrowid} {pattern_type} {pattern} -> {target}")
+            invalidate_rules_cache(reload_now=False)
+            enqueue_rules_reload("Rewrite rule added")
             self.redirect("/rewrites")
         elif path == "/rewrites/delete":
             with db_lock:
+                rule = db.execute("SELECT id,pattern_type,pattern,target FROM rules WHERE id=?", (form.get("id"),)).fetchone()
                 db.execute("DELETE FROM rules WHERE id=?", (form.get("id"),))
                 db.commit()
-            invalidate_rules_cache()
+            if rule:
+                console_event("ok", "Rewrite rule deleted", f"#{rule['id']} {rule['pattern_type']} {rule['pattern']} -> {rule['target']}")
+            else:
+                console_event("warn", "Rewrite rule delete failed", f"ID {form.get('id')} not found")
+            invalidate_rules_cache(reload_now=False)
+            enqueue_rules_reload("Rewrite rule deleted")
             self.redirect("/rewrites")
         elif path == "/clients/add":
             if client_manager is not None:
@@ -8110,6 +8280,7 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_json({
                 "import": current_blocklist_import_status(),
                 "delete": current_blocklist_delete_status(),
+                "toggle": current_blocklist_toggle_status(),
             })
         elif path == "/api/clients":
             if client_manager is not None:

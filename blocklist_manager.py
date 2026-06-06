@@ -729,7 +729,7 @@ class BlocklistManager:
             self.db.commit()
         return True
 
-    def set_enabled(self, list_id: int, enabled: bool) -> bool:
+    def set_enabled(self, list_id: int, enabled: bool, notify_reload: bool = True) -> bool:
         item = self._get(list_id)
         if not item:
             return False
@@ -739,7 +739,8 @@ class BlocklistManager:
                 (1 if enabled else 0, list_id),
             )
             self.db.commit()
-        self._notify_reload()
+        if notify_reload:
+            self._notify_reload()
         return True
 
     def delete(self, list_id: int, notify_reload: bool = True) -> bool:
