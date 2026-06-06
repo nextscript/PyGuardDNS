@@ -8740,6 +8740,42 @@ CONSOLE_COMMANDS = [
     "help",
 ]
 
+_readline_completion_ready = False
+
+
+def console_command_completions(prefix):
+    normalized = prefix.replace(chr(0xFEFF), "").lower()
+    return [command for command in CONSOLE_COMMANDS if command.startswith(normalized)]
+
+
+def setup_readline_completion():
+    global _readline_completion_ready
+    if _readline_completion_ready:
+        return True
+    try:
+        import readline
+    except Exception:
+        return False
+
+    def complete(text, state):
+        prefix = readline.get_line_buffer()
+        matches = console_command_completions(prefix)
+        if state < len(matches):
+            return matches[state]
+        return None
+
+    try:
+        readline.set_completer_delims("")
+        readline.set_completer(complete)
+        try:
+            readline.parse_and_bind("tab: menu-complete")
+        except Exception:
+            readline.parse_and_bind("tab: complete")
+        _readline_completion_ready = True
+        return True
+    except Exception:
+        return False
+
 
 def console_event(level, message, detail=""):
     labels = {
@@ -9002,7 +9038,11 @@ def run_console_command(command):
 
 
 def console_input(prompt):
-    if os.name != "nt" or not getattr(sys.stdin, "isatty", lambda: False)():
+    if os.name != "nt":
+        if getattr(sys.stdin, "isatty", lambda: False)():
+            setup_readline_completion()
+        return input(prompt)
+    if not getattr(sys.stdin, "isatty", lambda: False)():
         return input(prompt)
 
     import msvcrt
@@ -9057,7 +9097,7 @@ def console_input(prompt):
                 pass
             else:
                 tab_prefix = buffer.lower()
-                tab_matches = [command for command in CONSOLE_COMMANDS if command.startswith(tab_prefix)]
+                tab_matches = console_command_completions(tab_prefix)
                 tab_index = -1
             if tab_matches:
                 tab_index = (tab_index + 1) % len(tab_matches)
