@@ -1524,7 +1524,9 @@ def client_filtering_enabled(client_ip):
     if client_manager is not None:
         c = client_manager.get_client_by_ip(client_ip)
         if c:
-            return bool(c.get("filtering_enabled", 1))
+            client_enabled = bool(c.get("filtering_enabled", 1))
+            profile_enabled = bool(c.get("profile_filtering", 1))
+            return client_enabled and profile_enabled
         return True
     for client in rows("SELECT * FROM clients WHERE enabled=1"):
         address = client.get("address") or client.get("ip", "")
@@ -7188,22 +7190,38 @@ class WebHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "not found"}, 404)
         elif re.search(r"/api/profiles/\d+$", path):
             pid = int(path.strip("/").split("/")[2])
+            profile = client_manager.get_profile(pid) if client_manager else None
             if client_manager and client_manager.delete_profile(pid):
+                pname = profile["name"] if profile else f"ID {pid}"
+                console_event("info", "Profile deleted", pname)
                 self.send_json({"ok": True})
             else:
+                console_event("warn", "Profile delete failed", f"ID {pid} not found or default profile")
                 self.send_json({"error": "not found"}, 404)
         elif re.search(r"/api/profiles/\d+/rules/\d+$", path):
             parts = path.strip("/").split("/")
+            pid = int(parts[2])
             rule_id = int(parts[4])
+            profile = client_manager.get_profile(pid) if client_manager else None
+            rule = next((r for r in client_manager.get_profile_rules(pid) if int(r["id"]) == rule_id), None) if client_manager else None
             if client_manager and client_manager.delete_profile_rule(rule_id):
+                pname = profile["name"] if profile else f"ID {pid}"
+                detail = f"#{rule['id']} {rule['action']} {rule['pattern_type']} {rule['pattern']}" if rule else f"#{rule_id}"
+                console_event("info", "Profile rule deleted", f"{pname}: {detail}")
                 self.send_json({"ok": True})
             else:
+                console_event("warn", "Profile rule delete failed", f"ID {rule_id} not found")
                 self.send_json({"error": "not found"}, 404)
         elif re.search(r"/api/profiles/\d+/blocklists/\d+$", path):
             parts = path.strip("/").split("/")
             pid = int(parts[2])
             bl_id = int(parts[4])
+            profile = client_manager.get_profile(pid) if client_manager else None
+            bl = blocklist_manager.get_by_id(bl_id) if blocklist_manager else None
             if client_manager and client_manager.remove_blocklist_from_profile(pid, bl_id):
+                pname = profile["name"] if profile else f"ID {pid}"
+                bname = bl["name"] if bl else f"ID {bl_id}"
+                console_event("info", "Profile blocklist removed", f"{pname}: {bname}")
                 self.send_json({"ok": True})
             else:
                 self.send_json({"error": "not found"}, 404)
@@ -7212,7 +7230,10 @@ class WebHandler(BaseHTTPRequestHandler):
             pid = int(parts[2])
             svc = parts[4]
             if client_manager is not None:
-                client_manager.remove_profile_service(pid, svc)
+                profile = client_manager.get_profile(pid)
+                if client_manager.remove_profile_service(pid, svc):
+                    pname = profile["name"] if profile else f"ID {pid}"
+                    console_event("info", "Profile service block removed", f"{pname}: {svc}")
                 invalidate_rules_cache()
                 self.send_json({"ok": True})
             else:
@@ -7477,48 +7498,77 @@ class WebHandler(BaseHTTPRequestHandler):
                 name = form.get("name", "").strip()
                 desc = form.get("description", "").strip()
                 if name:
-                    client_manager.create_profile(name, desc)
+                    profile = client_manager.create_profile(name, desc)
+                    console_event("info", "Profile added", f"#{profile['id']} {profile['name']}")
             self.redirect("/profiles")
         elif path == "/profiles/rule-add":
             if client_manager is not None:
                 pid = int(form.get("profile_id"))
+                profile = client_manager.get_profile(pid)
                 action = form.get("action", "block")
                 pt = form.get("pattern_type", "domain")
                 pattern = form.get("pattern", "").strip()
                 if pattern:
-                    client_manager.add_profile_rule(pid, action, pt, pattern)
+                    rule = client_manager.add_profile_rule(pid, action, pt, pattern)
+                    if rule:
+                        pname = profile["name"] if profile else f"ID {pid}"
+                        console_event("info", "Profile rule added", f"{pname}: #{rule['id']} {action} {pt} {pattern}")
             self.redirect("/profiles")
         elif path == "/profiles/rule-delete":
             if client_manager is not None:
+                pid = int(form.get("profile_id"))
                 rule_id = int(form.get("rule_id"))
-                client_manager.delete_profile_rule(rule_id)
+                profile = client_manager.get_profile(pid)
+                rule = next((r for r in client_manager.get_profile_rules(pid) if int(r["id"]) == rule_id), None)
+                if client_manager.delete_profile_rule(rule_id):
+                    pname = profile["name"] if profile else f"ID {pid}"
+                    detail = f"#{rule['id']} {rule['action']} {rule['pattern_type']} {rule['pattern']}" if rule else f"#{rule_id}"
+                    console_event("info", "Profile rule deleted", f"{pname}: {detail}")
+                else:
+                    console_event("warn", "Profile rule delete failed", f"ID {rule_id} not found")
             self.redirect("/profiles")
         elif path == "/profiles/blocklist-add":
             if client_manager is not None:
                 pid = int(form.get("profile_id"))
                 bl_id = int(form.get("blocklist_id"))
-                client_manager.add_blocklist_to_profile(pid, bl_id)
+                profile = client_manager.get_profile(pid)
+                bl = blocklist_manager.get_by_id(bl_id) if blocklist_manager else None
+                if client_manager.add_blocklist_to_profile(pid, bl_id):
+                    pname = profile["name"] if profile else f"ID {pid}"
+                    bname = bl["name"] if bl else f"ID {bl_id}"
+                    console_event("info", "Profile blocklist added", f"{pname}: {bname}")
             self.redirect("/profiles")
         elif path == "/profiles/blocklist-remove":
             if client_manager is not None:
                 pid = int(form.get("profile_id"))
                 bl_id = int(form.get("blocklist_id"))
-                client_manager.remove_blocklist_from_profile(pid, bl_id)
+                profile = client_manager.get_profile(pid)
+                bl = blocklist_manager.get_by_id(bl_id) if blocklist_manager else None
+                if client_manager.remove_blocklist_from_profile(pid, bl_id):
+                    pname = profile["name"] if profile else f"ID {pid}"
+                    bname = bl["name"] if bl else f"ID {bl_id}"
+                    console_event("info", "Profile blocklist removed", f"{pname}: {bname}")
             self.redirect("/profiles")
         elif path == "/profiles/service-add":
             if client_manager is not None:
                 pid = int(form.get("profile_id"))
+                profile = client_manager.get_profile(pid)
                 svc = form.get("service_name", "").strip()
                 if svc:
-                    client_manager.add_profile_service(pid, svc)
+                    if client_manager.add_profile_service(pid, svc):
+                        pname = profile["name"] if profile else f"ID {pid}"
+                        console_event("info", "Profile service block added", f"{pname}: {svc}")
                     invalidate_rules_cache()
             self.redirect("/profiles")
         elif path == "/profiles/service-remove":
             if client_manager is not None:
                 pid = int(form.get("profile_id"))
+                profile = client_manager.get_profile(pid)
                 svc = form.get("service_name", "").strip()
                 if svc:
-                    client_manager.remove_profile_service(pid, svc)
+                    if client_manager.remove_profile_service(pid, svc):
+                        pname = profile["name"] if profile else f"ID {pid}"
+                        console_event("info", "Profile service block removed", f"{pname}: {svc}")
                     invalidate_rules_cache()
             self.redirect("/profiles")
         elif path == "/profiles/edit":
@@ -7526,7 +7576,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 pid = int(form.get("profile_id"))
                 name = form.get("name", "").strip()
                 if name:
-                    client_manager.update_profile(pid,
+                    profile = client_manager.update_profile(pid,
                         name=name,
                         description=form.get("description", "").strip(),
                         filtering_enabled=form.get("filtering_enabled") == "1",
@@ -7535,11 +7585,20 @@ class WebHandler(BaseHTTPRequestHandler):
                         safe_search_ddg=form.get("safe_search_ddg") == "1",
                         youtube_restricted=form.get("youtube_restricted") == "1",
                     )
+                    if profile:
+                        console_event("info", "Profile updated", f"#{profile['id']} {profile['name']}")
+                    else:
+                        console_event("warn", "Profile update failed", f"ID {pid} not found")
             self.redirect("/profiles")
         elif path == "/profiles/delete":
             if client_manager is not None:
                 pid = int(form.get("profile_id"))
-                client_manager.delete_profile(pid)
+                profile = client_manager.get_profile(pid)
+                if client_manager.delete_profile(pid):
+                    pname = profile["name"] if profile else f"ID {pid}"
+                    console_event("info", "Profile deleted", pname)
+                else:
+                    console_event("warn", "Profile delete failed", f"ID {pid} not found or default profile")
             self.redirect("/profiles")
         elif path == "/upstreams/add":
             parsed = detect_upstream(form.get("resolver", form.get("address", "")))
@@ -8487,6 +8546,7 @@ class WebHandler(BaseHTTPRequestHandler):
                     fe = int(form.get("filtering_enabled", "1"))
                     p = client_manager.create_profile(name, desc, bool(fe))
                     log_admin_action(self.session_user(), "profile_create", f"Created profile {name}", self.client_address[0])
+                    console_event("info", "Profile added", f"#{p['id']} {p['name']}")
                     self.send_json({"ok": True, "id": p["id"]})
         elif re.search(r"/api/profiles/\d+$", path):
             pid = int(path.strip("/").split("/")[2])
@@ -8503,6 +8563,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 p = client_manager.update_profile(pid, **kwargs)
                 if p:
                     log_admin_action(self.session_user(), "profile_update", f"Updated profile {pid}", self.client_address[0])
+                    console_event("info", "Profile updated", f"#{p['id']} {p['name']}")
                     invalidate_rules_cache()
                     self.send_json({"ok": True})
                 else:
@@ -8518,8 +8579,12 @@ class WebHandler(BaseHTTPRequestHandler):
                 if not pattern:
                     self.send_json({"error": "pattern required"}, 400)
                 else:
+                    profile = client_manager.get_profile(pid)
                     r = client_manager.add_profile_rule(pid, action, pattern_type, pattern)
                     log_admin_action(self.session_user(), "profile_rule_add", f"Added rule {action} {pattern} to profile {pid}", self.client_address[0])
+                    if r:
+                        pname = profile["name"] if profile else f"ID {pid}"
+                        console_event("info", "Profile rule added", f"{pname}: #{r['id']} {action} {pattern_type} {pattern}")
                     self.send_json({"ok": True, "id": r["id"]} if r else {"error": "profile not found"}, 400 if not r else 200)
         elif re.search(r"/api/profiles/\d+/blocklists$", path):
             pid = int(path.strip("/").split("/")[2])
@@ -8530,14 +8595,24 @@ class WebHandler(BaseHTTPRequestHandler):
                 if bl_id is None:
                     self.send_json({"error": "blocklist_id required"}, 400)
                 else:
-                    ok = client_manager.add_blocklist_to_profile(pid, int(bl_id))
+                    blocklist_id = int(bl_id)
+                    profile = client_manager.get_profile(pid)
+                    bl = blocklist_manager.get_by_id(blocklist_id) if blocklist_manager else None
+                    ok = client_manager.add_blocklist_to_profile(pid, blocklist_id)
                     log_admin_action(self.session_user(), "profile_blocklist_add", f"Added blocklist {bl_id} to profile {pid}", self.client_address[0])
+                    if ok:
+                        pname = profile["name"] if profile else f"ID {pid}"
+                        bname = bl["name"] if bl else f"ID {blocklist_id}"
+                        console_event("info", "Profile blocklist added", f"{pname}: {bname}")
                     self.send_json({"ok": ok})
         elif re.search(r"/api/profiles/\d+/services/add$", path):
             pid = int(path.strip("/").split("/")[2])
             svc = form.get("service_name", "").strip()
+            profile = client_manager.get_profile(pid) if client_manager else None
             if client_manager is not None and client_manager.add_profile_service(pid, svc):
                 log_admin_action(self.session_user(), "profile_service_add", f"Added service block {svc} to profile {pid}", self.client_address[0])
+                pname = profile["name"] if profile else f"ID {pid}"
+                console_event("info", "Profile service block added", f"{pname}: {svc}")
                 invalidate_rules_cache()
                 self.send_json({"ok": True})
             else:
@@ -8546,7 +8621,10 @@ class WebHandler(BaseHTTPRequestHandler):
             pid = int(path.strip("/").split("/")[2])
             svc = form.get("service_name", "").strip()
             if client_manager is not None:
-                client_manager.remove_profile_service(pid, svc)
+                profile = client_manager.get_profile(pid)
+                if client_manager.remove_profile_service(pid, svc):
+                    pname = profile["name"] if profile else f"ID {pid}"
+                    console_event("info", "Profile service block removed", f"{pname}: {svc}")
                 log_admin_action(self.session_user(), "profile_service_remove", f"Removed service block {svc} from profile {pid}", self.client_address[0])
                 invalidate_rules_cache()
                 self.send_json({"ok": True})
