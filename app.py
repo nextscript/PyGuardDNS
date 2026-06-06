@@ -4057,10 +4057,11 @@ def extended_dashboard_data():
 
     prev = one("""
         SELECT COUNT(*) total, COALESCE(SUM(blocked),0) blocked,
-               COALESCE(AVG(CASE WHEN duration_ms<1000 THEN duration_ms END),0) avg_ms
+               COALESCE(AVG(CASE WHEN duration_ms<1000 THEN duration_ms END),0) avg_ms,
+               COALESCE(SUM(CASE WHEN cache_status='hit' THEN 1 ELSE 0 END),0) cache_hits
         FROM query_log WHERE timestamp >= datetime('now','localtime','-48 hours')
           AND timestamp < datetime('now','localtime','-24 hours')
-    """) or {"total": 0, "blocked": 0, "avg_ms": 0}
+    """) or {"total": 0, "blocked": 0, "avg_ms": 0, "cache_hits": 0}
 
     def pct_change(curr, prev_v):
         if not prev_v:
@@ -4121,12 +4122,18 @@ def extended_dashboard_data():
         FROM query_log WHERE timestamp >= datetime('now','localtime','-48 hours')
         GROUP BY client_ip ORDER BY requests DESC LIMIT 8
     """)
+    today_cache_rate = round((combined["cache_hits"] / combined["total"] * 100) if combined["total"] else 0, 1)
+    prev_cache_rate = round((prev["cache_hits"] / prev["total"] * 100) if prev["total"] else 0, 1)
     result = {
         "today": combined, "prev": prev,
         "changes": {
             "total": pct_change(combined["total"], prev["total"]),
             "blocked": pct_change(combined["blocked"], prev["blocked"]),
             "avg_ms": pct_change(combined["avg_ms"], prev["avg_ms"]),
+            "cache": pct_change(today_cache_rate, prev_cache_rate),
+            "total_abs": combined["total"] - prev["total"],
+            "blocked_abs": combined["blocked"] - prev["blocked"],
+            "avg_ms_abs": round((combined["avg_ms"] or 0) - (prev["avg_ms"] or 0), 1),
         },
         "sparklines": {"total": sparkline_total, "blocked": sparkline_blocked, "cache": sparkline_cache, "avgms": sparkline_avgms},
         "top_domains": top_domains, "top_blocked": top_blocked,
@@ -4154,16 +4161,23 @@ def dashboard_page():
     changes = d["changes"]
     blue = "#3b82f6"; red = "#ef4444"; orange = "#f59e0b"; purple = "#a78bfa"
 
-    def change_span(pct, lower_is_better=False):
-        if pct == 0:
+    def change_span(val, lower_is_better=False, fmt="pct"):
+        if val == 0:
             return '<span class="card-change" style="color:var(--muted)">— vs yesterday</span>'
-        good = (pct < 0) if lower_is_better else (pct > 0)
+        good = (val < 0) if lower_is_better else (val > 0)
         cls = "up" if good else "dn"
-        arrow = "▲" if pct > 0 else "▼"
-        sign = "+" if pct > 0 else ""
-        return f'<span class="card-change {cls}">{arrow} {sign}{pct}% vs yesterday</span>'
+        arrow = "▲" if val > 0 else "▼"
+        sign = "+" if val > 0 else ""
+        if fmt == "count":
+            formatted = f'{sign}{int(val):,}'
+        elif fmt == "ms":
+            formatted = f'{sign}{val} ms'
+        else:
+            display = f'{int(val)}' if abs(val) >= 100 else f'{val}'
+            formatted = f'{sign}{display}%'
+        return f'<span class="card-change {cls}">{arrow} {formatted} vs yesterday</span>'
 
-    def stat_card(label, value, spark_vals, color, icon_svg, pct, lower_is_better=False, card_id=""):
+    def stat_card(label, value, spark_vals, color, icon_svg, chval, lower_is_better=False, card_id="", fmt="pct"):
         spark = sparkline_svg(spark_vals, color)
         li = "1" if lower_is_better else "0"
         return (
@@ -4171,7 +4185,7 @@ def dashboard_page():
             f'<div class="card-top">'
             f'<div><div class="card-label">{label}</div>'
             f'<div class="card-value">{value}</div>'
-            f'{change_span(pct, lower_is_better)}</div>'
+            f'{change_span(chval, lower_is_better, fmt)}</div>'
             f'<div class="card-icon-box" style="background:{color}1a">{icon_svg}</div>'
             f'</div>'
             f'<div class="card-sparkline" style="margin-top:.35rem">{spark}</div>'
@@ -4190,10 +4204,10 @@ def dashboard_page():
     cache_rate = d["cache_rate"]
 
     cards_html = (
-        stat_card("DNS Queries",          f'{total:,}',       sp["total"],   blue,   ic_globe,  changes["total"],            card_id="total") +
-        stat_card("Blocked Requests",     f'{blocked:,}',     sp["blocked"], red,    ic_block,  changes["blocked"], True,    card_id="blocked") +
-        stat_card("Cache Hit Rate",       f'{cache_rate}%',   sp["cache"],   orange, ic_zap,    changes["total"],            card_id="cache") +
-        stat_card("Average Response Time", f'{avg_ms} ms',    sp["avgms"],   purple, ic_clock,  changes["avg_ms"],  True,    card_id="avgms")
+        stat_card("DNS Queries",           f'{total:,}',      sp["total"],   blue,   ic_globe,  changes["total_abs"],           False, card_id="total",   fmt="count") +
+        stat_card("Blocked Requests",      f'{blocked:,}',    sp["blocked"], red,    ic_block,  changes["blocked_abs"],         True,  card_id="blocked", fmt="count") +
+        stat_card("Cache Hit Rate",        f'{cache_rate}%',  sp["cache"],   orange, ic_zap,    changes["cache"],               False, card_id="cache",   fmt="pct") +
+        stat_card("Average Response Time", f'{avg_ms} ms',    sp["avgms"],   purple, ic_clock,  changes["avg_ms_abs"],          True,  card_id="avgms",   fmt="ms")
     )
 
     block_rate = round(blocked / total * 100, 1) if total else 0
@@ -4313,10 +4327,21 @@ function sparkJS(vals, color, w, h) {{
   const dots = pts.map(p => `<circle cx="${{p.split(',')[0]}}" cy="${{p.split(',')[1]}}" r="2.5" fill="${{color}}" opacity="0.7" style="cursor:pointer" class="spark-dot"/>`).join('');
   return `<svg width="${{w}}" height="${{h}}" viewBox="0 0 ${{w}} ${{h}}" style="overflow:visible;display:block"><defs><linearGradient id="${{gid}}" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="${{color}}" stop-opacity=".22"/><stop offset="100%" stop-color="${{color}}" stop-opacity="0"/></linearGradient></defs><path d="${{area}}" fill="url(#${{gid}})"/><path d="${{path}}" fill="none" stroke="${{color}}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/><g style="cursor:pointer">${{dots}}${{hover}}</g></svg>`;
 }}
-function chgHTML(pct, lower) {{
-  if (!pct) return `<span class="card-change" style="color:var(--muted)">— vs yesterday</span>`;
-  const good = lower ? pct<0 : pct>0;
-  return `<span class="card-change ${{good?'up':'dn'}}">${{pct>0?'▲':'▼'}} ${{pct>0?'+':''}}${{pct}}% vs yesterday</span>`;
+function chgHTML(val, lower, fmt) {{
+  if (val === 0 || val == null) return `<span class="card-change" style="color:var(--muted)">— vs yesterday</span>`;
+  const good = lower ? val<0 : val>0;
+  const arrow = val>0 ? '▲' : '▼';
+  const sign = val>0 ? '+' : '';
+  let formatted;
+  if (fmt === 'count') {{
+    formatted = sign + Math.round(val).toLocaleString();
+  }} else if (fmt === 'ms') {{
+    formatted = sign + val + ' ms';
+  }} else {{
+    const display = Math.abs(val) >= 100 ? Math.round(val) : val;
+    formatted = sign + display + '%';
+  }}
+  return `<span class="card-change ${{good?'up':'dn'}}">${{arrow}} ${{formatted}} vs yesterday</span>`;
 }}
 function esc(s) {{
   return String(s||'').replace(/[&<>"']/g,c=>({{
@@ -4332,17 +4357,17 @@ async function refreshDash(force=false) {{
     const tch=d.total_cache_hits||1;
     // Stat cards
     const cards = [
-      {{id:'total',   val:t.total.toLocaleString(),                 pct:ch.total,   lower:false, spark:sp.total,               color:'#3b82f6'}},
-      {{id:'blocked', val:t.blocked.toLocaleString(),               pct:ch.blocked, lower:true,  spark:sp.blocked,             color:'#ef4444'}},
-      {{id:'cache',   val:(d.cache_rate||0)+'%',                    pct:ch.total,   lower:false, spark:sp.cache,               color:'#f59e0b'}},
-      {{id:'avgms',   val:(Math.round(t.avg_ms*10)/10)+' ms',       pct:ch.avg_ms,  lower:true,  spark:sp.avgms,               color:'#a78bfa'}},
+      {{id:'total',   val:t.total.toLocaleString(),                 chval:ch.total_abs,   lower:false, fmt:'count', spark:sp.total,   color:'#3b82f6'}},
+      {{id:'blocked', val:t.blocked.toLocaleString(),               chval:ch.blocked_abs, lower:true,  fmt:'count', spark:sp.blocked, color:'#ef4444'}},
+      {{id:'cache',   val:(d.cache_rate||0)+'%',                    chval:ch.cache,       lower:false, fmt:'pct',   spark:sp.cache,   color:'#f59e0b'}},
+      {{id:'avgms',   val:(Math.round(t.avg_ms*10)/10)+' ms',       chval:ch.avg_ms_abs,  lower:true,  fmt:'ms',    spark:sp.avgms,   color:'#a78bfa'}},
     ];
     for (const c of cards) {{
       const el = document.querySelector(`[data-card="${{c.id}}"]`);
       if (!el) continue;
       el.querySelector('.card-value').textContent = c.val;
       const chEl = el.querySelector('.card-change');
-      if (chEl) chEl.outerHTML = chgHTML(c.pct, c.lower);
+      if (chEl) chEl.outerHTML = chgHTML(c.chval, c.lower, c.fmt);
       const spEl = el.querySelector('.card-sparkline');
       if (spEl) spEl.innerHTML = sparkJS(c.spark, c.color, 160, 40);
     }}
