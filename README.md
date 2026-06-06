@@ -38,6 +38,7 @@ By default, the application listens on DNS port `53` for UDP/TCP and serves the 
 - Audit log for administrative actions
 - Start scripts for Windows and Linux/macOS
 - CLI commands for status, backup, restore, blocklist updates, and domain testing
+- Interactive console command completion with Tab
 - DNSSEC self-validation with local root trust anchor (SERVFAIL on bogus, AD flag set on valid)
 - Automatic missing dependency detection and installation at startup
 - Benchmark script for generated filter-engine rule sets
@@ -255,6 +256,9 @@ While the server is running, the console accepts:
 
 ```txt
 status
+domain test example.com [client-ip] [qtype]
+test domain example.com [client-ip] [qtype]
+dnssec test
 restart
 stop
 cache clear
@@ -262,6 +266,10 @@ update blocklist
 dedupe blocklists
 help
 ```
+
+`domain test` uses the same decision pipeline as the web Domain Test page. The client IP defaults to `127.0.0.1` and the query type defaults to `A`.
+
+Press `Tab` in the interactive console to cycle through matching commands.
 
 ## Backup and Data
 
