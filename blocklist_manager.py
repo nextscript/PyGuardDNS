@@ -4,6 +4,8 @@ import hashlib
 import io
 import json
 import re
+import socket
+import ssl
 import threading
 import time
 import zipfile
@@ -18,6 +20,13 @@ try:
     import idna
 except ImportError:
     idna = None
+
+_dns_resolver = None
+
+
+def set_dns_resolver(fn):
+    global _dns_resolver
+    _dns_resolver = fn
 
 
 def normalize_domain(domain: str) -> str:
@@ -343,6 +352,70 @@ def fetch_url_text(url: str, max_bytes: int = 100_000_000, etag: str = "", last_
         if exc.code == 304:
             return {"status": 304, "text": "", "etag": etag, "last_modified": last_modified, "sha256": ""}
         raise
+    except OSError as original_error:
+        if _dns_resolver is None:
+            raise original_error
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise original_error
+        ips = _dns_resolver(parsed.hostname)
+        if not ips:
+            raise original_error
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path = (parsed.path or "/") + (("?" + parsed.query) if parsed.query else "")
+        extra_headers = ""
+        if etag:
+            extra_headers += f"If-None-Match: {etag}\r\n"
+        if last_modified:
+            extra_headers += f"If-Modified-Since: {last_modified}\r\n"
+        last_err = original_error
+        for ip in ips[:4]:
+            try:
+                raw = socket.create_connection((ip, port), timeout=min(10, timeout))
+                with raw:
+                    raw.settimeout(timeout)
+                    conn = raw
+                    if parsed.scheme == "https":
+                        context = ssl.create_default_context()
+                        conn = context.wrap_socket(raw, server_hostname=parsed.hostname)
+                        conn.settimeout(timeout)
+                    with conn:
+                        req = (
+                            f"GET {path} HTTP/1.1\r\n"
+                            f"Host: {parsed.hostname}\r\n"
+                            f"User-Agent: Mozilla/5.0 (compatible; PyGuardDNS/1.0)\r\n"
+                            f"Accept: text/plain,*/*\r\n"
+                            + extra_headers
+                            + "Connection: close\r\n\r\n"
+                        ).encode("ascii", errors="replace")
+                        conn.sendall(req)
+                        data = b""
+                        deadline2 = time.monotonic() + timeout
+                        while len(data) < max_bytes + 8192:
+                            if time.monotonic() > deadline2:
+                                raise TimeoutError(f"Blocklist download timed out after {timeout:g}s")
+                            chunk = conn.recv(65536)
+                            if not chunk:
+                                break
+                            data += chunk
+                header_part, _, body = data.partition(b"\r\n\r\n")
+                status_line = header_part.splitlines()[0].decode("latin1", errors="ignore") if header_part else ""
+                if " 304 " in status_line:
+                    return {"status": 304, "text": "", "etag": etag, "last_modified": last_modified, "sha256": ""}
+                if not any(f" {c} " in status_line for c in ("200", "301", "302")):
+                    raise OSError(status_line or "HTTP download failed")
+                body = body[:max_bytes]
+                return {
+                    "status": 200,
+                    "text": decode_blocklist_content(body, url, max_bytes),
+                    "etag": "",
+                    "last_modified": "",
+                    "sha256": hashlib.sha256(body).hexdigest(),
+                }
+            except OSError as exc:
+                last_err = exc
+                continue
+        raise last_err
 
 
 def import_report(entries, total_lines: int = 0, invalid_rules: int = 0) -> dict:

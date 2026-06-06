@@ -32,7 +32,7 @@ from urllib.request import urlopen
 import bcrypt
 
 from dns_engine import FilterEngine, FilterResult
-from blocklist_manager import BlocklistManager, fetch_url_text as fetch_blocklist_url_text, parse_filter_list
+from blocklist_manager import BlocklistManager, fetch_url_text as fetch_blocklist_url_text, parse_filter_list, set_dns_resolver as _set_blocklist_dns_resolver
 from client_manager import ClientManager, SERVICE_DOMAINS, SAFESEARCH_REWRITES, YOUTUBE_SAFESEARCH_REWRITES, SAFESEARCH_PROFILE_COLUMNS
 try:
     from dnssec_validator import DNSSECValidator, DNSSECValidationStatus, ensure_root_trust_anchor, get_dnssec_metrics
@@ -83,6 +83,19 @@ APP_NAME = "PyGuardDNS"
 DB_PATH = os.environ.get("LOCALDNSGUARD_DB", "localdnsguard.sqlite3")
 DB_IN_MEMORY = os.environ.get("LOCALDNSGUARD_DB_IN_MEMORY", "1") == "1"
 DB_MEMORY_SYNC_INTERVAL = float(os.environ.get("LOCALDNSGUARD_DB_MEMORY_SYNC_INTERVAL", "60"))
+
+
+def _get_ram_db_path():
+    if not DB_IN_MEMORY:
+        return None
+    if sys.platform != "linux":
+        return None
+    if not os.path.isdir("/dev/shm"):
+        return None
+    return os.path.join("/dev/shm", os.path.basename(DB_PATH))
+
+
+RAM_DB_PATH = _get_ram_db_path()
 WEB_HOST = os.environ.get("LOCALDNSGUARD_WEB_HOST", "0.0.0.0")
 WEB_PORT = int(os.environ.get("LOCALDNSGUARD_WEB_PORT", "8080"))
 DNS_HOST = os.environ.get("LOCALDNSGUARD_DNS_HOST", "0.0.0.0")
@@ -407,18 +420,30 @@ def now_iso():
 
 
 def connect_db():
-    conn = sqlite3.connect(":memory:" if DB_IN_MEMORY else DB_PATH, check_same_thread=False, factory=PyGuardConnection)
-    conn.row_factory = sqlite3.Row
-    if DB_IN_MEMORY and os.path.exists(DB_PATH):
-        source = sqlite3.connect(DB_PATH)
-        try:
-            source.backup(conn)
-        finally:
-            source.close()
-    if not DB_IN_MEMORY:
+    if RAM_DB_PATH:
+        conn = sqlite3.connect(RAM_DB_PATH, check_same_thread=False, factory=PyGuardConnection)
+        conn.row_factory = sqlite3.Row
+        if os.path.exists(DB_PATH):
+            source = sqlite3.connect(DB_PATH)
+            try:
+                source.backup(conn)
+            finally:
+                source.close()
         conn.execute("PRAGMA journal_mode=WAL")
-    else:
+    elif DB_IN_MEMORY:
+        conn = sqlite3.connect(":memory:", check_same_thread=False, factory=PyGuardConnection)
+        conn.row_factory = sqlite3.Row
+        if os.path.exists(DB_PATH):
+            source = sqlite3.connect(DB_PATH)
+            try:
+                source.backup(conn)
+            finally:
+                source.close()
         conn.execute("PRAGMA journal_mode=MEMORY")
+    else:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False, factory=PyGuardConnection)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -444,7 +469,14 @@ def sync_memory_db_to_disk(force=False):
             return
         with memory_db_generation_lock:
             snapshot_generation = memory_db_generation
-        if hasattr(db, "serialize"):
+        if RAM_DB_PATH:
+            dest = sqlite3.connect(temp_path)
+            try:
+                db.backup(dest)
+                dest.commit()
+            finally:
+                dest.close()
+        elif hasattr(db, "serialize"):
             snapshot = db.serialize()
         else:
             dest = sqlite3.connect(temp_path)
@@ -667,6 +699,7 @@ def init_db():
         if blocklist_manager is None:
             blocklist_manager = BlocklistManager(db, reload_callback=reload_filter_engine)
             blocklist_manager.init_schema()
+            _set_blocklist_dns_resolver(resolve_via_configured_dns)
         global client_manager
         if client_manager is None:
             client_manager = ClientManager(db, reload_callback=reload_filter_engine)
@@ -845,7 +878,8 @@ def discover_system_dns_servers():
 
 
 def get_setting(key, default=""):
-    row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    with db_lock:
+        row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     return row["value"] if row else default
 
 
@@ -2959,7 +2993,10 @@ def forward_query(request):
 
 def _query_one_upstream(upstream, request, update_metrics=True, timeout_override=None):
     start = time.perf_counter()
-    configured_timeout = parse_positive_float(get_setting("upstream_timeout", "2.5"), 2.5, "Upstream timeout")
+    try:
+        configured_timeout = parse_positive_float(get_setting("upstream_timeout", "2.5"), 2.5, "Upstream timeout")
+    except ValueError:
+        configured_timeout = 2.5
     timeout = timeout_override or configured_timeout
     if upstream.get("resolver_type") == "doh":
         response = query_doh_upstream(upstream, request, timeout=timeout)
@@ -8912,7 +8949,8 @@ def main():
         log.flush()
         start_memory_db_sync()
         if DB_IN_MEMORY:
-            log.write(f"{now_iso()} database running in RAM with {DB_MEMORY_SYNC_INTERVAL:g}s disk sync\n")
+            ram_location = RAM_DB_PATH if RAM_DB_PATH else ":memory:"
+            log.write(f"{now_iso()} database running in RAM ({ram_location}) with {DB_MEMORY_SYNC_INTERVAL:g}s disk sync\n")
             log.flush()
         dnssec_ok, dnssec_state = process_dnssec_trust_anchor_startup()
         log.write(f"{now_iso()} dnssec trust-anchor startup {'ready' if dnssec_ok else 'failed'} {dnssec_state}\n")
