@@ -34,6 +34,7 @@ By default, the application listens on DNS port `53` for UDP/TCP and serves the 
 - API tokens for external automation
 - JSON API and Prometheus-compatible metrics at `/metrics`
 - Backup and restore for settings, rules, upstreams, profiles, clients, and blocklists
+- SQLite RAM mode loads the database into memory for runtime reads/writes and syncs it back to disk
 - Audit log for administrative actions
 - Start scripts for Windows and Linux/macOS
 - CLI commands for status, backup, restore, blocklist updates, and domain testing
@@ -97,6 +98,8 @@ Important runtime values can be configured through environment variables:
 | Variable | Default | Description |
 | --- | --- | --- |
 | `LOCALDNSGUARD_DB` | `localdnsguard.sqlite3` | Path to the SQLite database |
+| `LOCALDNSGUARD_DB_IN_MEMORY` | `1` | Load SQLite into RAM at startup and sync changes back to disk |
+| `LOCALDNSGUARD_DB_MEMORY_SYNC_INTERVAL` | `5` | Seconds between RAM database syncs to disk |
 | `LOCALDNSGUARD_WEB_HOST` | `0.0.0.0` | Host/IP for the web interface |
 | `LOCALDNSGUARD_WEB_PORT` | `8080` | Port for the web interface |
 | `LOCALDNSGUARD_DNS_HOST` | `0.0.0.0` | Host/IP for DNS UDP/TCP |
@@ -264,6 +267,16 @@ The application stores its data in this file by default:
 localdnsguard.sqlite3
 ```
 
+By default, PyGuardDNS loads this SQLite file into an in-memory database at startup. Runtime reads and writes use the RAM database, and changes are synchronized back to `localdnsguard.sqlite3` every `5` seconds and again during normal shutdown. This improves database responsiveness while keeping the on-disk file as the persistent copy.
+
+To force direct on-disk SQLite access instead, set:
+
+```sh
+LOCALDNSGUARD_DB_IN_MEMORY=0
+```
+
+The sync interval can be changed with `LOCALDNSGUARD_DB_MEMORY_SYNC_INTERVAL`. A hard power loss or process crash can lose changes made since the last sync.
+
 Backups can be exported and restored through the web interface or CLI. Backups include settings, rules, DNS rewrites, upstreams, profiles, clients, profile rules, profile blocklist mappings, and blocklist metadata. Query logs are not part of the normal backup.
 
 ## Development and Tests
@@ -321,7 +334,5 @@ requirements.txt          Runtime Python dependencies
 requirements-dev.txt      Test/development Python dependencies
 start-pyguarddns.bat      Windows start script
 start-pyguarddns.sh       Linux/macOS start script
-tests/                    Pytest test suite
-```
 tests/                    Pytest test suite
 ```
