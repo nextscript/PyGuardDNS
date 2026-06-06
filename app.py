@@ -126,6 +126,7 @@ doh_connection_cache = {}
 dnscrypt_cert_cache = {}
 rules_cache = None
 rules_cache_rebuild_running = False
+shutdown_signal_received = False
 dns_concurrency = threading.BoundedSemaphore(int(os.environ.get("LOCALDNSGUARD_MAX_DNS_WORKERS", "48")))
 upstream_concurrency = threading.BoundedSemaphore(int(os.environ.get("LOCALDNSGUARD_MAX_UPSTREAM_WORKERS", "64")))
 db_write_queue = []
@@ -391,8 +392,20 @@ def install_crash_handlers():
         threading.excepthook = thread_hook
 
     def signal_handler(signum, frame):
-        stack = "".join(traceback.format_stack(frame)) if frame else ""
-        write_crash_report(f"signal {signum}", stack)
+        global shutdown_signal_received
+        if shutdown_signal_received:
+            raise SystemExit(128 + int(signum))
+        shutdown_signal_received = True
+        try:
+            name = signal.Signals(signum).name
+        except Exception:
+            name = f"signal {signum}"
+        try:
+            console_event("info", "Shutdown signal received", name)
+            server_shutdown_event.set()
+            shutdown_runtime_servers()
+        except Exception:
+            pass
         raise SystemExit(128 + int(signum))
 
     for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None), getattr(signal, "SIGBREAK", None)):
