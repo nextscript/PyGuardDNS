@@ -99,7 +99,7 @@ Important runtime values can be configured through environment variables:
 | --- | --- | --- |
 | `LOCALDNSGUARD_DB` | `localdnsguard.sqlite3` | Path to the SQLite database |
 | `LOCALDNSGUARD_DB_IN_MEMORY` | `1` | Load SQLite into RAM at startup and sync changes back to disk |
-| `LOCALDNSGUARD_DB_MEMORY_SYNC_INTERVAL` | `5` | Seconds between RAM database syncs to disk |
+| `LOCALDNSGUARD_DB_MEMORY_SYNC_INTERVAL` | `60` | Seconds between RAM database syncs to disk |
 | `LOCALDNSGUARD_WEB_HOST` | `0.0.0.0` | Host/IP for the web interface |
 | `LOCALDNSGUARD_WEB_PORT` | `8080` | Port for the web interface |
 | `LOCALDNSGUARD_DNS_HOST` | `0.0.0.0` | Host/IP for DNS UDP/TCP |
