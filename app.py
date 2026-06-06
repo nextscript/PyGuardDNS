@@ -18,6 +18,7 @@ import sqlite3
 import ssl
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -31,7 +32,7 @@ from urllib.request import urlopen
 import bcrypt
 
 from dns_engine import FilterEngine, FilterResult
-from blocklist_manager import BlocklistManager
+from blocklist_manager import BlocklistManager, fetch_url_text, parse_filter_list
 from client_manager import ClientManager, SERVICE_DOMAINS, SAFESEARCH_REWRITES, YOUTUBE_SAFESEARCH_REWRITES, SAFESEARCH_PROFILE_COLUMNS
 try:
     from dnssec_validator import DNSSECValidator, DNSSECValidationStatus, ensure_root_trust_anchor, get_dnssec_metrics
@@ -61,22 +62,27 @@ class FormData(dict):
 
 
 memory_db_dirty = threading.Event()
+memory_db_generation = 0
+memory_db_generation_lock = threading.Lock()
 memory_db_sync_stop = threading.Event()
 memory_db_sync_started = False
 
 
 class PyGuardConnection(sqlite3.Connection):
     def commit(self):
+        global memory_db_generation
         result = super().commit()
         if DB_IN_MEMORY:
-            memory_db_dirty.set()
+            with memory_db_generation_lock:
+                memory_db_generation += 1
+                memory_db_dirty.set()
         return result
 
 
 APP_NAME = "PyGuardDNS"
 DB_PATH = os.environ.get("LOCALDNSGUARD_DB", "localdnsguard.sqlite3")
 DB_IN_MEMORY = os.environ.get("LOCALDNSGUARD_DB_IN_MEMORY", "1") == "1"
-DB_MEMORY_SYNC_INTERVAL = float(os.environ.get("LOCALDNSGUARD_DB_MEMORY_SYNC_INTERVAL", "5"))
+DB_MEMORY_SYNC_INTERVAL = float(os.environ.get("LOCALDNSGUARD_DB_MEMORY_SYNC_INTERVAL", "60"))
 WEB_HOST = os.environ.get("LOCALDNSGUARD_WEB_HOST", "0.0.0.0")
 WEB_PORT = int(os.environ.get("LOCALDNSGUARD_WEB_PORT", "8080"))
 DNS_HOST = os.environ.get("LOCALDNSGUARD_DNS_HOST", "0.0.0.0")
@@ -396,25 +402,52 @@ db = connect_db()
 def sync_memory_db_to_disk(force=False):
     if not DB_IN_MEMORY:
         return
-    if not force and not memory_db_dirty.is_set():
+    if not memory_db_dirty.is_set():
         return
     temp_path = f"{DB_PATH}.ramtmp"
-    with db_lock:
-        dest = sqlite3.connect(temp_path)
-        try:
-            db.backup(dest)
-            dest.commit()
-        finally:
-            dest.close()
-        os.replace(temp_path, DB_PATH)
-        for suffix in ("-wal", "-shm"):
-            aux_path = f"{DB_PATH}{suffix}"
+    snapshot = None
+    snapshot_generation = 0
+    lock_acquired = db_lock.acquire(blocking=force)
+    if not lock_acquired:
+        return
+    try:
+        if not memory_db_dirty.is_set():
+            return
+        with memory_db_generation_lock:
+            snapshot_generation = memory_db_generation
+        if hasattr(db, "serialize"):
+            snapshot = db.serialize()
+        else:
+            dest = sqlite3.connect(temp_path)
             try:
-                if os.path.exists(aux_path):
-                    os.remove(aux_path)
-            except OSError:
-                pass
-        memory_db_dirty.clear()
+                db.backup(dest)
+                dest.commit()
+            finally:
+                dest.close()
+    finally:
+        db_lock.release()
+    if snapshot is not None:
+        with open(temp_path, "wb") as fh:
+            fh.write(snapshot)
+    try:
+        os.replace(temp_path, DB_PATH)
+    except PermissionError:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
+        raise
+    for suffix in ("-wal", "-shm"):
+        aux_path = f"{DB_PATH}{suffix}"
+        try:
+            if os.path.exists(aux_path):
+                os.remove(aux_path)
+        except OSError:
+            pass
+    with memory_db_generation_lock:
+        if memory_db_generation == snapshot_generation:
+            memory_db_dirty.clear()
 
 
 def memory_db_sync_loop():
@@ -438,7 +471,8 @@ def stop_memory_db_sync():
     if not DB_IN_MEMORY:
         return
     memory_db_sync_stop.set()
-    sync_memory_db_to_disk(force=True)
+    if memory_db_dirty.is_set():
+        sync_memory_db_to_disk(force=True)
 
 
 atexit.register(stop_memory_db_sync)
@@ -4500,55 +4534,243 @@ def rules_page(kind=None):
 </div>""", "Rules")
 
 
+BUILTIN_ADLIST_PRESETS = """
+Blocklists
+
+1Hosts (Lite): https://adguardteam.github.io/HostlistsRegistry/assets/filter_24.txt
+1Hosts (Xtra): https://adguardteam.github.io/HostlistsRegistry/assets/filter_70.txt
+AdGuard DNS filter: https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt
+AdGuard DNS Popup Hosts filter: https://adguardteam.github.io/HostlistsRegistry/assets/filter_59.txt
+AWAvenue Ads Rule: https://adguardteam.github.io/HostlistsRegistry/assets/filter_53.txt
+Dan Pollock's List: https://adguardteam.github.io/HostlistsRegistry/assets/filter_4.txt
+HaGeZi's Normal Blocklist: https://adguardteam.github.io/HostlistsRegistry/assets/filter_34.txt
+HaGeZi's Pro Blocklist: https://adguardteam.github.io/HostlistsRegistry/assets/filter_48.txt
+HaGeZi's Pro++ Blocklist: https://adguardteam.github.io/HostlistsRegistry/assets/filter_51.txt
+HaGeZi's Ultimate Blocklist: https://adguardteam.github.io/HostlistsRegistry/assets/filter_49.txt
+OISD Blocklist Small: https://raw.githubusercontent.com/sjhgvr/oisd/main/domainswild2_small.txt
+OISD Blocklist Big: https://big.oisd.nl
+OISD Blocklist NSFW: https://raw.githubusercontent.com/sjhgvr/oisd/main/domainswild2_nsfw.txt
+Peter Lowe's Blocklist: https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0&mimetype=plaintext
+ShadowWhisperer Tracking List: https://adguardteam.github.io/HostlistsRegistry/assets/filter_69.txt
+Steven Black's List: https://adguardteam.github.io/HostlistsRegistry/assets/filter_33.txt
+Dandelion Sprout's Anti Push Notifications: https://adguardteam.github.io/HostlistsRegistry/assets/filter_39.txt
+Dandelion Sprout's Game Console Adblock List: https://adguardteam.github.io/HostlistsRegistry/assets/filter_6.txt
+HaGeZi's Anti-Piracy Blocklist: https://adguardteam.github.io/HostlistsRegistry/assets/filter_46.txt
+HaGeZi's Apple Tracker Blocklist: https://adguardteam.github.io/HostlistsRegistry/assets/filter_67.txt
+HaGeZi's Gambling Blocklist: https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/gambling.txt
+HaGeZi's OPPO & Realme Tracker Blocklist: https://adguardteam.github.io/HostlistsRegistry/assets/filter_66.txt
+HaGeZi's Samsung Tracker Blocklist: https://adguardteam.github.io/HostlistsRegistry/assets/filter_61.txt
+HaGeZi's Vivo Tracker Blocklist: https://adguardteam.github.io/HostlistsRegistry/assets/filter_65.txt
+HaGeZi's Windows/Office Tracker Blocklist: https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/native.winoffice.txt
+HaGeZi's Xiaomi Tracker Blocklist: https://adguardteam.github.io/HostlistsRegistry/assets/filter_60.txt
+HaGeZi's TikTok Fingerprinting DNS Blocklist: https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/native.tiktok.txt
+No Google: https://adguardteam.github.io/HostlistsRegistry/assets/filter_37.txt
+Perflyst and Dandelion Sprout's Smart-TV Blocklist: https://adguardteam.github.io/HostlistsRegistry/assets/filter_7.txt
+ShadowWhisperer's Dating List: https://adguardteam.github.io/HostlistsRegistry/assets/filter_57.txt
+Ukrainian Security Filter: https://adguardteam.github.io/HostlistsRegistry/assets/filter_62.txt
+Phishing URL Blocklist (PhishTank and OpenPhish): https://adguardteam.github.io/HostlistsRegistry/assets/filter_30.txt
+Dandelion Sprout's Anti-Malware List: https://raw.githubusercontent.com/DandelionSprout/adfilt/master/Alternate%20versions%20Anti-Malware%20List/AntiMalwareHosts.txt
+HaGeZi's Badware Hoster Blocklist: https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/hoster.txtv
+HaGeZi's Fake DNS Blocklist: https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/fake.txt
+HaGeZi's DNS Rebind Protection: https://adguardteam.github.io/HostlistsRegistry/assets/filter_71.txt
+HaGeZi's DynDNS Blocklist: https://adguardteam.github.io/HostlistsRegistry/assets/filter_54.txt
+HaGeZi's Encrypted DNS/VPN/TOR/Proxy Bypass: https://adguardteam.github.io/HostlistsRegistry/assets/filter_52.txt
+HaGeZi's The World's Most Abused TLDs: https://adguardteam.github.io/HostlistsRegistry/assets/filter_56.txt
+HaGeZi's Threat Intelligence Feeds: https://adguardteam.github.io/HostlistsRegistry/assets/filter_44.txt
+HaGeZi's URL Shortener Blocklist: https://adguardteam.github.io/HostlistsRegistry/assets/filter_68.txt
+NoCoin Filter List: https://adguardteam.github.io/HostlistsRegistry/assets/filter_8.txt
+Phishing Army: https://phishing.army/download/phishing_army_blocklist.txt
+Phishing Army (extended): https://phishing.army/download/phishing_army_blocklist_extended.txt
+Scam Blocklist by DurableNapkin: https://adguardteam.github.io/HostlistsRegistry/assets/filter_10.txt
+ShadowWhisperer's Malware List: https://adguardteam.github.io/HostlistsRegistry/assets/filter_42.txt
+Stalkerware Indicators List: https://raw.githubusercontent.com/AssoEchap/stalkerware-indicators/master/generated/hosts
+The Big List of Hacked Malware Web Sites: https://adguardteam.github.io/HostlistsRegistry/assets/filter_9.txt
+uBlock filters Badware risks: https://adguardteam.github.io/HostlistsRegistry/assets/filter_50.txt
+Malicious URL Blocklist (URLHaus): https://adguardteam.github.io/HostlistsRegistry/assets/filter_11.txt
+CHN: anti-AD: https://adguardteam.github.io/HostlistsRegistry/assets/filter_21.txt
+CHN: AdRules DNS List: https://adguardteam.github.io/HostlistsRegistry/assets/filter_29.txt
+WaLLy3K: https://v.firebog.net/hosts/static/w3kbl.txt
+KADhosts: https://raw.githubusercontent.com/PolishFiltersTeam/KADhosts/master/KADhosts.txt
+add.Spam: https://raw.githubusercontent.com/FadeMind/hosts.extras/master/add.Spam/hosts
+Matomo Referrer-spam-blacklist: https://raw.githubusercontent.com/matomo-org/referrer-spam-blacklist/master/spammers.txt
+Zero Hosts: https://someonewhocares.org/hosts/zero/hosts
+RooneyMcNibNug SNAFU: https://raw.githubusercontent.com/RooneyMcNibNug/pihole-stuff/master/SNAFU.txt
+AdAway default blocklist: https://adaway.org/hosts.txt
+AdguardDNS: https://v.firebog.net/hosts/AdguardDNS.txt
+Admiral: https://v.firebog.net/hosts/Admiral.txt
+AnudeepND: https://raw.githubusercontent.com/anudeepND/blacklist/master/adservers.txt
+Easylist: https://v.firebog.net/hosts/Easylist.txt
+hostsVN: https://raw.githubusercontent.com/bigdargon/hostsVN/master/hosts
+Easyprivacy: https://v.firebog.net/hosts/Easyprivacy.txt
+Prigent-Ads: https://v.firebog.net/hosts/Prigent-Ads.txt
+add.2o7Net: https://raw.githubusercontent.com/FadeMind/hosts.extras/master/add.2o7Net/hosts
+WindowsSpyBlocker: https://raw.githubusercontent.com/crazy-max/WindowsSpyBlocker/master/data/hosts/spy.txt
+First-party trackers host list: https://hostfiles.frogeye.fr/firstparty-trackers-hosts.txt
+Prigent-Crypto: https://v.firebog.net/hosts/Prigent-Crypto.txt
+add.Risk: https://raw.githubusercontent.com/FadeMind/hosts.extras/master/add.Risk/hosts
+NoTrack Malware Blocklist: https://gitlab.com/quidsup/notrack-blocklists/raw/master/notrack-malware.txt
+Spam404: https://raw.githubusercontent.com/Spam404/lists/master/main-blacklist.txt
+abuse.ch URLhaus Host file: https://urlhaus.abuse.ch/downloads/hostfile/
+CyberHost.uk Malware and Phishing Blocklist: https://lists.cyberhost.uk/malware.txt
+winhelp2002hosts: https://winhelp2002.mvps.org/hosts.txt
+ad-wars: https://raw.githubusercontent.com/jdlingyu/ad-wars/master/hosts
+d3ward: https://raw.githubusercontent.com/d3ward/toolz/master/src/d3host.txt
+RPiList-Malware: https://v.firebog.net/hosts/RPiList-Malware.txt
+Lightswitch05's ads-and-tracking-extended: https://www.github.developerdan.com/hosts/lists/ads-and-tracking-extended.txt
+hblock: https://hblock.molinero.dev/hosts_adblock.txt
+Newly Registered Domains: https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/nrd7.txt
+crypto-nl: https://blocklistproject.github.io/Lists/alt-version/crypto-nl.txt
+drugs-nl: https://blocklistproject.github.io/Lists/alt-version/drugs-nl.txt
+gambling-nl: https://blocklistproject.github.io/Lists/alt-version/gambling-nl.txt
+phishing-nl: https://blocklistproject.github.io/Lists/alt-version/phishing-nl.txt
+ransomware-nl: https://blocklistproject.github.io/Lists/alt-version/ransomware-nl.txt
+scam-nl: https://blocklistproject.github.io/Lists/alt-version/scam-nl.txt
+VeleSila hosts: https://raw.githubusercontent.com/VeleSila/yhosts/master/hosts
+PiHole Youtube-List: https://raw.githubusercontent.com/kboghdady/youTube_ads_4_pi-hole/master/youtubelist.txt
+PiHole Youtube-Crowed-List: https://raw.githubusercontent.com/kboghdady/youTube_ads_4_pi-hole/master/crowed_list.txt
+
+Whitelists
+
+IceFlom adguard-whitelist: https://gitlab.com/IceFlom/adguard-whitelist/-/raw/main/whitelist.txt
+hg1978's AdGuard Home Whitelist: https://raw.githubusercontent.com/hg1978/AdGuard-Home-Whitelist/master/whitelist.txt
+HaGeZi's Allowlist Referral: https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/whitelist-referral.txt
+Ealenn Allow: https://raw.githubusercontent.com/Ealenn/AdGuard-Home-List/gh-pages/AdGuard-Home-List.Allow.txt
+AdGuard Home Whitelist: https://raw.githubusercontent.com/hl2guide/AdGuard-Home-Whitelist/main/whitelist.txt
+kristerkari: https://raw.githubusercontent.com/kristerkari/umatrix-recipes/master/README.md
+"""
+
+
 def load_adlist_presets():
-    adlist_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adlist.txt")
     presets = {"block": [], "allow": []}
     section = None
-    try:
-        with open(adlist_path, "r", encoding="utf-8") as fh:
-            for raw_line in fh:
-                line = raw_line.strip()
-                if not line:
-                    continue
-                lowered = line.lower()
-                if lowered == "blocklists":
-                    section = "block"
-                    continue
-                if lowered == "whitelists":
-                    section = "allow"
-                    continue
-                if section is None:
-                    continue
-                match = re.match(r"^(.+?):\s*(https?://.+)$", line)
-                if not match:
-                    continue
-                name = match.group(1).strip()
-                url = match.group(2).strip()
-                if name and url:
-                    presets[section].append({"name": name, "url": url})
-    except OSError:
-        pass
+    for raw_line in BUILTIN_ADLIST_PRESETS.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        if lowered == "blocklists":
+            section = "block"
+            continue
+        if lowered == "whitelists":
+            section = "allow"
+            continue
+        if section is None:
+            continue
+        match = re.match(r"^(.+?):\s*(https?://.+)$", line)
+        if not match:
+            continue
+        name = match.group(1).strip()
+        url = match.group(2).strip()
+        if name and url:
+            presets[section].append({"name": name, "url": url})
     return presets
+
+
+def preset_exists(item, rows):
+    name = str(item.get("name", "")).strip().lower()
+    url = str(item.get("url", "")).strip().lower()
+    for row in rows:
+        row_name = str(row.get("name", "")).strip().lower()
+        row_url = str(row.get("url", "")).strip().lower()
+        if url and row_url and url == row_url:
+            return True
+        if name and row_name and name == row_name:
+            return True
+    return False
+
+
+def normalized_list_url(url):
+    return str(url or "").strip().rstrip("/").lower()
+
+
+def parsed_blocklist_entry_set(text, list_type):
+    list_type = "allow" if list_type == "allow" else "block"
+    entries = parse_filter_list(text or "", default_action=list_type)
+    if list_type == "allow":
+        entries = [(action, pt, pattern) for action, pt, pattern in entries if action == "allow"]
+    return frozenset(entries)
+
+
+def duplicate_blocklist_by_url(url, list_type):
+    wanted_url = normalized_list_url(url)
+    if not wanted_url or blocklist_manager is None:
+        return None
+    wanted_type = "allow" if list_type == "allow" else "block"
+    for row in blocklist_manager.get_all():
+        row_type = "allow" if row.get("list_type") == "allow" else "block"
+        if row_type == wanted_type and normalized_list_url(row.get("url")) == wanted_url:
+            return row
+    return None
+
+
+def duplicate_blocklist_by_entries(entry_set, list_type):
+    if not entry_set:
+        return None
+    wanted_type = "allow" if list_type == "allow" else "block"
+    existing = {}
+    with db_lock:
+        rows = db.execute(
+            """
+            SELECT bl.id, bl.name, be.action, be.pattern_type, be.pattern
+            FROM blocklists bl
+            JOIN blocklist_entries be ON be.blocklist_id = bl.id
+            WHERE bl.list_type=?
+            ORDER BY bl.id ASC, be.id ASC
+            """,
+            (wanted_type,),
+        ).fetchall()
+    for row in rows:
+        existing.setdefault(row["id"], {"name": row["name"], "entries": set()})
+        existing[row["id"]]["entries"].add((row["action"], row["pattern_type"], row["pattern"]))
+    for data in existing.values():
+        if frozenset(data["entries"]) == entry_set:
+            return data
+    return None
+
+
+def ensure_manual_blocklist_not_duplicate(url, text, list_type):
+    duplicate = duplicate_blocklist_by_url(url, list_type)
+    if duplicate:
+        raise ValueError(f"List URL is already added as {duplicate.get('name', 'existing list')}")
+    entry_set = parsed_blocklist_entry_set(text, list_type)
+    duplicate = duplicate_blocklist_by_entries(entry_set, list_type)
+    if duplicate:
+        raise ValueError(f"List entries already exist as {duplicate.get('name', 'existing list')}")
+    return entry_set
 
 
 def blocklists_page(error="", selected_type="block", success=""):
     global blocklist_manager
     lists = blocklist_manager.get_all() if blocklist_manager else []
     adlist_presets = load_adlist_presets()
+    block_rows = [bl for bl in lists if bl.get("list_type") != "allow"]
+    allow_rows = [bl for bl in lists if bl.get("list_type") == "allow"]
+    selected_type = "allow" if selected_type == "allow" else "block"
+
     preset_block_options = ""
     preset_allow_options = ""
     for idx, item in enumerate(adlist_presets["block"]):
+        exists = preset_exists(item, block_rows)
+        disabled = " disabled" if exists else ""
+        extra_class = " preset-list-option-disabled" if exists else ""
+        suffix = " <span class='text-secondary small'>Added</span>" if exists else ""
         preset_block_options += (
-            f"<label class='preset-list-option'>"
-            f"<input class='form-check-input bl-preset-choice' type='checkbox' name='preset_choice' value='block-{idx}'>"
+            f"<label class='preset-list-option{extra_class}'>"
+            f"<input class='form-check-input bl-preset-choice' type='checkbox' name='preset_choice' value='block-{idx}'{disabled}>"
             f"<span>{html_escape(item['name'])}</span>"
+            f"{suffix}"
             f"</label>"
         )
     for idx, item in enumerate(adlist_presets["allow"]):
+        exists = preset_exists(item, allow_rows)
+        disabled = " disabled" if exists else ""
+        extra_class = " preset-list-option-disabled" if exists else ""
+        suffix = " <span class='text-secondary small'>Added</span>" if exists else ""
         preset_allow_options += (
-            f"<label class='preset-list-option'>"
-            f"<input class='form-check-input bl-preset-choice' type='checkbox' name='preset_choice' value='allow-{idx}'>"
+            f"<label class='preset-list-option{extra_class}'>"
+            f"<input class='form-check-input bl-preset-choice' type='checkbox' name='preset_choice' value='allow-{idx}'{disabled}>"
             f"<span>{html_escape(item['name'])}</span>"
+            f"{suffix}"
             f"</label>"
         )
     if not preset_block_options:
@@ -4570,10 +4792,6 @@ def blocklists_page(error="", selected_type="block", success=""):
             "border-color:rgba(239,68,68,.55);background:#2a1217;color:#fecdd3'>"
             f"<strong>Fail</strong><br>{html_escape(error)}</div>"
         )
-    block_rows = [bl for bl in lists if bl.get("list_type") != "allow"]
-    allow_rows = [bl for bl in lists if bl.get("list_type") == "allow"]
-    selected_type = "allow" if selected_type == "allow" else "block"
-
     bl_edit_modals = ""
 
     def bl_table(rows):
@@ -4683,7 +4901,7 @@ function blPresetTypeChanged() {{
   if (blockPanel) blockPanel.style.display = t === 'block' ? '' : 'none';
   if (allowPanel) allowPanel.style.display = t === 'allow' ? '' : 'none';
   document.querySelectorAll('input[name="preset_choice"]').forEach(function(input) {{
-    if (!input.value.startsWith(t + '-')) input.checked = false;
+    if (!input.value.startsWith(t + '-') || input.disabled) input.checked = false;
   }});
 }}
 function validateBlocklistAdd() {{
@@ -4712,6 +4930,12 @@ setTimeout(function() {{
   cursor:pointer;
 }}
 .preset-list-option:hover {{ background:rgba(148,163,184,.09); }}
+.preset-list-option-disabled {{
+  cursor:not-allowed;
+  opacity:.55;
+}}
+.preset-list-option-disabled:hover {{ background:transparent; }}
+.preset-list-option > span:first-of-type {{ flex:1; }}
 .preset-list-scroll {{
   display:grid;
   gap:.4rem;
@@ -6488,14 +6712,40 @@ class WebHandler(BaseHTTPRequestHandler):
                         if preset_index < 0 or preset_index >= len(preset_items):
                             raise ValueError("Select valid lists")
                         selected_presets.append(preset_items[preset_index])
+                    existing_rows = blocklist_manager.get_all() if blocklist_manager else []
+                    existing_rows = [
+                        row for row in existing_rows
+                        if ("allow" if row.get("list_type") == "allow" else "block") == list_type
+                    ]
+                    selected_presets = [
+                        preset for preset in selected_presets
+                        if not preset_exists(preset, existing_rows)
+                    ]
+                    if not selected_presets:
+                        raise ValueError("Selected lists are already added")
                     for preset in selected_presets:
                         blocklist_manager.add_from_url(preset["name"], preset["url"], list_type)
                     added_count = len(selected_presets)
                 else:
                     if url:
-                        blocklist_manager.add_from_url(name, url, list_type)
+                        duplicate = duplicate_blocklist_by_url(url, list_type)
+                        if duplicate:
+                            raise ValueError(f"List URL is already added as {duplicate.get('name', 'existing list')}")
+                        fetched = fetch_url_text(url)
+                        ensure_manual_blocklist_not_duplicate("", fetched["text"], list_type)
+                        blocklist_manager.add_from_text(
+                            name,
+                            fetched["text"],
+                            list_type,
+                            source=url,
+                            sha256=fetched.get("sha256", ""),
+                            etag=fetched.get("etag", ""),
+                            last_modified=fetched.get("last_modified", ""),
+                            replace_by_name=False,
+                        )
                     elif content.strip():
-                        blocklist_manager.add_from_text(name, content, list_type)
+                        ensure_manual_blocklist_not_duplicate("", content, list_type)
+                        blocklist_manager.add_from_text(name, content, list_type, replace_by_name=False)
                     else:
                         raise ValueError("Provide URL or paste content")
                 success_msg = "List added successfully" if added_count == 1 else f"{added_count} lists added successfully"

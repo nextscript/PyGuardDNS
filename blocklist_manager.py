@@ -429,7 +429,7 @@ class BlocklistManager:
         fetched = fetch_url_text(url)
         return self.add_from_text(name, fetched["text"], list_type, source=url, sha256=fetched.get("sha256", ""), etag=fetched.get("etag", ""), last_modified=fetched.get("last_modified", ""))
 
-    def add_from_text(self, name: str, text: str, list_type: str = "block", source: str = "", sha256: str = "", etag: str = "", last_modified: str = "") -> int:
+    def add_from_text(self, name: str, text: str, list_type: str = "block", source: str = "", sha256: str = "", etag: str = "", last_modified: str = "", replace_by_name: bool = True) -> int:
         list_type = "allow" if list_type == "allow" else "block"
         entries = parse_filter_list(text, default_action=list_type)
         if list_type == "allow":
@@ -439,7 +439,8 @@ class BlocklistManager:
         report = import_report(entries, total_lines=len(text.splitlines()))
         created = now_iso()
         with self._update_lock:
-            self._delete_by_name(name)
+            if replace_by_name:
+                self._delete_by_name(name)
             curs = self.db.execute(
                 """INSERT INTO blocklists(name,url,list_type,rule_count,last_update,last_successful_update,last_rule_count,
                    last_unique_rule_count,last_sha256,etag,last_modified,duplicate_rule_count,import_report,created_at)
