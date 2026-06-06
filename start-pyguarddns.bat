@@ -96,7 +96,7 @@ if "%INSTALL_DEV_DEPS%"=="1" (
 
 echo All required Python runtime packages are installed.
 echo.
-echo Server console is active. Commands: restart, stop, status, dnssec test, cache clear, update blocklist
+echo Server console is active. Commands: restart, stop, status, dnssec test, cache clear, update blocklist, dedupe blocklists
 echo.
 "%PYTHON_EXE%" .\app.py 2>>server.err.log
 

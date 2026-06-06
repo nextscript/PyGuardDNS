@@ -3573,6 +3573,10 @@ def template(content, title="Dashboard"):
     tr:hover td{{background:rgba(26,39,64,.32)}}
     .table-responsive{{max-width:100%;overflow-x:auto;overflow-y:hidden;-webkit-overflow-scrolling:touch}}
     .table-responsive>.table,.table-responsive>table{{min-width:720px}}
+    .domain-test-list{{display:grid;gap:0;border-top:1px solid rgba(30,45,61,.5)}}
+    .domain-test-row{{display:grid;grid-template-columns:180px 1fr;gap:1rem;padding:.58rem 0;border-bottom:1px solid rgba(30,45,61,.5)}}
+    .domain-test-label{{color:var(--muted);font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.05em}}
+    .domain-test-value{{overflow-wrap:anywhere;word-break:break-word}}
     .td-num{{text-align:right;font-variant-numeric:tabular-nums}}
     .td-domain{{font-weight:500;overflow-wrap:anywhere;word-break:break-word}}
     .td-muted{{color:var(--muted2)}}
@@ -3693,11 +3697,8 @@ def template(content, title="Dashboard"):
       .mobile-card-table td[colspan]::before{{display:none}}
       .mobile-card-table .td-num{{text-align:left}}
       .mobile-card-table td.d-flex{{display:flex;width:100%;justify-content:flex-start;flex-wrap:wrap}}
-      .domain-test-table{{min-width:0!important}}
-      .domain-test-table tr{{display:block;border-bottom:1px solid rgba(30,45,61,.7);padding:.62rem 0}}
-      .domain-test-table tr:last-child{{border-bottom:0}}
-      .domain-test-table th,.domain-test-table td{{display:block;width:100%!important;border:0!important;padding:.1rem 0!important;white-space:normal;overflow-wrap:anywhere;word-break:break-word}}
-      .domain-test-table th{{color:var(--muted);font-size:.66rem;text-transform:uppercase;letter-spacing:.05em}}
+      .domain-test-row{{grid-template-columns:1fr;gap:.18rem;padding:.62rem 0}}
+      .domain-test-label{{font-size:.66rem}}
       }}
     @media(max-width:520px){{
       .topbar{{gap:.45rem}}
@@ -3708,7 +3709,6 @@ def template(content, title="Dashboard"):
       .col-6{{flex:0 0 100%}}
       .table-responsive>.table,.table-responsive>table{{min-width:640px}}
       .table-responsive>.mobile-card-table{{min-width:0!important}}
-      .table-responsive>.domain-test-table{{min-width:0!important}}
       .three-col .td-num,.two-col .td-num{{width:70px}}
       .three-col th:last-child,.three-col td:last-child,.two-col th:last-child,.two-col td:last-child{{width:74px}}
       .d-flex.flex-wrap>.form-control,.d-flex.flex-wrap>.form-select,.d-flex.flex-wrap>.btn,.d-flex.flex-wrap>form{{flex:1 1 100%!important;max-width:none!important;width:100%}}
@@ -4826,7 +4826,7 @@ def blocklist_import_worker():
                         notify_reload=False,
                     )
                     if count <= 0:
-                        raise ValueError("List contains no supported rules")
+                        raise ValueError("List contains no new rules")
                 else:
                     url = job.get("url", "")
                     print(f"[blocklist import] starting {job.get('name', '')} from {url}", flush=True)
@@ -4857,7 +4857,7 @@ def blocklist_import_worker():
                         notify_reload=False,
                     )
                     if count <= 0:
-                        raise ValueError("Downloaded list contains no supported rules")
+                        raise ValueError("Downloaded list contains no new rules")
                 should_reload = True
                 with blocklist_import_lock:
                     blocklist_import_status["done"] += 1
@@ -4974,6 +4974,56 @@ def blocklist_delete_worker():
 def current_blocklist_delete_status():
     with blocklist_delete_lock:
         return dict(blocklist_delete_status)
+
+
+def dedupe_existing_blocklist_entries():
+    removed_by_list = {}
+    kept_keys = set()
+    with db_lock:
+        rows_to_delete = []
+        rows = db.execute(
+            """
+            SELECT be.id, be.blocklist_id, bl.name, bl.list_type, be.action, be.pattern_type, be.pattern
+            FROM blocklist_entries be
+            JOIN blocklists bl ON bl.id = be.blocklist_id
+            ORDER BY be.id ASC
+            """
+        ).fetchall()
+        for row in rows:
+            list_type = "allow" if row["list_type"] == "allow" else "block"
+            key = (list_type, row["action"], row["pattern_type"], row["pattern"])
+            if key in kept_keys:
+                rows_to_delete.append(row["id"])
+                info = removed_by_list.setdefault(
+                    row["blocklist_id"],
+                    {"name": row["name"], "removed": 0},
+                )
+                info["removed"] += 1
+            else:
+                kept_keys.add(key)
+        for entry_id in rows_to_delete:
+            db.execute("DELETE FROM blocklist_entries WHERE id=?", (entry_id,))
+        db.execute(
+            """
+            UPDATE blocklists
+            SET rule_count = (
+                SELECT COUNT(*) FROM blocklist_entries
+                WHERE blocklist_entries.blocklist_id = blocklists.id
+            ),
+            last_rule_count = (
+                SELECT COUNT(*) FROM blocklist_entries
+                WHERE blocklist_entries.blocklist_id = blocklists.id
+            )
+            """
+        )
+        db.commit()
+    removed_total = len(rows_to_delete)
+    if removed_total:
+        reload_filter_engine()
+    return {
+        "removed": removed_total,
+        "lists": sorted(removed_by_list.values(), key=lambda item: item["name"].lower()),
+    }
 
 
 def queued_blocklist_delete_ids():
@@ -6292,14 +6342,14 @@ def domain_test_result_html(result):
         step_rows = ""
         for item in steps:
             detail = ", ".join(f"{html_escape(str(k))}: {html_escape(str(v))}" for k, v in item.items() if k != "step")
-            step_rows += f"<tr><td>{html_escape(str(item.get('step', '')))}</td><td>{detail or '-'}</td></tr>"
+            step_rows += (
+                "<div class='domain-test-row'>"
+                f"<div class='domain-test-label'>{html_escape(str(item.get('step', '')))}</div>"
+                f"<div class='domain-test-value'>{detail or '-'}</div>"
+                "</div>"
+            )
         steps_html = f"""
-  <div class="table-responsive mt-3">
-    <table class="table table-dark table-striped align-middle mb-0 domain-test-table">
-      <thead><tr><th>Step</th><th>Result</th></tr></thead>
-      <tbody>{step_rows}</tbody>
-    </table>
-  </div>"""
+  <div class="domain-test-list">{step_rows}</div>"""
 
     action = str(result.get("action", "") or "").upper()
     badge_cls = {
@@ -6327,17 +6377,18 @@ def domain_test_result_html(result):
         if value is None or value == "":
             value = "-"
         value_html = str(value) if raw else html_escape(str(value))
-        rows_html += f"<tr><th scope='row' style='width:180px'>{html_escape(label)}</th><td>{value_html}</td></tr>"
+        rows_html += (
+            "<div class='domain-test-row'>"
+            f"<div class='domain-test-label'>{html_escape(label)}</div>"
+            f"<div class='domain-test-value'>{value_html}</div>"
+            "</div>"
+        )
 
     return f"""
 <div class="panel rounded-2 border border-secondary-subtle p-3">
   <div class="panel-head px-0 pt-0"><span class="panel-title">Test Result</span></div>
-  <div class="table-responsive">
-    <table class="table table-dark table-striped align-middle mb-0 domain-test-table">
-      <tbody>{rows_html}</tbody>
-    </table>
-  </div>
-</div>{steps_html}"""
+  <div class="domain-test-list">{rows_html}</div>
+</div>"""
 
 
 def domain_test_page(result=None):
@@ -8716,7 +8767,7 @@ def run_console_command(command):
     if not cmd:
         return True
     if cmd in {"help", "?"}:
-        print("Commands: restart, stop, status, dnssec test, cache clear, update blocklist, help", flush=True)
+        print("Commands: restart, stop, status, dnssec test, cache clear, update blocklist, dedupe blocklists, help", flush=True)
         return True
     if cmd == "status":
         print_console_status()
@@ -8754,6 +8805,21 @@ def run_console_command(command):
                     print(f"[{idx}/{total}] {name}: ERROR - {exc}", flush=True)
             print("All Blocklist Updated", flush=True)
         return True
+    if cmd in {"dedupe blocklists", "dedupe blocklist", "dedupe lists", "blocklist dedupe", "duplicate blocklists", "doppelte blocklists"}:
+        print("Checking existing blocklist entries for duplicates...", flush=True)
+        try:
+            result = dedupe_existing_blocklist_entries()
+            removed = result["removed"]
+            if removed == 0:
+                print("No duplicate blocklist entries found.", flush=True)
+            else:
+                print(f"Removed {removed} duplicate blocklist entries.", flush=True)
+                for item in result["lists"]:
+                    print(f"  {item['name']}: removed {item['removed']}", flush=True)
+                print("Filter engine reloaded.", flush=True)
+        except Exception as exc:
+            print(f"Blocklist dedupe failed: {exc}", flush=True)
+        return True
     if cmd == "restart":
         print("Restarting runtime servers...", flush=True)
         try:
@@ -8777,7 +8843,7 @@ def run_console_command(command):
 
 
 def console_loop():
-    print("Console commands: restart, stop, status, dnssec test, cache clear, update blocklist, help", flush=True)
+    print("Console commands: restart, stop, status, dnssec test, cache clear, update blocklist, dedupe blocklists, help", flush=True)
     while not server_shutdown_event.is_set():
         try:
             command = input("pyguarddns> ")

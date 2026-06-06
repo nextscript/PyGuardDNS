@@ -445,7 +445,7 @@ class BlocklistManager:
         fetched = fetch_url_text(url)
         return self.add_from_text(name, fetched["text"], list_type, source=url, sha256=fetched.get("sha256", ""), etag=fetched.get("etag", ""), last_modified=fetched.get("last_modified", ""), notify_reload=notify_reload)
 
-    def add_from_text(self, name: str, text: str, list_type: str = "block", source: str = "", sha256: str = "", etag: str = "", last_modified: str = "", replace_by_name: bool = True, notify_reload: bool = True) -> int:
+    def add_from_text(self, name: str, text: str, list_type: str = "block", source: str = "", sha256: str = "", etag: str = "", last_modified: str = "", replace_by_name: bool = True, notify_reload: bool = True, skip_existing_entries: bool = True) -> int:
         list_type = "allow" if list_type == "allow" else "block"
         entries = parse_filter_list(text, default_action=list_type)
         if list_type == "allow":
@@ -453,6 +453,33 @@ class BlocklistManager:
         if not entries:
             return 0
         report = import_report(entries, total_lines=len(text.splitlines()))
+        seen_entries = set()
+        unique_entries = []
+        for entry in entries:
+            if entry in seen_entries:
+                continue
+            seen_entries.add(entry)
+            unique_entries.append(entry)
+        if skip_existing_entries:
+            existing_entries = {
+                (row["action"], row["pattern_type"], row["pattern"])
+                for row in self.db.execute(
+                    """
+                    SELECT be.action, be.pattern_type, be.pattern
+                    FROM blocklist_entries be
+                    JOIN blocklists bl ON bl.id = be.blocklist_id
+                    WHERE bl.list_type=?
+                    """,
+                    (list_type,),
+                ).fetchall()
+            }
+            before_existing_filter = len(unique_entries)
+            unique_entries = [entry for entry in unique_entries if entry not in existing_entries]
+            report["existing_rule_duplicates"] = before_existing_filter - len(unique_entries)
+        else:
+            report["existing_rule_duplicates"] = 0
+        if not unique_entries:
+            return 0
         created = now_iso()
         with self._update_lock:
             if replace_by_name:
@@ -461,17 +488,17 @@ class BlocklistManager:
                 """INSERT INTO blocklists(name,url,list_type,rule_count,last_update,last_successful_update,last_rule_count,
                    last_unique_rule_count,last_sha256,etag,last_modified,duplicate_rule_count,import_report,created_at)
                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (name, source, list_type, len(entries), created, created, len(entries), report["unique_rules"], sha256, etag, last_modified, report["duplicate_rules"], json.dumps(report), created),
+                (name, source, list_type, len(unique_entries), created, created, len(unique_entries), report["unique_rules"], sha256, etag, last_modified, report["duplicate_rules"] + report["existing_rule_duplicates"], json.dumps(report), created),
             )
             bl_id = curs.lastrowid
             self.db.executemany(
                 "INSERT INTO blocklist_entries(blocklist_id,action,pattern_type,pattern,created_at) VALUES(?,?,?,?,?)",
-                [(bl_id, action, pt, pattern, created) for action, pt, pattern in entries],
+                [(bl_id, action, pt, pattern, created) for action, pt, pattern in unique_entries],
             )
             self.db.commit()
         if notify_reload:
             self._notify_reload()
-        return len(entries)
+        return len(unique_entries)
 
     def update(self, list_id: int, background: bool = True) -> dict:
         item = self._get(list_id)
