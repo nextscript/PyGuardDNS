@@ -28,7 +28,7 @@ By default, the application listens on DNS port `53` for UDP/TCP and serves the 
 - Block response modes: zero IP, custom IP, NXDOMAIN, REFUSED, and NODATA
 - DNS cache with configurable TTL and cache size
 - Upstream resolver management with health checks, latency measurement, automatic pause on failures, and manual testing
-- Support for multiple upstream resolver types, including classic DNS, DNS-over-TLS, and DNS-over-HTTPS
+- Support for multiple upstream resolver types, including classic DNS, DNS-over-TLS, DNS-over-HTTPS, and DNSCrypt stamps
 - Optional encrypted DNS server for DNS-over-TLS and DNS-over-QUIC on port `853`
 - Admin login with password, sessions, CSRF protection, and login rate limiting
 - API tokens for external automation
@@ -200,6 +200,8 @@ Clients can be assigned to a profile by IP address or CIDR range. A profile can 
 
 PyGuardDNS creates a Cloudflare DNS-over-TLS upstream by default. Additional upstreams can be added, detected, tested, enabled, or paused in the web interface. Health checks track latency, success rate, errors, and pause state.
 
+Supported upstream formats include plain DNS over UDP/TCP, DNS-over-TLS, DNS-over-HTTPS URLs and stamps, and DNSCrypt `sdns://` stamps. DNSCrypt certificate fetching tries UDP first and falls back to TCP when the certificate response is truncated or unusable. DNSCrypt certificates using `X25519-XSalsa20Poly1305` (`es_version=1`) and `X25519-XChaCha20Poly1305` (`es_version=2`) are supported.
+
 ## API and Metrics
 
 The web interface uses the same JSON API that can also be used for automation. External clients authenticate with an API token through:
@@ -348,3 +350,4 @@ start-pyguarddns.bat      Windows start script
 start-pyguarddns.sh       Linux/macOS start script
 tests/                    Pytest test suite
 ```
+
