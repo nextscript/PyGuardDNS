@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import base64
 import csv
+import atexit
 import faulthandler
 import hashlib
 import io
@@ -59,8 +60,23 @@ class FormData(dict):
         return list(self._all.get(key, []))
 
 
+memory_db_dirty = threading.Event()
+memory_db_sync_stop = threading.Event()
+memory_db_sync_started = False
+
+
+class PyGuardConnection(sqlite3.Connection):
+    def commit(self):
+        result = super().commit()
+        if DB_IN_MEMORY:
+            memory_db_dirty.set()
+        return result
+
+
 APP_NAME = "PyGuardDNS"
 DB_PATH = os.environ.get("LOCALDNSGUARD_DB", "localdnsguard.sqlite3")
+DB_IN_MEMORY = os.environ.get("LOCALDNSGUARD_DB_IN_MEMORY", "1") == "1"
+DB_MEMORY_SYNC_INTERVAL = float(os.environ.get("LOCALDNSGUARD_DB_MEMORY_SYNC_INTERVAL", "5"))
 WEB_HOST = os.environ.get("LOCALDNSGUARD_WEB_HOST", "0.0.0.0")
 WEB_PORT = int(os.environ.get("LOCALDNSGUARD_WEB_PORT", "8080"))
 DNS_HOST = os.environ.get("LOCALDNSGUARD_DNS_HOST", "0.0.0.0")
@@ -356,9 +372,18 @@ def now_iso():
 
 
 def connect_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(":memory:" if DB_IN_MEMORY else DB_PATH, check_same_thread=False, factory=PyGuardConnection)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    if DB_IN_MEMORY and os.path.exists(DB_PATH):
+        source = sqlite3.connect(DB_PATH)
+        try:
+            source.backup(conn)
+        finally:
+            source.close()
+    if not DB_IN_MEMORY:
+        conn.execute("PRAGMA journal_mode=WAL")
+    else:
+        conn.execute("PRAGMA journal_mode=MEMORY")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -366,6 +391,57 @@ def connect_db():
 
 
 db = connect_db()
+
+
+def sync_memory_db_to_disk(force=False):
+    if not DB_IN_MEMORY:
+        return
+    if not force and not memory_db_dirty.is_set():
+        return
+    temp_path = f"{DB_PATH}.ramtmp"
+    with db_lock:
+        dest = sqlite3.connect(temp_path)
+        try:
+            db.backup(dest)
+            dest.commit()
+        finally:
+            dest.close()
+        os.replace(temp_path, DB_PATH)
+        for suffix in ("-wal", "-shm"):
+            aux_path = f"{DB_PATH}{suffix}"
+            try:
+                if os.path.exists(aux_path):
+                    os.remove(aux_path)
+            except OSError:
+                pass
+        memory_db_dirty.clear()
+
+
+def memory_db_sync_loop():
+    while not memory_db_sync_stop.wait(DB_MEMORY_SYNC_INTERVAL):
+        try:
+            sync_memory_db_to_disk()
+        except Exception:
+            with open("web-error.log", "a", encoding="utf-8") as log:
+                log.write(f"{now_iso()} memory_db_sync_loop\n{traceback.format_exc()}\n")
+
+
+def start_memory_db_sync():
+    global memory_db_sync_started
+    if not DB_IN_MEMORY or memory_db_sync_started:
+        return
+    memory_db_sync_started = True
+    threading.Thread(target=memory_db_sync_loop, name="memory-db-sync", daemon=True).start()
+
+
+def stop_memory_db_sync():
+    if not DB_IN_MEMORY:
+        return
+    memory_db_sync_stop.set()
+    sync_memory_db_to_disk(force=True)
+
+
+atexit.register(stop_memory_db_sync)
 
 
 def init_db():
@@ -8165,6 +8241,10 @@ def main():
         init_db()
         log.write(f"{now_iso()} database ready\n")
         log.flush()
+        start_memory_db_sync()
+        if DB_IN_MEMORY:
+            log.write(f"{now_iso()} database running in RAM with {DB_MEMORY_SYNC_INTERVAL:g}s disk sync\n")
+            log.flush()
         dnssec_ok, dnssec_state = process_dnssec_trust_anchor_startup()
         log.write(f"{now_iso()} dnssec trust-anchor startup {'ready' if dnssec_ok else 'failed'} {dnssec_state}\n")
         log.flush()
@@ -8208,6 +8288,7 @@ def main():
         console_loop()
     finally:
         shutdown_runtime_servers()
+        stop_memory_db_sync()
 
 
 def cli_main():
@@ -8229,6 +8310,7 @@ def cli_main():
         return
 
     init_db()
+    start_memory_db_sync()
     start_db_writer()
 
     if cmd == "status":
