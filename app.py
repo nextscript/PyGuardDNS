@@ -49,6 +49,16 @@ except ModuleNotFoundError:
 import logging
 logger = logging.getLogger("dnssec")
 
+
+class FormData(dict):
+    def __init__(self, parsed):
+        super().__init__((key, values[-1]) for key, values in parsed.items())
+        self._all = parsed
+
+    def get_all(self, key):
+        return list(self._all.get(key, []))
+
+
 APP_NAME = "PyGuardDNS"
 DB_PATH = os.environ.get("LOCALDNSGUARD_DB", "localdnsguard.sqlite3")
 WEB_HOST = os.environ.get("LOCALDNSGUARD_WEB_HOST", "0.0.0.0")
@@ -4414,9 +4424,61 @@ def rules_page(kind=None):
 </div>""", "Rules")
 
 
+def load_adlist_presets():
+    adlist_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adlist.txt")
+    presets = {"block": [], "allow": []}
+    section = None
+    try:
+        with open(adlist_path, "r", encoding="utf-8") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                lowered = line.lower()
+                if lowered == "blocklists":
+                    section = "block"
+                    continue
+                if lowered == "whitelists":
+                    section = "allow"
+                    continue
+                if section is None:
+                    continue
+                match = re.match(r"^(.+?):\s*(https?://.+)$", line)
+                if not match:
+                    continue
+                name = match.group(1).strip()
+                url = match.group(2).strip()
+                if name and url:
+                    presets[section].append({"name": name, "url": url})
+    except OSError:
+        pass
+    return presets
+
+
 def blocklists_page(error="", selected_type="block", success=""):
     global blocklist_manager
     lists = blocklist_manager.get_all() if blocklist_manager else []
+    adlist_presets = load_adlist_presets()
+    preset_block_options = ""
+    preset_allow_options = ""
+    for idx, item in enumerate(adlist_presets["block"]):
+        preset_block_options += (
+            f"<label class='preset-list-option'>"
+            f"<input class='form-check-input bl-preset-choice' type='checkbox' name='preset_choice' value='block-{idx}'>"
+            f"<span>{html_escape(item['name'])}</span>"
+            f"</label>"
+        )
+    for idx, item in enumerate(adlist_presets["allow"]):
+        preset_allow_options += (
+            f"<label class='preset-list-option'>"
+            f"<input class='form-check-input bl-preset-choice' type='checkbox' name='preset_choice' value='allow-{idx}'>"
+            f"<span>{html_escape(item['name'])}</span>"
+            f"</label>"
+        )
+    if not preset_block_options:
+        preset_block_options = "<div class='text-secondary small py-2'>No blocklist presets found.</div>"
+    if not preset_allow_options:
+        preset_allow_options = "<div class='text-secondary small py-2'>No allowlist presets found.</div>"
     notification = ""
     if success:
         notification = (
@@ -4514,12 +4576,45 @@ function blSwitch() {{
   document.getElementById('bl-allow').style.display = t === 'allow' ? '' : 'none';
   var addType = document.getElementById('bl-add-type');
   if (addType) addType.value = t;
+  blPresetTypeChanged();
 }}
 function openBlocklistModal() {{
   var addType = document.getElementById('bl-add-type');
   var selected = document.getElementById('bl-type');
   if (addType && selected) addType.value = selected.value;
+  setBlocklistAddMode('from-list');
+  blPresetTypeChanged();
   document.getElementById('bl-modal').classList.add('show');
+}}
+function setBlocklistAddMode(mode) {{
+  var fromList = mode === 'from-list';
+  document.getElementById('bl-add-mode').value = mode;
+  document.getElementById('bl-from-list-panel').style.display = fromList ? '' : 'none';
+  document.getElementById('bl-manual-panel').style.display = fromList ? 'none' : '';
+  document.getElementById('bl-mode-from-list').classList.toggle('active', fromList);
+  document.getElementById('bl-mode-manual').classList.toggle('active', !fromList);
+  document.getElementById('bl-manual-name').disabled = fromList;
+  document.getElementById('bl-manual-url').disabled = fromList;
+  document.getElementById('bl-manual-content').disabled = fromList;
+  document.querySelectorAll('.bl-preset-choice').forEach(function(input) {{
+    input.disabled = !fromList;
+  }});
+}}
+function blPresetTypeChanged() {{
+  var t = document.getElementById('bl-add-type').value;
+  var blockPanel = document.getElementById('bl-preset-block');
+  var allowPanel = document.getElementById('bl-preset-allow');
+  if (blockPanel) blockPanel.style.display = t === 'block' ? '' : 'none';
+  if (allowPanel) allowPanel.style.display = t === 'allow' ? '' : 'none';
+  document.querySelectorAll('input[name="preset_choice"]').forEach(function(input) {{
+    if (!input.value.startsWith(t + '-')) input.checked = false;
+  }});
+}}
+function validateBlocklistAdd() {{
+  if (document.getElementById('bl-add-mode').value !== 'from-list') return true;
+  if (document.querySelector('input[name="preset_choice"]:checked')) return true;
+  alert('Please select a list first.');
+  return false;
 }}
 setTimeout(function() {{
   var n = document.getElementById('bl-notification');
@@ -4530,17 +4625,47 @@ setTimeout(function() {{
   setTimeout(function() {{ n.remove(); }}, 280);
 }}, 3500);
 </script>
+<style>
+.preset-list-option {{
+  display:flex;
+  align-items:center;
+  gap:.6rem;
+  padding:.55rem .65rem;
+  border:1px solid rgba(148,163,184,.24);
+  border-radius:6px;
+  cursor:pointer;
+}}
+.preset-list-option:hover {{ background:rgba(148,163,184,.09); }}
+.preset-list-scroll {{
+  display:grid;
+  gap:.4rem;
+  max-height:min(52vh,520px);
+  overflow:auto;
+  padding-right:.25rem;
+}}
+</style>
 <div id="bl-modal" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('show')">
   <div class="modal-box">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
       <h2 class="h5" style="margin:0">Add Blocklist</h2>
       <button class="btn btn-sm btn-outline-light" onclick="document.getElementById('bl-modal').classList.remove('show')" style="border:none;font-size:1.2rem">&times;</button>
     </div>
-    <form method="post" action="/blocklists/add">
-      <label class="form-label">Name</label><input class="form-control mb-2" name="name" placeholder="HaGeZi" required>
-      <label class="form-label">List Type</label><select id="bl-add-type" class="form-select mb-2" name="list_type"><option value="block" {"selected" if selected_type == "block" else ""}>Blocklist</option><option value="allow" {"selected" if selected_type == "allow" else ""}>Allowlist</option></select>
-      <label class="form-label">URL</label><input class="form-control mb-2" name="url" placeholder="https://raw.githubusercontent.com/...">
-      <label class="form-label">Or paste list content</label><textarea class="form-control mb-3" name="content" rows="6" placeholder="0.0.0.0 ads.example.com&#10;||tracker.com^"></textarea>
+    <form method="post" action="/blocklists/add" onsubmit="return validateBlocklistAdd()">
+      <input type="hidden" id="bl-add-mode" name="add_mode" value="from-list">
+      <div class="btn-group w-100 mb-3" role="group">
+        <button id="bl-mode-from-list" type="button" class="btn btn-outline-light active" onclick="setBlocklistAddMode('from-list')">From List</button>
+        <button id="bl-mode-manual" type="button" class="btn btn-outline-light" onclick="setBlocklistAddMode('manual')">Manual</button>
+      </div>
+      <label class="form-label">List Type</label><select id="bl-add-type" class="form-select mb-3" name="list_type" onchange="blPresetTypeChanged()"><option value="block" {"selected" if selected_type == "block" else ""}>Blocklist</option><option value="allow" {"selected" if selected_type == "allow" else ""}>Allowlist</option></select>
+      <div id="bl-from-list-panel">
+        <div id="bl-preset-block" class="preset-list-scroll">{preset_block_options}</div>
+        <div id="bl-preset-allow" class="preset-list-scroll" style="display:none">{preset_allow_options}</div>
+      </div>
+      <div id="bl-manual-panel" style="display:none">
+        <label class="form-label">Name</label><input id="bl-manual-name" class="form-control mb-2" name="name" placeholder="HaGeZi" required disabled>
+        <label class="form-label">URL</label><input id="bl-manual-url" class="form-control mb-2" name="url" placeholder="https://raw.githubusercontent.com/..." disabled>
+        <label class="form-label">Or paste list content</label><textarea id="bl-manual-content" class="form-control mb-3" name="content" rows="6" placeholder="0.0.0.0 ads.example.com&#10;||tracker.com^" disabled></textarea>
+      </div>
       <button class="btn btn-success w-100" type="submit">Add</button>
     </form>
   </div>
@@ -6269,13 +6394,36 @@ class WebHandler(BaseHTTPRequestHandler):
             list_type = "allow" if form.get("list_type") == "allow" else "block"
             content = form.get("content", "")
             try:
-                if url:
-                    blocklist_manager.add_from_url(name, url, list_type)
-                elif content.strip():
-                    blocklist_manager.add_from_text(name, content, list_type)
+                added_count = 1
+                if form.get("add_mode") == "from-list":
+                    preset_choices = form.get_all("preset_choice")
+                    prefix = f"{list_type}-"
+                    if not preset_choices:
+                        raise ValueError("Select at least one list")
+                    preset_items = load_adlist_presets()[list_type]
+                    selected_presets = []
+                    for preset_choice in preset_choices:
+                        if not preset_choice.startswith(prefix):
+                            raise ValueError("Select valid lists")
+                        try:
+                            preset_index = int(preset_choice[len(prefix):])
+                        except ValueError:
+                            raise ValueError("Select valid lists")
+                        if preset_index < 0 or preset_index >= len(preset_items):
+                            raise ValueError("Select valid lists")
+                        selected_presets.append(preset_items[preset_index])
+                    for preset in selected_presets:
+                        blocklist_manager.add_from_url(preset["name"], preset["url"], list_type)
+                    added_count = len(selected_presets)
                 else:
-                    raise ValueError("Provide URL or paste content")
-                self.redirect(f"/blocklists?type={list_type}&success={quote('List added successfully')}")
+                    if url:
+                        blocklist_manager.add_from_url(name, url, list_type)
+                    elif content.strip():
+                        blocklist_manager.add_from_text(name, content, list_type)
+                    else:
+                        raise ValueError("Provide URL or paste content")
+                success_msg = "List added successfully" if added_count == 1 else f"{added_count} lists added successfully"
+                self.redirect(f"/blocklists?type={list_type}&success={quote(success_msg)}")
             except Exception as exc:
                 self.redirect(f"/blocklists?type={list_type}&error={quote(str(exc))}")
         elif path == "/blocklists/update":
@@ -6662,7 +6810,7 @@ class WebHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0") or "0")
         data = self.rfile.read(length).decode()
         parsed = parse_qs(data)
-        return {k: v[-1] for k, v in parsed.items()}
+        return FormData(parsed)
 
     def handle_restore(self):
         global blocklist_manager, client_manager
