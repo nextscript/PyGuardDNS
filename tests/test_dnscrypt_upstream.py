@@ -44,9 +44,87 @@ def test_dnscrypt_ipv6_stamp_parses_address_and_uses_ipv6_family():
     assert app.socket_family_for_host(parsed["address"]) == socket.AF_INET6
 
 
+def test_dnscrypt_relay_stamp_parses_and_detects():
+    stamp = "sdns://gQ04OS4xMDYuNzguMTA2"
+
+    parsed = app.parse_dnscrypt_relay_stamp(stamp)
+    detected = app.detect_upstream(stamp)
+
+    assert parsed == {"address": "89.106.78.106", "port": 443}
+    assert detected["type"] == "dnscrypt_relay"
+    assert detected["supported"] is False
+
+
+def test_anonymized_dnscrypt_target_header_maps_ipv4_to_ipv6():
+    header = app.anonymized_dnscrypt_target_header({"address": "37.120.217.75", "port": 443})
+
+    assert header[:10] == b"\xff" * 8 + b"\x00\x00"
+    assert header[10:22] == b"\x00" * 10 + b"\xff\xff"
+    assert header[22:26] == bytes([37, 120, 217, 75])
+    assert header[26:28] == struct.pack("!H", 443)
+
+
+def test_dnscrypt_query_uses_relay_for_cert_and_query(monkeypatch):
+    calls = []
+    upstream = {
+        "resolver": "sdns://AQcAAAAAAAAADTM3LjEyMC4yMTcuNzUgMTNyrVlWMsJBa4cvCY-FG925ZShMbL6aTxkJZDDbqVoeMi5kbnNjcnlwdC1jZXJ0LmNyeXB0b3N0b3JtLmlz",
+        "dnscrypt_relay": "sdns://gQ04OS4xMDYuNzguMTA2",
+    }
+    cert = {
+        "es_version": 1,
+        "resolver_public_key": b"r" * 32,
+        "client_magic": b"12345678",
+        "serial": 1,
+        "not_before": 1,
+        "not_after": int(time.time()) + 3600,
+    }
+
+    def fake_fetch(_stamp_info, timeout=4.0, relay_info=None):
+        calls.append(("cert", relay_info["address"]))
+        return cert
+
+    def fake_send(_stamp_info, _packet, timeout=4.0, transport="udp", relay_info=None):
+        calls.append((transport, relay_info["address"]))
+        return b"relay-response"
+
+    monkeypatch.setattr(app, "fetch_dnscrypt_certificate", fake_fetch)
+    monkeypatch.setattr(app, "dnscrypt_encrypt_query", lambda *_args: (b"packet", b"nonce", lambda *_decrypt_args: b""))
+    monkeypatch.setattr(app, "send_dnscrypt_packet", fake_send)
+    monkeypatch.setattr(app, "decrypt_dnscrypt_response", lambda response, *_args: response)
+    monkeypatch.setattr(app, "dns_response_truncated", lambda _response: False)
+
+    assert app.query_dnscrypt_upstream(upstream, b"\x00" * 12) == b"relay-response"
+    assert calls == [("cert", "89.106.78.106"), ("udp", "89.106.78.106")]
+
+
+def test_dnscrypt_query_uses_active_relay_entry_when_no_relay_on_upstream(monkeypatch):
+    calls = []
+    upstream = {
+        "resolver": "sdns://AQcAAAAAAAAADTM3LjEyMC4yMTcuNzUgMTNyrVlWMsJBa4cvCY-FG925ZShMbL6aTxkJZDDbqVoeMi5kbnNjcnlwdC1jZXJ0LmNyeXB0b3N0b3JtLmlz",
+    }
+    cert = {
+        "es_version": 1,
+        "resolver_public_key": b"r" * 32,
+        "client_magic": b"12345678",
+        "serial": 1,
+        "not_before": 1,
+        "not_after": int(time.time()) + 3600,
+    }
+
+    monkeypatch.setattr(app, "active_dnscrypt_relay", lambda: {"resolver": "sdns://gQ04OS4xMDYuNzguMTA2"})
+    monkeypatch.setattr(app, "fetch_dnscrypt_certificate", lambda _stamp_info, timeout=4.0, relay_info=None: calls.append(("cert", relay_info["address"])) or cert)
+    monkeypatch.setattr(app, "dnscrypt_encrypt_query", lambda *_args: (b"packet", b"nonce", lambda *_decrypt_args: b""))
+    monkeypatch.setattr(app, "send_dnscrypt_packet", lambda _stamp_info, _packet, timeout=4.0, transport="udp", relay_info=None: calls.append((transport, relay_info["address"])) or b"relay-response")
+    monkeypatch.setattr(app, "decrypt_dnscrypt_response", lambda response, *_args: response)
+    monkeypatch.setattr(app, "dns_response_truncated", lambda _response: False)
+
+    assert app.query_dnscrypt_upstream(upstream, b"\x00" * 12) == b"relay-response"
+    assert calls == [("cert", "89.106.78.106"), ("udp", "89.106.78.106")]
+
+
 def test_dnscrypt_query_retries_over_tcp_when_udp_fails(monkeypatch):
     calls = []
-    upstream = {"resolver": "sdns://AQcAAAAAAAAADTM3LjEyMC4yMTcuNzUgMTNyrVlWMsJBa4cvCY-FG925ZShMbL6aTxkJZDDbqVoeMi5kbnNjcnlwdC1jZXJ0LmNyeXB0b3N0b3JtLmlz"}
+    upstream = {"resolver": "sdns://AQcAAAAAAAAADTM3LjEyMC4yMTcuNzUgMTNyrVlWMsJBa4cvCY-FG925ZShMbL6aTxkJZDDbqVoeMi5kbnNjcnlwdC1jZXJ0LmNyeXB0b3N0b3JtLmlz", "_skip_auto_relay": True}
     cert = {
         "es_version": 1,
         "resolver_public_key": b"r" * 32,
@@ -59,7 +137,7 @@ def test_dnscrypt_query_retries_over_tcp_when_udp_fails(monkeypatch):
     monkeypatch.setattr(app, "fetch_dnscrypt_certificate", lambda *_args, **_kwargs: cert)
     monkeypatch.setattr(app, "dnscrypt_encrypt_query", lambda *_args: (b"packet", b"nonce", lambda *_decrypt_args: b""))
 
-    def fake_send(_stamp_info, _packet, timeout=4.0, transport="udp"):
+    def fake_send(_stamp_info, _packet, timeout=4.0, transport="udp", relay_info=None):
         calls.append(transport)
         if transport == "udp":
             raise OSError("udp failed")

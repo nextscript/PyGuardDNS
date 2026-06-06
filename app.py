@@ -616,6 +616,7 @@ def init_db():
                 resolver TEXT NOT NULL DEFAULT '',
                 resolver_type TEXT NOT NULL DEFAULT 'plain_udp',
                 transport TEXT NOT NULL DEFAULT 'udp',
+                dnscrypt_relay TEXT NOT NULL DEFAULT '',
                 enabled INTEGER NOT NULL DEFAULT 1,
                 latency_ms REAL,
                 last_error TEXT NOT NULL DEFAULT '',
@@ -833,6 +834,9 @@ MIGRATIONS = [
             PRIMARY KEY (profile_id, service_name)
         );
     """)),
+    (12, "add DNSCrypt relay column to upstreams", lambda: (
+        _ensure_column("upstreams", "dnscrypt_relay", "TEXT NOT NULL DEFAULT ''"),
+    )),
 ]
 
 
@@ -1223,7 +1227,7 @@ def _healthcheck_worker():
 
 
 def _healthcheck_worker_pass():
-    upstreams = rows("SELECT id,name,address,port,resolver,resolver_type,transport FROM upstreams WHERE enabled=1")
+    upstreams = rows("SELECT id,name,address,port,resolver,resolver_type,transport,dnscrypt_relay FROM upstreams WHERE enabled=1 AND resolver_type <> 'dnscrypt_relay'")
     if not upstreams:
         return
     _, query = build_query("google.com", 1)
@@ -2380,6 +2384,20 @@ def parse_plain_dns_stamp(stamp):
     return {"address": host, "port": port}
 
 
+def parse_dnscrypt_relay_stamp(stamp):
+    if not stamp.startswith("sdns://"):
+        raise ValueError("invalid DNSCrypt relay stamp")
+    raw = _stamp_b64decode(stamp[7:])
+    if len(raw) < 3 or raw[0] != 0x81:
+        raise ValueError("not a DNSCrypt relay stamp")
+    address, offset = _read_stamp_lp(raw, 1)
+    server = address.decode("utf-8", errors="ignore").strip()
+    if not server:
+        raise ValueError("DNSCrypt relay stamp is missing server address")
+    host, port = split_host_port(server, 443)
+    return {"address": host, "port": port}
+
+
 def extract_txt_answers(response):
     answers = []
     try:
@@ -2411,12 +2429,51 @@ def extract_txt_answers(response):
     return answers
 
 
-def _dnscrypt_certificate_response_candidates(stamp_info, request, timeout):
+ANON_DNSCRYPT_MAGIC = b"\xff" * 8 + b"\x00\x00"
+
+
+def anonymized_dnscrypt_target_header(stamp_info):
+    try:
+        target_ip = ipaddress.ip_address(stamp_info["address"].strip("[]"))
+    except ValueError:
+        raise OSError("Anonymized DNSCrypt relay forwarding requires a resolver stamp with an IP address")
+    if target_ip.version == 4:
+        target_bytes = b"\x00" * 10 + b"\xff\xff" + target_ip.packed
+    else:
+        target_bytes = target_ip.packed
+    return ANON_DNSCRYPT_MAGIC + target_bytes + struct.pack("!H", int(stamp_info["port"]))
+
+
+def wrap_anonymized_dnscrypt_packet(stamp_info, packet):
+    if packet.startswith(ANON_DNSCRYPT_MAGIC):
+        raise OSError("refusing nested Anonymized DNSCrypt packet")
+    return anonymized_dnscrypt_target_header(stamp_info) + packet
+
+
+def send_anonymized_dnscrypt_packet(stamp_info, relay_info, packet, timeout=4.0, transport="udp"):
+    relay_packet = wrap_anonymized_dnscrypt_packet(stamp_info, packet)
+    relay_target = {"address": relay_info["address"], "port": relay_info["port"]}
+    if transport == "tcp":
+        with socket.create_connection((relay_target["address"], int(relay_target["port"])), timeout=timeout) as s:
+            s.settimeout(timeout)
+            s.sendall(struct.pack("!H", len(relay_packet)) + relay_packet)
+            return _read_dnscrypt_tcp_response(s)
+    with socket.socket(socket_family_for_host(relay_target["address"]), socket.SOCK_DGRAM) as s:
+        s.settimeout(timeout)
+        s.sendto(relay_packet, (relay_target["address"], int(relay_target["port"])))
+        response, _ = s.recvfrom(4096)
+        return response
+
+
+def _dnscrypt_certificate_response_candidates(stamp_info, request, timeout, relay_info=None):
     base = {"address": stamp_info["address"], "port": stamp_info["port"]}
     udp_response = None
     last_error = None
     try:
-        udp_response = query_plain_upstream({**base, "transport": "udp"}, request, timeout=timeout)
+        if relay_info:
+            udp_response = send_anonymized_dnscrypt_packet(stamp_info, relay_info, request, timeout=timeout, transport="udp")
+        else:
+            udp_response = query_plain_upstream({**base, "transport": "udp"}, request, timeout=timeout)
     except OSError:
         last_error = sys.exc_info()[1]
         udp_response = None
@@ -2425,7 +2482,10 @@ def _dnscrypt_certificate_response_candidates(stamp_info, request, timeout):
     if udp_response is not None and not dns_response_truncated(udp_response) and extract_txt_answers(udp_response):
         return
     try:
-        yield query_plain_upstream({**base, "transport": "tcp"}, request, timeout=timeout)
+        if relay_info:
+            yield send_anonymized_dnscrypt_packet(stamp_info, relay_info, request, timeout=timeout, transport="tcp")
+        else:
+            yield query_plain_upstream({**base, "transport": "tcp"}, request, timeout=timeout)
         return
     except OSError:
         last_error = sys.exc_info()[1]
@@ -2433,15 +2493,16 @@ def _dnscrypt_certificate_response_candidates(stamp_info, request, timeout):
         raise OSError(f"DNSCrypt certificate transport failed: {last_error}") from last_error
 
 
-def fetch_dnscrypt_certificate(stamp_info, timeout=4.0):
-    cache_key_value = f"{stamp_info['address']}:{stamp_info['port']}|{stamp_info['provider_name']}"
+def fetch_dnscrypt_certificate(stamp_info, timeout=4.0, relay_info=None):
+    relay_key = f"|relay={relay_info['address']}:{relay_info['port']}" if relay_info else ""
+    cache_key_value = f"{stamp_info['address']}:{stamp_info['port']}|{stamp_info['provider_name']}{relay_key}"
     cached = dnscrypt_cert_cache.get(cache_key_value)
     if cached and cached["expires"] > time.time():
         return cached["cert"]
     _, request = build_query(stamp_info["provider_name"], QTYPE_CODE["TXT"])
     now = int(time.time())
     best = None
-    for response in _dnscrypt_certificate_response_candidates(stamp_info, request, timeout):
+    for response in _dnscrypt_certificate_response_candidates(stamp_info, request, timeout, relay_info=relay_info):
         for txt in extract_txt_answers(response):
             try:
                 cert = parse_dnscrypt_certificate(txt, stamp_info["provider_public_key"])
@@ -2641,7 +2702,9 @@ def _read_dnscrypt_tcp_response(conn):
     return b"".join(chunks)
 
 
-def send_dnscrypt_packet(stamp_info, packet, timeout=4.0, transport="udp"):
+def send_dnscrypt_packet(stamp_info, packet, timeout=4.0, transport="udp", relay_info=None):
+    if relay_info:
+        return send_anonymized_dnscrypt_packet(stamp_info, relay_info, packet, timeout=timeout, transport=transport)
     address = stamp_info["address"]
     port = int(stamp_info["port"])
     if transport == "tcp":
@@ -2675,17 +2738,25 @@ def query_dnscrypt_upstream(upstream, request, timeout=4.0):
     except ImportError:
         raise OSError("DNSCrypt requires PyNaCl (pip install pynacl)")
     stamp_info = parse_dnscrypt_stamp(upstream["resolver"])
-    cert = fetch_dnscrypt_certificate(stamp_info, timeout=timeout)
+    relay_info = None
+    relay_stamp = (upstream.get("dnscrypt_relay") or "").strip()
+    if relay_stamp:
+        relay_info = parse_dnscrypt_relay_stamp(relay_stamp)
+    elif not upstream.get("_skip_auto_relay"):
+        relay_upstream = active_dnscrypt_relay()
+        if relay_upstream and relay_upstream.get("resolver"):
+            relay_info = parse_dnscrypt_relay_stamp(relay_upstream["resolver"])
+    cert = fetch_dnscrypt_certificate(stamp_info, timeout=timeout, relay_info=relay_info)
     client_key = PrivateKey.generate()
     packet, client_nonce, decrypt_response = dnscrypt_encrypt_query(cert, client_key, request)
     try:
-        response = send_dnscrypt_packet(stamp_info, packet, timeout=timeout, transport="udp")
+        response = send_dnscrypt_packet(stamp_info, packet, timeout=timeout, transport="udp", relay_info=relay_info)
         decrypted = decrypt_dnscrypt_response(response, client_nonce, decrypt_response)
         if not dns_response_truncated(decrypted):
             return decrypted
     except OSError:
         pass
-    response = send_dnscrypt_packet(stamp_info, packet, timeout=timeout, transport="tcp")
+    response = send_dnscrypt_packet(stamp_info, packet, timeout=timeout, transport="tcp", relay_info=relay_info)
     return decrypt_dnscrypt_response(response, client_nonce, decrypt_response)
 
 
@@ -2855,6 +2926,7 @@ def detect_dns_stamp_type(stamp):
         0x02: "doh_stamp",
         0x03: "dot_stamp",
         0x04: "doq_stamp",
+        0x81: "dnscrypt_relay",
     }.get(protocol, "dns_stamp_unknown")
 
 
@@ -2881,6 +2953,7 @@ def detect_upstream(resolver):
             "doh_stamp": "DNS stamp: DNS-over-HTTPS resolver",
             "dot_stamp": "DNS stamp: DNS-over-TLS resolver",
             "doq_stamp": "DNS stamp: DNS-over-QUIC resolver",
+            "dnscrypt_relay": "DNS stamp: DNSCrypt relay",
             "dns_stamp_unknown": "DNS stamp: unknown resolver type",
         }
         if stamp_type == "dnscrypt_stamp":
@@ -2924,6 +2997,19 @@ def detect_upstream(resolver):
                 })
             except Exception as exc:
                 result.update({"address": raw, "port": 0, "type": stamp_type, "transport": "https", "supported": False, "label": f"{labels[stamp_type]} ({exc})"})
+        elif stamp_type == "dnscrypt_relay":
+            try:
+                parsed_stamp = parse_dnscrypt_relay_stamp(raw)
+                result.update({
+                    "address": parsed_stamp["address"],
+                    "port": parsed_stamp["port"],
+                    "type": stamp_type,
+                    "transport": "dnscrypt-relay",
+                    "supported": False,
+                    "label": labels[stamp_type] + " (use as Relay on a DNSCrypt upstream)",
+                })
+            except Exception as exc:
+                result.update({"address": raw, "port": 0, "type": stamp_type, "transport": "dnscrypt-relay", "supported": False, "label": f"{labels[stamp_type]} ({exc})"})
         else:
             result.update({"address": raw, "port": 0, "type": stamp_type, "transport": "stamp", "supported": False, "label": labels.get(stamp_type, labels["dns_stamp_unknown"])})
         return result
@@ -3152,7 +3238,7 @@ def active_upstreams():
                uh.last_checked, uh.total_queries, uh.successful_queries
         FROM upstreams u
         LEFT JOIN upstream_health uh ON uh.upstream_id=u.id
-        WHERE u.enabled=1 AND COALESCE(uh.paused,0)=0
+        WHERE u.enabled=1 AND COALESCE(uh.paused,0)=0 AND u.resolver_type <> 'dnscrypt_relay'
         ORDER BY
           CASE WHEN u.last_error='' THEN 0 ELSE 1 END,
           CASE WHEN u.latency_ms IS NULL THEN 999999 ELSE u.latency_ms END,
@@ -3161,17 +3247,40 @@ def active_upstreams():
     )
 
 
+def active_dnscrypt_relay():
+    relay = one(
+        """
+        SELECT u.*
+        FROM upstreams u
+        LEFT JOIN upstream_health uh ON uh.upstream_id=u.id
+        WHERE u.enabled=1
+          AND u.resolver_type='dnscrypt_relay'
+          AND COALESCE(uh.paused,0)=0
+        ORDER BY
+          CASE WHEN u.last_error='' THEN 0 ELSE 1 END,
+          CASE WHEN u.latency_ms IS NULL THEN 999999 ELSE u.latency_ms END,
+          u.id ASC
+        """
+    )
+    return relay
+
+
 def plain_upstream_supported(upstream):
     return upstream.get("transport") in ("udp", "tcp") and upstream.get("resolver_type") in ("plain_udp", "plain_udp_host", "plain_tcp", "plain_tcp_host")
 
 
 def upstream_supported(upstream):
-    return plain_upstream_supported(upstream) or upstream.get("resolver_type") in ("doh", "doh_stamp", "doh_http3", "dot", "dnscrypt_stamp", "dns_stamp_unknown", "plain_dns_stamp")
+    return plain_upstream_supported(upstream) or upstream.get("resolver_type") in ("doh", "doh_stamp", "doh_http3", "dot", "dnscrypt_stamp", "dnscrypt_relay", "dns_stamp_unknown", "plain_dns_stamp")
 
 
 def probe_upstream(upstream):
     if not upstream_supported(upstream):
         raise OSError(f"{upstream['resolver_type']} forwarding is detected but not implemented yet")
+    if upstream.get("resolver_type") == "dnscrypt_relay":
+        start = time.perf_counter()
+        with socket.create_connection((upstream["address"], int(upstream["port"])), timeout=4.0):
+            pass
+        return round((time.perf_counter() - start) * 1000, 2)
     _, request = build_query("example.com", QTYPE_CODE["A"])
     start = time.perf_counter()
     if upstream.get("resolver_type") == "doh":
@@ -6135,6 +6244,7 @@ def upstreams_page():
             f"<td data-label='Resolver' class='text-break'>{html_escape(r['resolver'] or (r['address'] + ':' + str(r['port'])))}</td>"
             f"<td data-label='Type'><span class='badge text-bg-secondary'>{html_escape(r['resolver_type'])}</span></td>"
             f"<td data-label='Transport'>{html_escape(r['transport'])}</td>"
+            f"<td data-label='Relay' class='text-break'>{html_escape(r.get('dnscrypt_relay', ''))}</td>"
             f"<td data-label='Enabled'>{upstream_toggle(r)}</td>"
             f"<td data-label='Latency ms' id='upstream-latency-{rid}'>{latency_badge(r)}</td>"
             f"<td data-label='Error' class='text-secondary' id='upstream-error-{rid}'>{html_escape(r['last_error'])}</td>"
@@ -6169,10 +6279,12 @@ def upstreams_page():
 <h2 class="h5">Add Upstream</h2>
 <label class="form-label">Name</label><input class="form-control mb-2" name="name" placeholder="Cloudflare" required>
 <label class="form-label">Resolver</label><input class="form-control mb-2" id="resolver-input" name="resolver" placeholder="https://dns.google/dns-query" required>
+<label class="form-label">DNSCrypt Relay (optional)</label><input class="form-control mb-2" id="relay-input" name="dnscrypt_relay" placeholder="sdns://gQ04OS4xMDYuNzguMTA2">
+<div class="alert alert-secondary py-2" id="relay-detect">Relay is used only for DNSCrypt upstream stamps.</div>
 <div class="alert alert-secondary py-2" id="resolver-detect">Type is detected automatically.</div>
-<div class="small text-secondary mb-3">Use <code>https://domain/dns-query</code> for DNS-over-HTTPS, <code>h3://domain/dns-query</code> for DNS-over-HTTPS over QUIC/HTTP3, or <code>tls://domain</code> for pooled DNS-over-TLS. Native <code>quic://domain</code> upstreams are experimental and disabled by default.</div>
+<div class="small text-secondary mb-3">Use <code>https://domain/dns-query</code> for DNS-over-HTTPS, <code>h3://domain/dns-query</code> for DNS-over-HTTPS over QUIC/HTTP3, <code>tls://domain</code> for pooled DNS-over-TLS, or <code>sdns://...</code> for DNSCrypt/DoH stamps. A DNSCrypt relay stamp can be pasted into Resolver to save it as a relay entry; active relay entries are used automatically by DNSCrypt upstreams without their own relay.</div>
 <button class="btn btn-success w-100">Save</button></form></div>
-<div class="col-xl-8"><div class="panel rounded-2 border border-secondary-subtle p-3"><div class="table-responsive"><table class="table table-dark table-hover mobile-card-table"><thead><tr><th>Name</th><th>Resolver</th><th>Type</th><th>Transport</th><th>Enabled</th><th>Latency ms</th><th>Error</th><th></th></tr></thead><tbody>{table}</tbody></table></div></div></div></div>
+<div class="col-xl-8"><div class="panel rounded-2 border border-secondary-subtle p-3"><div class="table-responsive"><table class="table table-dark table-hover mobile-card-table"><thead><tr><th>Name</th><th>Resolver</th><th>Type</th><th>Transport</th><th>Relay</th><th>Enabled</th><th>Latency ms</th><th>Error</th><th></th></tr></thead><tbody>{table}</tbody></table></div></div></div></div>
 <script>
 async function testUpstream(id, btn) {{
   const origText = btn.textContent;
@@ -6203,6 +6315,8 @@ async function testUpstream(id, btn) {{
 }}
 const resolverInput = document.getElementById('resolver-input');
 const resolverDetect = document.getElementById('resolver-detect');
+const relayInput = document.getElementById('relay-input');
+const relayDetect = document.getElementById('relay-detect');
 async function detectResolver() {{
   const resolver = resolverInput.value.trim();
   if (!resolver) {{
@@ -6213,11 +6327,32 @@ async function detectResolver() {{
   try {{
     const response = await fetch('/api/upstreams/detect?resolver=' + encodeURIComponent(resolver), {{cache:'no-store'}});
     const data = await response.json();
-    resolverDetect.textContent = data.label + (data.supported ? ' - forwarding active.' : ' - detected, forwarding is not implemented yet.');
-    resolverDetect.className = 'alert py-2 ' + (data.supported ? 'alert-success' : 'alert-warning');
+    if (data.type === 'dnscrypt_relay') {{
+      resolverDetect.textContent = data.label + ' - saved as relay entry and used by DNSCrypt upstreams.';
+      resolverDetect.className = 'alert py-2 alert-success';
+    }} else {{
+      resolverDetect.textContent = data.label + (data.supported ? ' - forwarding active.' : ' - detected, forwarding is not implemented yet.');
+      resolverDetect.className = 'alert py-2 ' + (data.supported ? 'alert-success' : 'alert-warning');
+    }}
   }} catch (error) {{}}
 }}
 resolverInput.addEventListener('input', detectResolver);
+async function detectRelay() {{
+  const relay = relayInput.value.trim();
+  if (!relay) {{
+    relayDetect.textContent = 'Relay is used only for DNSCrypt upstream stamps.';
+    relayDetect.className = 'alert alert-secondary py-2';
+    return;
+  }}
+  try {{
+    const response = await fetch('/api/upstreams/detect?resolver=' + encodeURIComponent(relay), {{cache:'no-store'}});
+    const data = await response.json();
+    const ok = data.type === 'dnscrypt_relay';
+    relayDetect.textContent = data.label;
+    relayDetect.className = 'alert py-2 ' + (ok ? 'alert-success' : 'alert-warning');
+  }} catch (error) {{}}
+}}
+relayInput.addEventListener('input', detectRelay);
 </script>""", "Upstreams")
 
 
@@ -6986,9 +7121,9 @@ def handle_restore_data(data):
         counts["blocklists"] = restored_blocklists
         db.execute("DELETE FROM upstreams")
         for row in data.get("upstreams", []):
-            db.execute("INSERT INTO upstreams(name,address,port,resolver,resolver_type,transport,enabled,latency_ms,last_error,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            db.execute("INSERT INTO upstreams(name,address,port,resolver,resolver_type,transport,dnscrypt_relay,enabled,latency_ms,last_error,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                        (row.get("name",""), row.get("address","1.1.1.1"), int(row.get("port",53)), row.get("resolver",""),
-                        row.get("resolver_type","plain_udp"), row.get("transport","udp"), int(row.get("enabled",1)),
+                        row.get("resolver_type","plain_udp"), row.get("transport","udp"), row.get("dnscrypt_relay",""), int(row.get("enabled",1)),
                         row.get("latency_ms"), row.get("last_error",""), row.get("created_at", now_iso())))
         counts["upstreams"] = len(data.get("upstreams", []))
         if client_manager and "profiles" in data:
@@ -7813,10 +7948,15 @@ class WebHandler(BaseHTTPRequestHandler):
             self.redirect("/profiles")
         elif path == "/upstreams/add":
             parsed = detect_upstream(form.get("resolver", form.get("address", "")))
+            dnscrypt_relay = form.get("dnscrypt_relay", "").strip()
+            if dnscrypt_relay:
+                relay_detected = detect_upstream(dnscrypt_relay)
+                if relay_detected.get("type") != "dnscrypt_relay":
+                    raise ValueError("DNSCrypt Relay must be a relay sdns:// stamp")
             with db_lock:
                 db.execute(
-                    "INSERT INTO upstreams(name,address,port,resolver,resolver_type,transport,created_at) VALUES(?,?,?,?,?,?,?)",
-                    (form.get("name", ""), parsed["address"], int(parsed["port"]), parsed["resolver"], parsed["type"], parsed["transport"], now_iso()),
+                    "INSERT INTO upstreams(name,address,port,resolver,resolver_type,transport,dnscrypt_relay,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (form.get("name", ""), parsed["address"], int(parsed["port"]), parsed["resolver"], parsed["type"], parsed["transport"], dnscrypt_relay if parsed["type"] == "dnscrypt_stamp" else "", now_iso()),
                 )
                 db.commit()
             self.redirect("/upstreams")
@@ -8152,10 +8292,10 @@ class WebHandler(BaseHTTPRequestHandler):
             upstream_rows = data.get("upstreams", [])
             for row in upstream_rows:
                 db.execute(
-                    "INSERT INTO upstreams(name,address,port,resolver,resolver_type,transport,enabled,latency_ms,last_error,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO upstreams(name,address,port,resolver,resolver_type,transport,dnscrypt_relay,enabled,latency_ms,last_error,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                     (row.get("name",""), row.get("address","1.1.1.1"), int(row.get("port",53)),
                      row.get("resolver",""), row.get("resolver_type","plain_udp"),
-                     row.get("transport","udp"), int(row.get("enabled",1)),
+                     row.get("transport","udp"), row.get("dnscrypt_relay",""), int(row.get("enabled",1)),
                      row.get("latency_ms"), row.get("last_error",""),
                      row.get("created_at", now_iso()))
                 )
