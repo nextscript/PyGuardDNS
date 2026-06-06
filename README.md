@@ -259,6 +259,7 @@ restart
 stop
 cache clear
 update blocklist
+dedupe blocklists
 help
 ```
 
@@ -337,7 +338,5 @@ requirements.txt          Runtime Python dependencies
 requirements-dev.txt      Test/development Python dependencies
 start-pyguarddns.bat      Windows start script
 start-pyguarddns.sh       Linux/macOS start script
-tests/                    Pytest test suite
-```
 tests/                    Pytest test suite
 ```
