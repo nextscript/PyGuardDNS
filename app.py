@@ -4,6 +4,7 @@ import csv
 import atexit
 import faulthandler
 import hashlib
+import hmac
 import io
 import ipaddress
 import json
@@ -1371,6 +1372,12 @@ def dns_response_rcode(response):
     return response[3] & 0x0F
 
 
+def dns_response_truncated(response):
+    if not response or len(response) < 4:
+        return False
+    return bool(response[2] & 0x02)
+
+
 def build_ip_response(request, ip_text, ttl=60):
     question = parse_dns_question(request)
     qtype = question["qtype"]
@@ -2394,6 +2401,8 @@ def extract_txt_answers(response):
             while pos < len(rdata):
                 length = rdata[pos]
                 pos += 1
+                if pos + length > len(rdata):
+                    raise ValueError("truncated TXT answer")
                 chunks.append(rdata[pos : pos + length])
                 pos += length
             answers.append(b"".join(chunks))
@@ -2402,27 +2411,42 @@ def extract_txt_answers(response):
     return answers
 
 
+def _dnscrypt_certificate_response_candidates(stamp_info, request, timeout):
+    base = {"address": stamp_info["address"], "port": stamp_info["port"]}
+    udp_response = None
+    try:
+        udp_response = query_plain_upstream({**base, "transport": "udp"}, request, timeout=timeout)
+    except OSError:
+        udp_response = None
+    if udp_response is not None and not dns_response_truncated(udp_response):
+        yield udp_response
+    if udp_response is not None and not dns_response_truncated(udp_response) and extract_txt_answers(udp_response):
+        return
+    try:
+        yield query_plain_upstream({**base, "transport": "tcp"}, request, timeout=timeout)
+    except OSError:
+        return
+
+
 def fetch_dnscrypt_certificate(stamp_info, timeout=4.0):
     cache_key_value = f"{stamp_info['address']}:{stamp_info['port']}|{stamp_info['provider_name']}"
     cached = dnscrypt_cert_cache.get(cache_key_value)
     if cached and cached["expires"] > time.time():
         return cached["cert"]
     _, request = build_query(stamp_info["provider_name"], QTYPE_CODE["TXT"])
-    response = query_plain_upstream(
-        {"address": stamp_info["address"], "port": stamp_info["port"], "transport": "udp"},
-        request,
-        timeout=timeout,
-    )
     now = int(time.time())
     best = None
-    for txt in extract_txt_answers(response):
-        try:
-            cert = parse_dnscrypt_certificate(txt, stamp_info["provider_public_key"])
-            if cert["not_before"] <= now <= cert["not_after"]:
-                if best is None or cert["serial"] > best["serial"]:
-                    best = cert
-        except Exception:
-            continue
+    for response in _dnscrypt_certificate_response_candidates(stamp_info, request, timeout):
+        for txt in extract_txt_answers(response):
+            try:
+                cert = parse_dnscrypt_certificate(txt, stamp_info["provider_public_key"])
+                if cert["not_before"] <= now <= cert["not_after"]:
+                    if best is None or cert["serial"] > best["serial"]:
+                        best = cert
+            except Exception:
+                continue
+        if best:
+            break
     if not best:
         raise OSError("DNSCrypt certificate fetch failed")
     ttl = max(300, min(86400, best["not_after"] - now))
@@ -2438,7 +2462,7 @@ def parse_dnscrypt_certificate(cert_data, provider_public_key):
     if len(cert_data) < 124 or cert_data[:4] != b"DNSC":
         raise ValueError("invalid DNSCrypt certificate")
     es_version = struct.unpack("!H", cert_data[4:6])[0]
-    if es_version != 1:
+    if es_version not in (1, 2):
         raise ValueError(f"unsupported DNSCrypt encryption system: {es_version}")
     signature = cert_data[8:72]
     signed = cert_data[72:]
@@ -2447,6 +2471,7 @@ def parse_dnscrypt_certificate(cert_data, provider_public_key):
     client_magic = cert_data[104:112]
     serial, not_before, not_after = struct.unpack("!III", cert_data[112:124])
     return {
+        "es_version": es_version,
         "resolver_public_key": resolver_public_key,
         "client_magic": client_magic,
         "serial": serial,
@@ -2469,19 +2494,141 @@ def unpad_dnscrypt_response(response):
     return response
 
 
+def _rotl32(value, shift):
+    return ((value << shift) | (value >> (32 - shift))) & 0xFFFFFFFF
+
+
+def _chacha20_quarter_round(state, a, b, c, d):
+    state[a] = (state[a] + state[b]) & 0xFFFFFFFF
+    state[d] ^= state[a]
+    state[d] = _rotl32(state[d], 16)
+    state[c] = (state[c] + state[d]) & 0xFFFFFFFF
+    state[b] ^= state[c]
+    state[b] = _rotl32(state[b], 12)
+    state[a] = (state[a] + state[b]) & 0xFFFFFFFF
+    state[d] ^= state[a]
+    state[d] = _rotl32(state[d], 8)
+    state[c] = (state[c] + state[d]) & 0xFFFFFFFF
+    state[b] ^= state[c]
+    state[b] = _rotl32(state[b], 7)
+
+
+def hchacha20(key, nonce16):
+    if len(key) != 32 or len(nonce16) != 16:
+        raise ValueError("HChaCha20 requires a 32-byte key and 16-byte nonce")
+    constants = (0x61707865, 0x3320646E, 0x79622D32, 0x6B206574)
+    state = list(constants)
+    state.extend(struct.unpack("<8I", key))
+    state.extend(struct.unpack("<4I", nonce16))
+    for _ in range(10):
+        _chacha20_quarter_round(state, 0, 4, 8, 12)
+        _chacha20_quarter_round(state, 1, 5, 9, 13)
+        _chacha20_quarter_round(state, 2, 6, 10, 14)
+        _chacha20_quarter_round(state, 3, 7, 11, 15)
+        _chacha20_quarter_round(state, 0, 5, 10, 15)
+        _chacha20_quarter_round(state, 1, 6, 11, 12)
+        _chacha20_quarter_round(state, 2, 7, 8, 13)
+        _chacha20_quarter_round(state, 3, 4, 9, 14)
+    return struct.pack("<8I", state[0], state[1], state[2], state[3], state[12], state[13], state[14], state[15])
+
+
+def _chacha20_djb_block(key, counter, nonce8):
+    constants = (0x61707865, 0x3320646E, 0x79622D32, 0x6B206574)
+    initial = list(constants)
+    initial.extend(struct.unpack("<8I", key))
+    initial.extend((counter & 0xFFFFFFFF, (counter >> 32) & 0xFFFFFFFF))
+    initial.extend(struct.unpack("<2I", nonce8))
+    state = initial[:]
+    for _ in range(10):
+        _chacha20_quarter_round(state, 0, 4, 8, 12)
+        _chacha20_quarter_round(state, 1, 5, 9, 13)
+        _chacha20_quarter_round(state, 2, 6, 10, 14)
+        _chacha20_quarter_round(state, 3, 7, 11, 15)
+        _chacha20_quarter_round(state, 0, 5, 10, 15)
+        _chacha20_quarter_round(state, 1, 6, 11, 12)
+        _chacha20_quarter_round(state, 2, 7, 8, 13)
+        _chacha20_quarter_round(state, 3, 4, 9, 14)
+    return struct.pack("<16I", *((state[i] + initial[i]) & 0xFFFFFFFF for i in range(16)))
+
+
+def _xchacha20_djb_xor(key, nonce24, data, initial_counter=0, initial_skip=32):
+    if len(key) != 32 or len(nonce24) != 24:
+        raise ValueError("XChaCha20 requires a 32-byte key and 24-byte nonce")
+    subkey = hchacha20(key, nonce24[:16])
+    nonce8 = nonce24[16:]
+    out = bytearray()
+    counter = initial_counter
+    skip = initial_skip
+    offset = 0
+    while offset < len(data):
+        block = _chacha20_djb_block(subkey, counter, nonce8)
+        if skip:
+            block = block[skip:]
+            skip = 0
+        chunk = data[offset : offset + len(block)]
+        out.extend(bytes(a ^ b for a, b in zip(chunk, block)))
+        offset += len(chunk)
+        counter += 1
+    return bytes(out)
+
+
+def dnscrypt_xchacha20poly1305_encrypt(key, nonce24, data):
+    from cryptography.hazmat.primitives.poly1305 import Poly1305
+
+    subkey = hchacha20(key, nonce24[:16])
+    poly_key = _chacha20_djb_block(subkey, 0, nonce24[16:])[:32]
+    ciphertext = _xchacha20_djb_xor(key, nonce24, data)
+    return Poly1305.generate_tag(poly_key, ciphertext) + ciphertext
+
+
+def dnscrypt_xchacha20poly1305_decrypt(key, nonce24, data):
+    from cryptography.hazmat.primitives.poly1305 import Poly1305
+
+    if len(data) < 16:
+        raise ValueError("short XChaCha20-Poly1305 ciphertext")
+    tag = data[:16]
+    ciphertext = data[16:]
+    subkey = hchacha20(key, nonce24[:16])
+    poly_key = _chacha20_djb_block(subkey, 0, nonce24[16:])[:32]
+    expected = Poly1305.generate_tag(poly_key, ciphertext)
+    if not hmac.compare_digest(tag, expected):
+        raise ValueError("invalid XChaCha20-Poly1305 tag")
+    return _xchacha20_djb_xor(key, nonce24, ciphertext)
+
+
+def dnscrypt_encrypt_query(cert, client_key, request):
+    from nacl.public import Box, PublicKey
+
+    client_nonce = secrets.token_bytes(12)
+    nonce = client_nonce + (b"\x00" * 12)
+    padded = pad_dnscrypt_query(request)
+    if cert["es_version"] == 1:
+        box = Box(client_key, PublicKey(cert["resolver_public_key"]))
+        encrypted = box.encrypt(padded, nonce).ciphertext
+        decrypt_response = lambda ciphertext, response_nonce: box.decrypt(ciphertext, response_nonce)
+    elif cert["es_version"] == 2:
+        try:
+            from nacl.bindings import crypto_scalarmult
+        except ImportError:
+            raise OSError("DNSCrypt XChaCha20 support requires PyNaCl")
+        shared_key = hchacha20(crypto_scalarmult(bytes(client_key), cert["resolver_public_key"]), b"\x00" * 16)
+        encrypted = dnscrypt_xchacha20poly1305_encrypt(shared_key, nonce, padded)
+        decrypt_response = lambda ciphertext, response_nonce: dnscrypt_xchacha20poly1305_decrypt(shared_key, response_nonce, ciphertext)
+    else:
+        raise OSError(f"unsupported DNSCrypt encryption system: {cert['es_version']}")
+    packet = cert["client_magic"] + bytes(client_key.public_key) + client_nonce + encrypted
+    return packet, client_nonce, decrypt_response
+
+
 def query_dnscrypt_upstream(upstream, request, timeout=4.0):
     try:
-        from nacl.public import Box, PrivateKey, PublicKey
+        from nacl.public import PrivateKey
     except ImportError:
         raise OSError("DNSCrypt requires PyNaCl (pip install pynacl)")
     stamp_info = parse_dnscrypt_stamp(upstream["resolver"])
     cert = fetch_dnscrypt_certificate(stamp_info, timeout=timeout)
     client_key = PrivateKey.generate()
-    box = Box(client_key, PublicKey(cert["resolver_public_key"]))
-    client_nonce = secrets.token_bytes(12)
-    nonce = client_nonce + (b"\x00" * 12)
-    encrypted = box.encrypt(pad_dnscrypt_query(request), nonce).ciphertext
-    packet = cert["client_magic"] + bytes(client_key.public_key) + client_nonce + encrypted
+    packet, client_nonce, decrypt_response = dnscrypt_encrypt_query(cert, client_key, request)
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.settimeout(timeout)
         s.sendto(packet, (stamp_info["address"], int(stamp_info["port"])))
@@ -2491,7 +2638,7 @@ def query_dnscrypt_upstream(upstream, request, timeout=4.0):
     response_nonce = response[8:32]
     if not response_nonce.startswith(client_nonce):
         raise OSError("DNSCrypt response nonce mismatch")
-    decrypted = box.decrypt(response[32:], response_nonce)
+    decrypted = decrypt_response(response[32:], response_nonce)
     decrypted = unpad_dnscrypt_response(decrypted)
     if len(decrypted) < 12:
         raise OSError("invalid DNSCrypt DNS response")
