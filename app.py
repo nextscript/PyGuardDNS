@@ -8731,6 +8731,7 @@ def console_print(text="", style=None):
 
 CONSOLE_COMMANDS = [
     "status",
+    "domain test",
     "dnssec test",
     "cache clear",
     "update blocklist",
@@ -8813,6 +8814,7 @@ def console_box(title, rows):
 def console_help():
     descriptions = {
         "status": "Show runtime metrics",
+        "domain test": "Test filtering decision: domain test example.com [client-ip] [qtype]",
         "dnssec test": "Run DNSSEC self-validation",
         "cache clear": "Clear DNS cache",
         "update blocklist": "Update remote blocklists",
@@ -8954,6 +8956,26 @@ def print_dnssec_self_validation_test():
     console_event(overall_level, f"Overall: {result['overall'].upper()}")
 
 
+def print_console_domain_test(domain, client="127.0.0.1", query_type="A"):
+    result = run_domain_test({"domain": domain, "query_type": query_type, "client": client})
+    rows = [
+        ("Domain", result.get("domain", "")),
+        ("Query type", result.get("query_type", "")),
+        ("Client", result.get("client", "")),
+        ("Action", result.get("action", "")),
+        ("Reason", result.get("reason", "")),
+        ("Matched rule", result.get("matched_rule") or result.get("matched_domain") or "-"),
+        ("List", result.get("list_name") or "-"),
+        ("Client name", result.get("client_name") or "-"),
+        ("Profile", result.get("profile_name") or "-"),
+    ]
+    if result.get("target"):
+        rows.append(("Target", result["target"]))
+    console_box("Domain test", rows)
+    for step in result.get("steps", []):
+        console_event("info", step)
+
+
 def run_console_command(command):
     global dns_servers
     command = command.replace(chr(0xFEFF), "")
@@ -8966,6 +8988,19 @@ def run_console_command(command):
         return True
     if cmd == "status":
         print_console_status()
+        return True
+    if cmd in {"domain test", "test domain"} or cmd.startswith("domain test ") or cmd.startswith("test domain "):
+        parts = cleaned.strip().split()
+        if len(parts) < 3:
+            console_event("error", "Usage: domain test example.com [client-ip] [qtype]")
+            return True
+        domain = parts[2]
+        client = parts[3] if len(parts) >= 4 else "127.0.0.1"
+        query_type = parts[4] if len(parts) >= 5 else "A"
+        try:
+            print_console_domain_test(domain, client, query_type)
+        except Exception as exc:
+            console_event("error", "Domain test failed", exc)
         return True
     if cmd in {"dnssec test", "test dnssec", "dnssec"}:
         print_dnssec_self_validation_test()
