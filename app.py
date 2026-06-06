@@ -5204,6 +5204,9 @@ function blFormatStatus(prefix, s) {{
   const current = s.current || (prefix === 'Blocklist import' ? 'Preparing import' : 'Preparing delete');
   return `${{prefix}} running: ${{current}} (${{s.done || 0}} done, ${{s.failed || 0}} failed, ${{s.queued || 0}} queued).`;
 }}
+function blClearStatusBoxes() {{
+  document.querySelectorAll('#bl-job-status,#bl-delete-status').forEach(function(el) {{ el.remove(); }});
+}}
 async function refreshBlocklistJobStatus() {{
   try {{
     const r = await fetch('/api/blocklists/job-status', {{cache:'no-store'}});
@@ -5212,23 +5215,26 @@ async function refreshBlocklistJobStatus() {{
     const imp = data.import || {{}};
     const del = data.delete || {{}};
     const active = !!(imp.running || del.running);
-    const impEl = document.getElementById('bl-job-status');
-    const delEl = document.getElementById('bl-delete-status');
+    if (!active) {{
+      const hadStatusBox = !!document.querySelector('#bl-job-status,#bl-delete-status');
+      blClearStatusBoxes();
+      if ((blJobWasActive || hadStatusBox) && !blReloadScheduled) {{
+        blReloadScheduled = true;
+        setTimeout(function() {{ window.location.reload(); }}, 700);
+      }}
+      return;
+    }}
     if (imp.running) {{
       blEnsureStatusBox('bl-job-status', 'alert alert-info').textContent = blFormatStatus('Blocklist import', imp);
-    }} else if (impEl) {{
-      impEl.remove();
+    }} else {{
+      document.querySelectorAll('#bl-job-status').forEach(function(el) {{ el.remove(); }});
     }}
     if (del.running) {{
       blEnsureStatusBox('bl-delete-status', 'alert alert-warning').textContent = blFormatStatus('Blocklist delete', del);
-    }} else if (delEl) {{
-      delEl.remove();
+    }} else {{
+      document.querySelectorAll('#bl-delete-status').forEach(function(el) {{ el.remove(); }});
     }}
-    if (active) blJobWasActive = true;
-    if (!active && blJobWasActive && !blReloadScheduled) {{
-      blReloadScheduled = true;
-      setTimeout(function() {{ window.location.reload(); }}, 700);
-    }}
+    blJobWasActive = true;
   }} catch (e) {{}}
 }}
 setTimeout(function() {{
