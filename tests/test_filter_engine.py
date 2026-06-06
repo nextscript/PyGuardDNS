@@ -53,3 +53,46 @@ def test_profile_rules_and_explain_steps():
     assert result.action == "ALLOW"
     assert explanation["profile_id"] == 7
     assert any(step["step"] == "profile_allow_check" and step["result"] == "matched" for step in explanation["steps"])
+
+
+def test_regex_index_keeps_regex_hits_and_clean_misses_fast_path():
+    engine = FilterEngine()
+    engine.add_rule(r"/ads[0-9]+\.doubleclick\.net/", "block", list_name="Regex")
+
+    hit = engine.check("ads42.doubleclick.net")
+    miss = engine.check("example.org")
+
+    assert hit.action == "BLOCK"
+    assert hit.reason == "regex_block"
+    assert hit.matched_rule == r"/ads[0-9]+\.doubleclick\.net/"
+    assert miss.action == "ALLOW"
+    assert miss.reason == "no_match"
+    assert engine.regex_block.fallback_ratio() == 0
+
+
+def test_simple_regex_demotes_to_domain_rules():
+    engine = FilterEngine()
+    engine.add_rule(r"/^ads\.example\.com$/", "block", list_name="Regex")
+    engine.add_rule(r"/(^|\.)tracker\.example\.net$/", "block", list_name="Regex")
+
+    exact = engine.check("ads.example.com")
+    suffix = engine.check("www.tracker.example.net")
+
+    assert exact.action == "BLOCK"
+    assert exact.reason == "exact_block"
+    assert suffix.action == "BLOCK"
+    assert suffix.reason == "suffix_block"
+    assert len(engine.regex_block) == 0
+
+
+def test_negative_cache_invalidates_when_rules_change():
+    engine = FilterEngine()
+
+    clean = engine.check("later-blocked.example")
+    engine.add_rule("later-blocked.example", "block", list_name="Manual")
+    blocked = engine.check("later-blocked.example")
+
+    assert clean.action == "ALLOW"
+    assert clean.reason == "no_match"
+    assert blocked.action == "BLOCK"
+    assert blocked.reason == "exact_block"

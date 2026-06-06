@@ -1,5 +1,6 @@
 import re
 import ipaddress
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Optional, Pattern
 
@@ -50,6 +51,88 @@ class DomainSuffixTrie:
         return best
 
 
+class RegexIndex:
+    def __init__(self):
+        self.rules: list[tuple[Pattern, str]] = []
+        self.literal_buckets: dict[str, list[int]] = {}
+        self.fallback: list[int] = []
+
+    def add(self, pattern: Pattern, raw: str) -> None:
+        idx = len(self.rules)
+        self.rules.append((pattern, raw))
+
+        literals = self._extract_required_literals(raw)
+        if not literals:
+            self.fallback.append(idx)
+            return
+
+        for lit in literals:
+            self.literal_buckets.setdefault(lit, []).append(idx)
+
+    def candidates(self, domain: str):
+        labels = set(domain.split("."))
+        tokens = labels | self._domain_ngrams(domain)
+
+        seen: set[int] = set()
+        for token in tokens:
+            for idx in self.literal_buckets.get(token, ()):
+                if idx not in seen:
+                    seen.add(idx)
+                    yield self.rules[idx]
+
+        for idx in self.fallback:
+            if idx not in seen:
+                yield self.rules[idx]
+
+    def fallback_ratio(self) -> float:
+        return len(self.fallback) / max(1, len(self))
+
+    def __len__(self) -> int:
+        return len(self.rules)
+
+    @staticmethod
+    def _domain_ngrams(domain: str) -> set[str]:
+        parts = domain.split(".")
+        out = set()
+        for i in range(len(parts)):
+            joined = ".".join(parts[i:])
+            if len(joined) >= 4:
+                out.add(joined)
+        return out
+
+    @staticmethod
+    def _extract_required_literals(raw_rule: str) -> set[str]:
+        pattern = raw_rule[1:-1] if raw_rule.startswith("/") and raw_rule.endswith("/") else raw_rule
+        pattern = pattern.lower()
+
+        # Alternation and optional pieces make literal extraction unsafe without
+        # a full regex parser, so keep those rules on the conservative path.
+        if "|" in pattern or "?" in pattern:
+            return set()
+
+        pattern = pattern.replace(r"\.", ".")
+        chunks = re.split(r"[\\\[\]\(\)\{\}\^\$\*\+\|]+", pattern)
+
+        ignored = {"com", "net", "org", "de", "www", "http", "https", "example", "invalid", "local"}
+        literals = set()
+
+        for chunk in chunks:
+            chunk = chunk.strip(".-_")
+            if len(chunk) < 4:
+                continue
+            if chunk in ignored:
+                continue
+            if not re.fullmatch(r"[a-z0-9._-]+", chunk):
+                continue
+
+            literals.add(chunk)
+            for label in chunk.split("."):
+                if len(label) >= 4 and label not in ignored:
+                    literals.add(label)
+
+        return set(sorted(literals, key=len, reverse=True)[:3])
+
+
 class FilterEngine:
     def __init__(self):
         self.exact_block: set[str] = set()
@@ -58,8 +141,8 @@ class FilterEngine:
         self.suffix_allow: set[str] = set()
         self.suffix_block_trie = DomainSuffixTrie()
         self.suffix_allow_trie = DomainSuffixTrie()
-        self.regex_block: list[tuple[Pattern, str]] = []
-        self.regex_allow: list[tuple[Pattern, str]] = []
+        self.regex_block = RegexIndex()
+        self.regex_allow = RegexIndex()
         self.rewrite_map: dict[str, str] = {}
         self.rewrite_wildcard: dict[str, str] = {}
         self.rewrite_domain_type: dict[str, str] = {}
@@ -70,6 +153,9 @@ class FilterEngine:
         self.profile_safesearch: dict[int, list[str]] = {}
         self.profile_youtube_restricted: dict[int, bool] = {}
         self.profile_blocked_services: dict[int, set[str]] = {}
+        self._negative_cache: OrderedDict[tuple[str, Optional[int]], FilterResult] = OrderedDict()
+        self._negative_cache_max = 50000
+        self._rules_generation = 0
 
     def _ensure_profile(self, profile_id: int) -> dict:
         if profile_id not in self.profiles:
@@ -80,8 +166,8 @@ class FilterEngine:
                 "suffix_allow": set(),
                 "suffix_block_trie": DomainSuffixTrie(),
                 "suffix_allow_trie": DomainSuffixTrie(),
-                "regex_block": [],
-                "regex_allow": [],
+                "regex_block": RegexIndex(),
+                "regex_allow": RegexIndex(),
                 "rewrite_map": {},
                 "rewrite_wildcard": {},
                 "pattern_sources": {},
@@ -98,7 +184,61 @@ class FilterEngine:
                 p["suffix_allow_trie"] = DomainSuffixTrie()
                 for suffix in p.get("suffix_allow", set()):
                     p["suffix_allow_trie"].add(suffix, suffix)
+            self._ensure_profile_regex_indexes(p)
         return self.profiles[profile_id]
+
+    @staticmethod
+    def _ensure_profile_regex_indexes(p: dict) -> None:
+        if isinstance(p.get("regex_block"), list):
+            idx = RegexIndex()
+            for compiled, raw in p["regex_block"]:
+                idx.add(compiled, raw)
+            p["regex_block"] = idx
+        if isinstance(p.get("regex_allow"), list):
+            idx = RegexIndex()
+            for compiled, raw in p["regex_allow"]:
+                idx.add(compiled, raw)
+            p["regex_allow"] = idx
+
+    def _bump_generation(self) -> None:
+        self._rules_generation += 1
+        self._negative_cache.clear()
+
+    def _negative_cache_get(self, domain: str, profile_id: Optional[int]) -> Optional[FilterResult]:
+        key = (domain, profile_id)
+        result = self._negative_cache.get(key)
+        if result is not None:
+            self._negative_cache.move_to_end(key)
+        return result
+
+    def _negative_cache_put(self, domain: str, profile_id: Optional[int], result: FilterResult) -> None:
+        key = (domain, profile_id)
+        self._negative_cache[key] = result
+        self._negative_cache.move_to_end(key)
+        if len(self._negative_cache) > self._negative_cache_max:
+            self._negative_cache.popitem(last=False)
+
+    def regex_index_stats(self) -> dict:
+        global_total = len(self.regex_allow) + len(self.regex_block)
+        global_fallback = len(self.regex_allow.fallback) + len(self.regex_block.fallback)
+        profile_total = 0
+        profile_fallback = 0
+        for profile in self.profiles.values():
+            self._ensure_profile_regex_indexes(profile)
+            profile_total += len(profile["regex_allow"]) + len(profile["regex_block"])
+            profile_fallback += len(profile["regex_allow"].fallback) + len(profile["regex_block"].fallback)
+        total = global_total + profile_total
+        fallback = global_fallback + profile_fallback
+        ratio = fallback / max(1, total)
+        warning = ""
+        if ratio > 0.10:
+            warning = "High regex fallback ratio: many regex rules cannot be indexed and may slow clean misses."
+        return {
+            "regex_rules": total,
+            "regex_fallback_rules": fallback,
+            "regex_fallback_ratio": ratio,
+            "warning": warning,
+        }
 
     def normalize_domain(self, domain: str) -> str:
         domain = domain.strip().lower()
@@ -123,6 +263,7 @@ class FilterEngine:
             return
 
         is_allow = rule.startswith("@@") or rule_type == "allow"
+        self._bump_generation()
 
         if rule.startswith("@@"):
             rule = rule[2:].strip()
@@ -199,12 +340,15 @@ class FilterEngine:
 
     def set_profile_safesearch(self, profile_id: int, engines: list[str]) -> None:
         self.profile_safesearch[profile_id] = engines
+        self._bump_generation()
 
     def set_profile_youtube_restricted(self, profile_id: int, enabled: bool) -> None:
         self.profile_youtube_restricted[profile_id] = enabled
+        self._bump_generation()
 
     def set_profile_blocked_services(self, profile_id: int, services: set[str]) -> None:
         self.profile_blocked_services[profile_id] = services
+        self._bump_generation()
 
     def check(self, domain: str, filtering_enabled: bool = True, profile_id: Optional[int] = None) -> FilterResult:
         domain = self.normalize_domain(domain)
@@ -213,6 +357,10 @@ class FilterEngine:
 
         if not filtering_enabled:
             return FilterResult("ALLOW", "client_filtering_disabled", matched_rule="filtering_disabled")
+
+        cached_negative = self._negative_cache_get(domain, profile_id)
+        if cached_negative is not None:
+            return cached_negative
 
         if profile_id and profile_id in self.profiles:
             p = self.profiles[profile_id]
@@ -259,7 +407,9 @@ class FilterEngine:
             if result:
                 return result
 
-        return FilterResult("ALLOW", "no_match")
+        result = FilterResult("ALLOW", "no_match")
+        self._negative_cache_put(domain, profile_id, result)
+        return result
 
     def explain(self, domain: str, filtering_enabled: bool = True, profile_id: Optional[int] = None) -> dict:
         original = domain
@@ -345,7 +495,7 @@ class FilterEngine:
         matched = self._suffix_match(domain, p["suffix_allow"], p.get("suffix_allow_trie"))
         if matched:
             return FilterResult("ALLOW", "profile_suffix_allow", matched, matched_rule=matched, list_name=self._profile_source(p, matched))
-        for pattern, raw in p["regex_allow"]:
+        for pattern, raw in p["regex_allow"].candidates(domain):
             if pattern.search(domain):
                 return FilterResult("ALLOW", "profile_regex_allow", raw, matched_rule=raw, list_name=self._profile_source(p, raw))
         return None
@@ -356,7 +506,7 @@ class FilterEngine:
         matched = self._suffix_match(domain, self.suffix_allow, self.suffix_allow_trie)
         if matched:
             return FilterResult("ALLOW", "suffix_allow", matched, matched_rule=matched, list_name=self._source(matched))
-        for pattern, raw in self.regex_allow:
+        for pattern, raw in self.regex_allow.candidates(domain):
             if pattern.search(domain):
                 return FilterResult("ALLOW", "regex_allow", raw, matched_rule=raw, list_name=self._source(raw))
         return None
@@ -367,7 +517,7 @@ class FilterEngine:
         matched = self._suffix_match(domain, p["suffix_block"], p.get("suffix_block_trie"))
         if matched:
             return FilterResult("BLOCK", "profile_suffix_block", matched, matched_rule=matched, list_name=self._profile_source(p, matched))
-        for pattern, raw in p["regex_block"]:
+        for pattern, raw in p["regex_block"].candidates(domain):
             if pattern.search(domain):
                 return FilterResult("BLOCK", "profile_regex_block", raw, matched_rule=raw, list_name=self._profile_source(p, raw))
         return None
@@ -378,7 +528,7 @@ class FilterEngine:
         matched = self._suffix_match(domain, self.suffix_block, self.suffix_block_trie)
         if matched:
             return FilterResult("BLOCK", "suffix_block", matched, matched_rule=matched, list_name=self._source(matched))
-        for pattern, raw in self.regex_block:
+        for pattern, raw in self.regex_block.candidates(domain):
             if pattern.search(domain):
                 return FilterResult("BLOCK", "regex_block", raw, matched_rule=raw, list_name=self._source(raw))
         return None
@@ -453,6 +603,8 @@ class FilterEngine:
         return self.suffix_allow_trie if is_allow else self.suffix_block_trie
 
     def _add_regex_rule(self, rule: str, is_allow: bool, list_name: str = "", profile_id: Optional[int] = None) -> None:
+        if self._try_demote_regex_to_domain_rule(rule, is_allow, list_name, profile_id):
+            return
         pattern = rule[1:-1]
         try:
             compiled = re.compile(pattern, re.IGNORECASE)
@@ -462,12 +614,30 @@ class FilterEngine:
         if profile_id:
             p = self._ensure_profile(profile_id)
             target = p["regex_allow"] if is_allow else p["regex_block"]
-            target.append((compiled, rule))
+            target.add(compiled, rule)
             self._profile_track_source(profile_id, rule, list_name)
         else:
             target = self.regex_allow if is_allow else self.regex_block
-            target.append((compiled, rule))
+            target.add(compiled, rule)
             self._track_source(rule, list_name)
+
+    def _try_demote_regex_to_domain_rule(self, rule: str, is_allow: bool, list_name: str, profile_id: Optional[int]) -> bool:
+        pattern = rule[1:-1]
+        p = pattern.lower()
+
+        exact = re.fullmatch(r"\^([a-z0-9_-]+(?:\\\.[a-z0-9_-]+)+)\$", p)
+        if exact:
+            domain = exact.group(1).replace(r"\.", ".")
+            self.add_rule(domain, "allow" if is_allow else "block", list_name, profile_id)
+            return True
+
+        suffix = re.fullmatch(r"\(\^\|\\\.\)([a-z0-9_-]+(?:\\\.[a-z0-9_-]+)+)\$", p)
+        if suffix:
+            domain = suffix.group(1).replace(r"\.", ".")
+            self.add_rule("||" + domain + "^", "allow" if is_allow else "block", list_name, profile_id)
+            return True
+
+        return False
 
     def _add_rewrite_rule(self, rule: str, list_name: str = "", profile_id: Optional[int] = None) -> None:
         if "->" in rule:
@@ -565,6 +735,7 @@ class FilterEngine:
     def clear_profile(self, profile_id: int) -> None:
         if profile_id in self.profiles:
             del self.profiles[profile_id]
+            self._bump_generation()
 
     def list_profiles(self) -> list[int]:
         return list(self.profiles.keys())

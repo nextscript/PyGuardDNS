@@ -6689,6 +6689,7 @@ def handle_restore_data(data):
 def collect_metrics():
     summary = stats_summary()
     cache_stats_data = cache_stats()
+    regex_stats = get_filter_engine().regex_index_stats()
     dot_metrics = dot_pool_metrics()
     queue_metrics = upstream_queue_wait_metrics()
     dnssec_metrics = get_dnssec_metrics()
@@ -6704,6 +6705,7 @@ def collect_metrics():
         "active_clients": summary.get("clients", 0),
         "filter_rules": summary.get("rules", 0),
         "active_upstreams": summary.get("upstreams", 0),
+        **regex_stats,
         "cache_entries": cache_stats_data.get("entries", 0),
         "cache_bytes": cache_stats_data.get("bytes_used", 0),
         "dnssec_secure": dnssec_metrics.get("secure", 0),
@@ -7872,6 +7874,18 @@ class WebHandler(BaseHTTPRequestHandler):
             "# TYPE localdnsguard_filter_rules gauge",
             f"localdnsguard_filter_rules {m['filter_rules']}",
             "",
+            "# HELP pyguarddns_regex_rules Regex rules loaded into the filter engine",
+            "# TYPE pyguarddns_regex_rules gauge",
+            f"pyguarddns_regex_rules {m['regex_rules']}",
+            "",
+            "# HELP pyguarddns_regex_fallback_rules Regex rules that could not be indexed by required literals",
+            "# TYPE pyguarddns_regex_fallback_rules gauge",
+            f"pyguarddns_regex_fallback_rules {m['regex_fallback_rules']}",
+            "",
+            "# HELP pyguarddns_regex_fallback_ratio Ratio of regex rules on the fallback scan path",
+            "# TYPE pyguarddns_regex_fallback_ratio gauge",
+            f"pyguarddns_regex_fallback_ratio {m['regex_fallback_ratio']}",
+            "",
             "# HELP localdnsguard_active_upstreams Healthy upstream resolvers",
             "# TYPE localdnsguard_active_upstreams gauge",
             f"localdnsguard_active_upstreams {m['active_upstreams']}",
@@ -7986,6 +8000,7 @@ class WebHandler(BaseHTTPRequestHandler):
             validator = get_dnssec_validator()
             dnssec_anchor = validator.trust_anchor_info() if validator else {}
             dnssec_metrics = get_dnssec_metrics()
+            regex_stats = get_filter_engine().regex_index_stats()
             self.send_json({
                 "app": APP_NAME, "dns": {"host": DNS_HOST, "port": DNS_PORT},
                 "web": {"host": WEB_HOST, "port": WEB_PORT},
@@ -8034,6 +8049,10 @@ class WebHandler(BaseHTTPRequestHandler):
                     "validation_seconds_total": dnssec_metrics.get("validation_seconds_total", 0.0),
                 },
                 "summary": stats_summary(),
+                "filter_engine": {
+                    "regex_index": regex_stats,
+                    "warnings": [regex_stats["warning"]] if regex_stats.get("warning") else [],
+                },
                 "upstream_health": upstream_health,
                 "healthcheck_last_run": hc_last,
             })
