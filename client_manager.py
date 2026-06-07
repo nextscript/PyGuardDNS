@@ -159,37 +159,44 @@ def now_iso() -> str:
 
 
 class ClientManager:
-    def __init__(self, db, reload_callback=None):
+    def __init__(self, db, reload_callback=None, db_lock=None):
         self.db = db
         self.reload_callback = reload_callback
-        self._lock = threading.Lock()
+        # Share the caller's lock (the same one guarding `db`'s connection
+        # elsewhere) so concurrent cursor use on the shared SQLite connection
+        # can't corrupt row state. Falls back to a private lock for callers
+        # (e.g. tests) that pass an isolated connection.
+        self._lock = db_lock if db_lock is not None else threading.Lock()
 
     def init_schema(self):
-        self.db.executescript(PROFILE_SCHEMA_SQL)
-        self.db.commit()
+        with self._lock:
+            self.db.executescript(PROFILE_SCHEMA_SQL)
+            self.db.commit()
         self._ensure_default_profile()
         self._ensure_existing_clients_have_profiles()
 
     def _ensure_default_profile(self):
-        existing = self.db.execute("SELECT id FROM profiles WHERE is_default=1").fetchone()
-        if not existing:
-            now = now_iso()
-            self.db.execute(
-                "INSERT INTO profiles(name,description,is_default,filtering_enabled,safe_search_google,safe_search_bing,safe_search_ddg,youtube_restricted,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                ("Default", "Default profile for all clients", 1, 1, 0, 0, 0, 0, now, now),
-            )
-            self.db.commit()
+        with self._lock:
+            existing = self.db.execute("SELECT id FROM profiles WHERE is_default=1").fetchone()
+            if not existing:
+                now = now_iso()
+                self.db.execute(
+                    "INSERT INTO profiles(name,description,is_default,filtering_enabled,safe_search_google,safe_search_bing,safe_search_ddg,youtube_restricted,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    ("Default", "Default profile for all clients", 1, 1, 0, 0, 0, 0, now, now),
+                )
+                self.db.commit()
 
     def _ensure_existing_clients_have_profiles(self):
-        default = self.db.execute("SELECT id FROM profiles WHERE is_default=1").fetchone()
-        if not default:
-            return
-        default_id = default["id"]
-        self.db.execute(
-            "UPDATE clients SET profile_id=? WHERE profile_id IS NULL",
-            (default_id,),
-        )
-        self.db.commit()
+        with self._lock:
+            default = self.db.execute("SELECT id FROM profiles WHERE is_default=1").fetchone()
+            if not default:
+                return
+            default_id = default["id"]
+            self.db.execute(
+                "UPDATE clients SET profile_id=? WHERE profile_id IS NULL",
+                (default_id,),
+            )
+            self.db.commit()
 
     def _notify(self):
         if self.reload_callback:
@@ -200,12 +207,15 @@ class ClientManager:
     # ------------------------------------------------------------------ #
 
     def get_profiles(self):
-        return [dict(r) for r in self.db.execute(
-            "SELECT * FROM profiles ORDER BY is_default DESC, id ASC"
-        ).fetchall()]
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT * FROM profiles ORDER BY is_default DESC, id ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def get_profile(self, profile_id: int) -> Optional[dict]:
-        row = self.db.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
+        with self._lock:
+            row = self.db.execute("SELECT * FROM profiles WHERE id=?", (profile_id,)).fetchone()
         return dict(row) if row else None
 
     def create_profile(self, name: str, description: str = "", filtering_enabled: bool = True) -> dict:
@@ -247,9 +257,9 @@ class ClientManager:
             return False
         if profile["is_default"]:
             return False
-        default = self.db.execute("SELECT id FROM profiles WHERE is_default=1").fetchone()
-        default_id = default["id"] if default else None
         with self._lock:
+            default = self.db.execute("SELECT id FROM profiles WHERE is_default=1").fetchone()
+            default_id = default["id"] if default else None
             if default_id:
                 self.db.execute("UPDATE clients SET profile_id=? WHERE profile_id=?", (default_id, profile_id))
             else:
@@ -266,10 +276,11 @@ class ClientManager:
         return sorted(SERVICE_DOMAINS.keys())
 
     def get_profile_services(self, profile_id: int):
-        rows = self.db.execute(
-            "SELECT service_name FROM profile_service_blocks WHERE profile_id=? ORDER BY service_name ASC",
-            (profile_id,),
-        ).fetchall()
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT service_name FROM profile_service_blocks WHERE profile_id=? ORDER BY service_name ASC",
+                (profile_id,),
+            ).fetchall()
         return [r["service_name"] for r in rows]
 
     def add_profile_service(self, profile_id: int, service_name: str) -> bool:
@@ -302,12 +313,13 @@ class ClientManager:
     # ------------------------------------------------------------------ #
 
     def get_clients(self):
-        rows = self.db.execute("""
-            SELECT c.*, p.name as profile_name
-            FROM clients c
-            LEFT JOIN profiles p ON p.id = c.profile_id
-            ORDER BY c.id DESC
-        """).fetchall()
+        with self._lock:
+            rows = self.db.execute("""
+                SELECT c.*, p.name as profile_name
+                FROM clients c
+                LEFT JOIN profiles p ON p.id = c.profile_id
+                ORDER BY c.id DESC
+            """).fetchall()
         return [dict(r) for r in rows]
 
     def get_client_by_ip(self, ip: str) -> Optional[dict]:
@@ -315,14 +327,15 @@ class ClientManager:
             client_ip = ipaddress.ip_address(ip)
         except ValueError:
             return None
-        rows = self.db.execute("""
-            SELECT c.*, p.name as profile_name, p.filtering_enabled as profile_filtering,
-                   p.safe_search_google, p.safe_search_bing, p.safe_search_ddg,
-                   p.youtube_restricted
-            FROM clients c
-            LEFT JOIN profiles p ON p.id = c.profile_id
-            ORDER BY c.id ASC
-        """).fetchall()
+        with self._lock:
+            rows = self.db.execute("""
+                SELECT c.*, p.name as profile_name, p.filtering_enabled as profile_filtering,
+                       p.safe_search_google, p.safe_search_bing, p.safe_search_ddg,
+                       p.youtube_restricted
+                FROM clients c
+                LEFT JOIN profiles p ON p.id = c.profile_id
+                ORDER BY c.id ASC
+            """).fetchall()
         for row in rows:
             try:
                 cidr_str = (row["cidr"] or row["ip"] or "").strip()
@@ -339,24 +352,25 @@ class ClientManager:
         return None
 
     def get_client(self, client_id: int) -> Optional[dict]:
-        row = self.db.execute("""
-            SELECT c.*, p.name as profile_name,
-                   p.safe_search_google, p.safe_search_bing, p.safe_search_ddg,
-                   p.youtube_restricted
-            FROM clients c
-            LEFT JOIN profiles p ON p.id = c.profile_id
-            WHERE c.id=?
-        """, (client_id,)).fetchone()
+        with self._lock:
+            row = self.db.execute("""
+                SELECT c.*, p.name as profile_name,
+                       p.safe_search_google, p.safe_search_bing, p.safe_search_ddg,
+                       p.youtube_restricted
+                FROM clients c
+                LEFT JOIN profiles p ON p.id = c.profile_id
+                WHERE c.id=?
+            """, (client_id,)).fetchone()
         return dict(row) if row else None
 
     def create_client(self, ip: str, name: str = "", cidr: str = "", profile_id: Optional[int] = None) -> dict:
         now = now_iso()
         if not name:
             name = ip
-        if profile_id is None:
-            default = self.db.execute("SELECT id FROM profiles WHERE is_default=1").fetchone()
-            profile_id = default["id"] if default else None
         with self._lock:
+            if profile_id is None:
+                default = self.db.execute("SELECT id FROM profiles WHERE is_default=1").fetchone()
+                profile_id = default["id"] if default else None
             self.db.execute(
                 "INSERT OR REPLACE INTO clients(name,ip,cidr,profile_id,filtering_enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
                 (name, ip, cidr, profile_id, 1, now, now),
@@ -397,10 +411,12 @@ class ClientManager:
     # ------------------------------------------------------------------ #
 
     def get_profile_rules(self, profile_id: int):
-        return [dict(r) for r in self.db.execute(
-            "SELECT * FROM profile_custom_rules WHERE profile_id=? ORDER BY id ASC",
-            (profile_id,)
-        ).fetchall()]
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT * FROM profile_custom_rules WHERE profile_id=? ORDER BY id ASC",
+                (profile_id,)
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def add_profile_rule(self, profile_id: int, action: str, pattern_type: str, pattern: str) -> Optional[dict]:
         if not self.get_profile(profile_id):
@@ -413,15 +429,15 @@ class ClientManager:
             )
             self.db.commit()
             rid = self.db.execute("SELECT last_insert_rowid()").fetchone()[0]
+            row = self.db.execute("SELECT * FROM profile_custom_rules WHERE id=?", (rid,)).fetchone()
         self._notify()
-        row = self.db.execute("SELECT * FROM profile_custom_rules WHERE id=?", (rid,)).fetchone()
         return dict(row) if row else None
 
     def delete_profile_rule(self, rule_id: int) -> bool:
-        row = self.db.execute("SELECT * FROM profile_custom_rules WHERE id=?", (rule_id,)).fetchone()
-        if not row:
-            return False
         with self._lock:
+            row = self.db.execute("SELECT * FROM profile_custom_rules WHERE id=?", (rule_id,)).fetchone()
+            if not row:
+                return False
             self.db.execute("DELETE FROM profile_custom_rules WHERE id=?", (rule_id,))
             self.db.commit()
         self._notify()
@@ -432,13 +448,15 @@ class ClientManager:
     # ------------------------------------------------------------------ #
 
     def get_profile_blocklists(self, profile_id: int):
-        return [dict(r) for r in self.db.execute("""
-            SELECT pb.*, bl.name, bl.list_type, bl.rule_count, bl.enabled
-            FROM profile_blocklists pb
-            JOIN blocklists bl ON bl.id = pb.blocklist_id
-            WHERE pb.profile_id=?
-            ORDER BY bl.name ASC
-        """, (profile_id,)).fetchall()]
+        with self._lock:
+            rows = self.db.execute("""
+                SELECT pb.*, bl.name, bl.list_type, bl.rule_count, bl.enabled
+                FROM profile_blocklists pb
+                JOIN blocklists bl ON bl.id = pb.blocklist_id
+                WHERE pb.profile_id=?
+                ORDER BY bl.name ASC
+            """, (profile_id,)).fetchall()
+        return [dict(r) for r in rows]
 
     def add_blocklist_to_profile(self, profile_id: int, blocklist_id: int) -> bool:
         if not self.get_profile(profile_id):

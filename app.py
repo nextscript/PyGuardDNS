@@ -735,6 +735,7 @@ def init_db():
         }
         for key, value in defaults.items():
             db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, value))
+        _invalidate_settings_cache()
         load_runtime_network_settings()
         if not db.execute("SELECT 1 FROM settings WHERE key=?", (API_TOKEN_SETTING,)).fetchone():
             token = secrets.token_urlsafe(32)
@@ -752,7 +753,7 @@ def init_db():
             _set_blocklist_dns_resolver(resolve_via_configured_dns)
         global client_manager
         if client_manager is None:
-            client_manager = ClientManager(db, reload_callback=reload_filter_engine)
+            client_manager = ClientManager(db, reload_callback=reload_filter_engine, db_lock=db_lock)
             client_manager.init_schema()
         if not db.execute("SELECT 1 FROM upstreams WHERE enabled=1").fetchone():
             db.execute(
@@ -931,19 +932,44 @@ def discover_system_dns_servers():
     return servers
 
 
+_settings_cache = {}
+_settings_cache_lock = threading.RLock()
+_SETTING_MISSING = object()
+
+
+def _invalidate_settings_cache(key=None):
+    with _settings_cache_lock:
+        if key is None:
+            _settings_cache.clear()
+        else:
+            _settings_cache.pop(key, None)
+
+
 def get_setting(key, default=""):
+    with _settings_cache_lock:
+        cached = _settings_cache.get(key, _SETTING_MISSING)
+    if cached is not _SETTING_MISSING:
+        return cached
     with db_lock:
         row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    return row["value"] if row else default
+    if row is None:
+        return default
+    value = row["value"]
+    with _settings_cache_lock:
+        _settings_cache[key] = value
+    return value
 
 
 def set_setting(key, value):
+    value = str(value)
     with db_lock:
         db.execute(
             "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, str(value)),
+            (key, value),
         )
         db.commit()
+    with _settings_cache_lock:
+        _settings_cache[key] = value
 
 
 def parse_port(value, default, name):
@@ -1279,11 +1305,13 @@ def _healthcheck_worker_pass():
 
 
 def rows(query, params=()):
-    return [dict(r) for r in db.execute(query, params).fetchall()]
+    with db_lock:
+        return [dict(r) for r in db.execute(query, params).fetchall()]
 
 
 def one(query, params=()):
-    row = db.execute(query, params).fetchone()
+    with db_lock:
+        row = db.execute(query, params).fetchone()
     return dict(row) if row else None
 
 
@@ -1574,9 +1602,9 @@ def ensure_client(client_ip):
         pass
 
 
-def client_filtering_enabled(client_ip):
+def client_filtering_enabled(client_ip, client_info=None):
     if client_manager is not None:
-        c = client_manager.get_client_by_ip(client_ip)
+        c = client_info if client_info is not None else client_manager.get_client_by_ip(client_ip)
         if c:
             client_enabled = bool(c.get("filtering_enabled", 1))
             profile_enabled = bool(c.get("profile_filtering", 1))
@@ -3289,18 +3317,18 @@ def detect_upstream(resolver):
     return result
 
 
-def decide(domain, qtype_name, client_ip):
+def decide(domain, qtype_name, client_ip, client_info=None):
     normalized = normalize_domain(domain)
     if not is_lan_allowed(client_ip):
         return {"status": "refused", "action": "refuse", "rule": "access control", "reason": "client not allowed"}
-    filtering_on = get_setting("filtering_enabled", "1") == "1" and client_filtering_enabled(client_ip)
 
     profile_id = None
-    client_info = None
-    if client_manager is not None:
+    if client_info is None and client_manager is not None:
         client_info = client_manager.get_client_by_ip(client_ip)
-        if client_info:
-            profile_id = client_info.get("profile_id")
+    if client_info:
+        profile_id = client_info.get("profile_id")
+
+    filtering_on = get_setting("filtering_enabled", "1") == "1" and client_filtering_enabled(client_ip, client_info=client_info)
 
     engine = get_filter_engine()
     result = engine.check(normalized, filtering_enabled=filtering_on, profile_id=profile_id)
@@ -3894,7 +3922,7 @@ def handle_dns_request(request, client_ip, connection_type=""):
             log_query(client_ip, domain, normalized, qtype_name, "local", matched_rule="local reverse", cache_status="local", reason="local reverse lookup", duration_ms=(time.perf_counter() - started) * 1000, client_name=client_log_name, profile_name=client_profile_name, connection_type=connection_type)
             return response
 
-        decision = decide(normalized, qtype_name, client_ip)
+        decision = decide(normalized, qtype_name, client_ip, client_info=client_info)
         dc = decision.get("client_name", "")
         dp = decision.get("profile_name", "")
 
@@ -3928,7 +3956,7 @@ def handle_dns_request(request, client_ip, connection_type=""):
             forwarding_request = add_do_bit_to_query(request)
         response, upstream = forward_query(forwarding_request)
         response = apply_ipv6_disabled_policy(response)
-        filtering_on = get_setting("filtering_enabled", "1") == "1" and client_filtering_enabled(client_ip)
+        filtering_on = get_setting("filtering_enabled", "1") == "1" and client_filtering_enabled(client_ip, client_info=client_info)
         profile_id = decision.get("profile_id")
         engine = get_filter_engine()
 
@@ -7378,6 +7406,7 @@ def handle_restore_data(data):
         settings_rows = [r for r in data.get("settings", []) if r.get("key") not in skip_settings]
         for row in settings_rows:
             db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (row["key"], row["value"]))
+        _invalidate_settings_cache()
         counts["settings"] = len(settings_rows)
         db.execute("DELETE FROM rules")
         rule_rows = [row for row in data.get("rules", []) if row.get("action") != "rewrite"]
@@ -8400,6 +8429,7 @@ class WebHandler(BaseHTTPRequestHandler):
             if not user:
                 db.execute("INSERT INTO users(username,password_hash,created_at) VALUES(?,?,?)", ("admin", hash_password(password), now_iso()))
                 db.execute("UPDATE settings SET value='1' WHERE key='admin_password_set'")
+                _invalidate_settings_cache("admin_password_set")
                 db.commit()
                 user = db.execute("SELECT * FROM users WHERE username='admin'").fetchone()
             if user and verify_password(password, user["password_hash"]):
@@ -8550,6 +8580,7 @@ class WebHandler(BaseHTTPRequestHandler):
             settings_rows = [r for r in data.get("settings", []) if r.get("key") not in skip_settings]
             for row in settings_rows:
                 db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (row["key"], row["value"]))
+            _invalidate_settings_cache()
             counts["settings"] = len(settings_rows)
 
             db.execute("DELETE FROM rules")
