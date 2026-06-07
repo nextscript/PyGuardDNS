@@ -9,6 +9,7 @@ import io
 import ipaddress
 import json
 import os
+import queue
 import random
 import re
 import secrets
@@ -27,6 +28,7 @@ import traceback
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import MappingProxyType
 from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import urlopen
 
@@ -60,6 +62,32 @@ class FormData(dict):
 
     def get_all(self, key):
         return list(self._all.get(key, []))
+
+
+class TTLSet:
+    """Thread-safe "seen recently" set with a fixed TTL per entry.
+
+    Used to dedupe unknown-client events so a single noisy IP queues at most
+    one registration event per TTL window, instead of one per DNS query.
+    """
+
+    def __init__(self, ttl_seconds, max_entries=20000):
+        self._ttl = ttl_seconds
+        self._max_entries = max_entries
+        self._expires = {}
+        self._lock = threading.Lock()
+
+    def add_if_absent(self, item):
+        """Record `item` and return True, unless it was already seen within the TTL (then False)."""
+        now = time.monotonic()
+        with self._lock:
+            expires_at = self._expires.get(item)
+            if expires_at is not None and expires_at > now:
+                return False
+            self._expires[item] = now + self._ttl
+            if len(self._expires) > self._max_entries:
+                self._expires = {k: v for k, v in self._expires.items() if v > now}
+            return True
 
 
 memory_db_dirty = threading.Event()
@@ -160,6 +188,58 @@ _healthcheck_lock = threading.Lock()
 
 _active_engine = FilterEngine()
 _active_engine_lock = threading.RLock()
+
+# RAM snapshot of clients/profiles for the DNS hot path (see build_client_snapshot).
+# Replaced wholesale (atomic reference swap) after client/profile changes -
+# readers never block on a rebuild and never touch SQLite directly.
+_empty_client_snapshot = {"by_ip": MappingProxyType({}), "networks": (), "default_profile": None}
+_client_snapshot = _empty_client_snapshot
+_client_snapshot_lock = threading.RLock()
+_client_snapshot_generation = 0
+
+# Async unknown-client registration: the DNS hot path only enqueues an IP
+# (deduped via TTL, at most one event per IP per window) - a background
+# worker performs the actual SQLite insert and triggers a snapshot reload.
+unknown_client_queue = queue.Queue(maxsize=10000)
+unknown_client_seen = TTLSet(ttl_seconds=300)
+unknown_client_dropped_total = 0
+unknown_client_dropped_lock = threading.Lock()
+
+# Lightweight DNS hot-path runtime counters (see get_runtime_metrics / spec
+# task 8). Plain dict + lock - increments are rare-contention single-key
+# updates, not a bottleneck compared to the DNS work itself.
+_filter_engine_generation = 0
+dns_runtime_metrics_lock = threading.Lock()
+dns_runtime_metrics = {
+    "dns_requests_total": 0,
+    "dns_cache_hits_total": 0,
+    "dns_cache_misses_total": 0,
+    "dns_filter_blocks_total": 0,
+    "dns_filter_allows_total": 0,
+    "dns_upstream_errors_total": 0,
+    "query_log_dropped_total": 0,
+}
+
+
+def bump_runtime_metric(name, amount=1):
+    with dns_runtime_metrics_lock:
+        dns_runtime_metrics[name] = dns_runtime_metrics.get(name, 0) + amount
+
+
+def get_runtime_metrics():
+    """Snapshot of all spec-required runtime/queue/generation metrics for
+    /metrics and /api/runtime_metrics."""
+    with dns_runtime_metrics_lock:
+        snapshot = dict(dns_runtime_metrics)
+    with db_write_lock:
+        snapshot["query_log_queue_size"] = len(db_write_queue)
+    snapshot["unknown_client_queue_size"] = unknown_client_queue.qsize()
+    with unknown_client_dropped_lock:
+        snapshot["unknown_client_dropped_total"] = unknown_client_dropped_total
+    snapshot["runtime_snapshot_generation"] = client_snapshot_generation()
+    with _active_engine_lock:
+        snapshot["filter_engine_generation"] = _filter_engine_generation
+    return snapshot
 _dnssec_validator = None
 _dnssec_validator_lock = threading.Lock()
 blocklist_manager = None
@@ -334,15 +414,101 @@ def clear_dnssec_validator():
 
 
 def reload_filter_engine():
-    global _active_engine
+    global _active_engine, _filter_engine_generation
     new_engine = build_filter_engine()
     with _active_engine_lock:
         _active_engine = new_engine
+        _filter_engine_generation += 1
 
 
 def get_filter_engine():
     with _active_engine_lock:
         return _active_engine
+
+
+def build_client_snapshot():
+    """Build an immutable RAM snapshot of clients/profiles for the DNS hot path.
+
+    Mirrors ClientManager.get_client_by_ip's exact-IP-or-CIDR matching, but
+    precomputed offline (no lock held, no SQLite access from readers): exact
+    IP entries land in an O(1) dict, CIDR entries in an ordered tuple that's
+    scanned only on a dict miss.
+    """
+    by_ip = {}
+    networks = []
+    default_profile = None
+    if client_manager is not None:
+        try:
+            for row in client_manager.get_clients_full():
+                cidr_str = (row.get("cidr") or row.get("ip") or "").strip()
+                if not cidr_str:
+                    continue
+                if "/" in cidr_str:
+                    try:
+                        net = ipaddress.ip_network(cidr_str, strict=False)
+                    except ValueError:
+                        continue
+                    networks.append((net, row))
+                else:
+                    by_ip.setdefault(cidr_str, row)
+        except Exception:
+            pass
+        try:
+            for profile in client_manager.get_profiles():
+                if profile.get("is_default"):
+                    default_profile = profile
+                    break
+        except Exception:
+            pass
+    return {
+        "by_ip": MappingProxyType(by_ip),
+        "networks": tuple(networks),
+        "default_profile": default_profile,
+    }
+
+
+def reload_client_snapshot():
+    global _client_snapshot, _client_snapshot_generation
+    new_snapshot = build_client_snapshot()
+    with _client_snapshot_lock:
+        _client_snapshot = new_snapshot
+        _client_snapshot_generation += 1
+
+
+def get_client_snapshot():
+    with _client_snapshot_lock:
+        return _client_snapshot
+
+
+def client_snapshot_generation():
+    with _client_snapshot_lock:
+        return _client_snapshot_generation
+
+
+def lookup_client_snapshot(client_ip):
+    """O(1) exact-IP lookup with CIDR fallback - reads only the RAM snapshot,
+    never SQLite. This is what the DNS hot path should call instead of
+    client_manager.get_client_by_ip()."""
+    snapshot = get_client_snapshot()
+    info = snapshot["by_ip"].get(client_ip)
+    if info is not None:
+        return info
+    try:
+        ip_obj = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return None
+    for net, row in snapshot["networks"]:
+        if ip_obj in net:
+            return row
+    return None
+
+
+def reload_client_state():
+    """Rebuild the filter engine and the client/profile RAM snapshot together -
+    used as ClientManager's reload_callback so client/profile edits propagate
+    to both atomically-swapped caches."""
+    reload_filter_engine()
+    reload_client_snapshot()
 
 
 def crash_filename():
@@ -753,8 +919,9 @@ def init_db():
             _set_blocklist_dns_resolver(resolve_via_configured_dns)
         global client_manager
         if client_manager is None:
-            client_manager = ClientManager(db, reload_callback=reload_filter_engine, db_lock=db_lock)
+            client_manager = ClientManager(db, reload_callback=reload_client_state, db_lock=db_lock)
             client_manager.init_schema()
+            reload_client_snapshot()
         if not db.execute("SELECT 1 FROM upstreams WHERE enabled=1").fetchone():
             db.execute(
                 "INSERT INTO upstreams(name,address,port,resolver,resolver_type,transport,enabled,created_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -1581,28 +1748,80 @@ def backfill_clients_from_querylog():
 
 
 def ensure_client(client_ip):
+    """Register a previously-unseen client IP - asynchronously.
+
+    The DNS hot path must never block on SQLite, so this only does an O(1)
+    RAM-snapshot lookup plus a TTL-deduped queue push. A background worker
+    (unknown_client_worker) performs the actual insert and triggers a
+    snapshot reload so the new client gets picked up.
+    """
     try:
         ipaddress.ip_address(client_ip)
     except ValueError:
         return
+    if lookup_client_snapshot(client_ip) is not None:
+        return
+    if not unknown_client_seen.add_if_absent(client_ip):
+        return
     try:
-        with db_lock:
-            existing = db.execute("SELECT id FROM clients WHERE ip=?", (client_ip,)).fetchone()
-            if existing:
-                return
+        unknown_client_queue.put_nowait(client_ip)
+    except queue.Full:
+        global unknown_client_dropped_total
+        with unknown_client_dropped_lock:
+            unknown_client_dropped_total += 1
+
+
+def unknown_client_worker():
+    """Background worker: batches queued unknown-client IPs into SQLite
+    inserts and reloads the client/profile RAM snapshot when new rows land."""
+    while not server_shutdown_event.is_set():
+        try:
+            ip = unknown_client_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        batch = [ip]
+        while len(batch) < 200:
+            try:
+                batch.append(unknown_client_queue.get_nowait())
+            except queue.Empty:
+                break
+        inserted = False
+        try:
             now = now_iso()
-            db.execute(
-                "INSERT OR IGNORE INTO clients(name,ip,cidr,filtering_enabled,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-                (client_ip, client_ip, "", 1, now, now),
-            )
-            db.commit()
-    except Exception:
-        pass
+            with db_lock:
+                for client_ip in batch:
+                    try:
+                        existing = db.execute("SELECT id FROM clients WHERE ip=?", (client_ip,)).fetchone()
+                        if existing:
+                            continue
+                        db.execute(
+                            "INSERT OR IGNORE INTO clients(name,ip,cidr,filtering_enabled,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                            (client_ip, client_ip, "", 1, now, now),
+                        )
+                        inserted = True
+                    except sqlite3.IntegrityError:
+                        # UNIQUE(ip) race: another writer (or a previous batch
+                        # entry for the same IP) already inserted this client.
+                        pass
+                db.commit()
+        except Exception:
+            with open("web-error.log", "a", encoding="utf-8") as log:
+                log.write(f"{now_iso()} unknown_client_worker\n{traceback.format_exc()}\n")
+            continue
+        if inserted:
+            try:
+                reload_client_snapshot()
+            except Exception:
+                pass
+
+
+def start_unknown_client_worker():
+    threading.Thread(target=unknown_client_worker, name="unknown-client-worker", daemon=True).start()
 
 
 def client_filtering_enabled(client_ip, client_info=None):
     if client_manager is not None:
-        c = client_info if client_info is not None else client_manager.get_client_by_ip(client_ip)
+        c = client_info if client_info is not None else lookup_client_snapshot(client_ip)
         if c:
             client_enabled = bool(c.get("filtering_enabled", 1))
             profile_enabled = bool(c.get("profile_filtering", 1))
@@ -1646,6 +1865,7 @@ def invalidate_rules_cache(reload_now: bool = True):
         rules_cache = None
     if reload_now:
         reload_filter_engine()
+        reload_client_snapshot()
         clear_dns_cache()
 
 
@@ -3321,8 +3541,8 @@ def decide(domain, qtype_name, client_ip, client_info=None):
         return {"status": "refused", "action": "refuse", "rule": "access control", "reason": "client not allowed"}
 
     profile_id = None
-    if client_info is None and client_manager is not None:
-        client_info = client_manager.get_client_by_ip(client_ip)
+    if client_info is None:
+        client_info = lookup_client_snapshot(client_ip)
     if client_info:
         profile_id = client_info.get("profile_id")
 
@@ -3810,8 +4030,12 @@ def log_query(client_ip, domain, normalized, qtype_name, status, response_ips=""
         return
     with db_write_lock:
         if len(db_write_queue) >= 20000:
-            return
-        db_write_queue.append((now_iso(), client_ip or "", domain or "", normalized or "", qtype_name or "", status or "", response_ips or "", upstream or "", connection_type or "", matched_rule or "", cache_status or "miss", blocked or 0, reason or "", matched_list or "", duration_ms or 0, client_name or "", profile_name or ""))
+            full = True
+        else:
+            full = False
+            db_write_queue.append((now_iso(), client_ip or "", domain or "", normalized or "", qtype_name or "", status or "", response_ips or "", upstream or "", connection_type or "", matched_rule or "", cache_status or "miss", blocked or 0, reason or "", matched_list or "", duration_ms or 0, client_name or "", profile_name or ""))
+    if full:
+        bump_runtime_metric("query_log_dropped_total")
 
 
 def db_writer_loop():
@@ -3900,8 +4124,9 @@ def log_query_sync(client_ip, domain, normalized, qtype_name, status, response_i
 
 def handle_dns_request(request, client_ip, connection_type=""):
     started = time.perf_counter()
+    bump_runtime_metric("dns_requests_total")
     ensure_client(client_ip)
-    client_info = client_manager.get_client_by_ip(client_ip) if client_manager else None
+    client_info = lookup_client_snapshot(client_ip)
     client_log_name = client_info.get("name", "") if client_info else ""
     client_profile_name = (client_info.get("profile_name", "") or "") if client_info else ""
     try:
@@ -3929,6 +4154,7 @@ def handle_dns_request(request, client_ip, connection_type=""):
             log_query(client_ip, domain, normalized, qtype_name, "refused", matched_rule=decision["rule"], blocked=1, reason=decision["reason"], duration_ms=(time.perf_counter() - started) * 1000, matched_list=decision.get("filter_list", ""), client_name=dc, profile_name=dp, connection_type=connection_type)
             return response
         if decision["action"] == "block":
+            bump_runtime_metric("dns_filter_blocks_total")
             response = build_block_response(request, qtype_name)
             log_query(client_ip, domain, normalized, qtype_name, "blocked", matched_rule=decision["rule"], blocked=1, reason=decision["reason"], duration_ms=(time.perf_counter() - started) * 1000, matched_list=decision.get("filter_list", ""), client_name=dc, profile_name=dp, connection_type=connection_type)
             return response
@@ -3937,6 +4163,8 @@ def handle_dns_request(request, client_ip, connection_type=""):
             log_query(client_ip, domain, normalized, qtype_name, "rewritten", response_ips=decision["target"], matched_rule=decision["rule"], reason=decision["reason"], duration_ms=(time.perf_counter() - started) * 1000, matched_list=decision.get("filter_list", ""), client_name=dc, profile_name=dp, connection_type=connection_type)
             return response
 
+        bump_runtime_metric("dns_filter_allows_total")
+
         if is_local_nodata_query(qtype_name):
             response = build_empty_response(request)
             log_query(client_ip, domain, normalized, qtype_name, "local", matched_rule="local nodata", cache_status="local", reason="local no data", duration_ms=(time.perf_counter() - started) * 1000, client_name=dc, profile_name=dp, connection_type=connection_type)
@@ -3944,10 +4172,12 @@ def handle_dns_request(request, client_ip, connection_type=""):
 
         cached = get_cached(normalized, qtype_name)
         if cached:
+            bump_runtime_metric("dns_cache_hits_total")
             cached = request[:2] + cached[2:]
             cached = apply_ipv6_disabled_policy(cached)
             log_query(client_ip, domain, normalized, qtype_name, "cached", response_ips=extract_response_ips(cached), cache_status="hit", duration_ms=(time.perf_counter() - started) * 1000, client_name=dc, profile_name=dp, connection_type=connection_type)
             return cached
+        bump_runtime_metric("dns_cache_misses_total")
 
         forwarding_request = request
         if get_setting("dnssec_validation_enabled", "0") == "1":
@@ -3997,6 +4227,7 @@ def handle_dns_request(request, client_ip, connection_type=""):
         for cname in extract_cname_targets(response):
             cname_result = engine.check(cname, filtering_enabled=filtering_on, profile_id=profile_id)
             if cname_result.action == "BLOCK":
+                bump_runtime_metric("dns_filter_blocks_total")
                 blocked_response = build_block_response(request, qtype_name)
                 matched = cname_result.matched_rule or cname_result.matched_domain or cname
                 log_query(client_ip, domain, normalized, qtype_name, "blocked", upstream=upstream,
@@ -4009,6 +4240,7 @@ def handle_dns_request(request, client_ip, connection_type=""):
         log_query(client_ip, domain, normalized, qtype_name, "allowed", response_ips=extract_response_ips(response), upstream=upstream, duration_ms=(time.perf_counter() - started) * 1000, client_name=dc, profile_name=dp, connection_type=connection_type)
         return response
     except Exception as exc:
+        bump_runtime_metric("dns_upstream_errors_total")
         try:
             question = parse_dns_question(request)
             log_query(client_ip, question["domain"], question["normalized_domain"], question["qtype_name"], "upstream_error", reason=str(exc), duration_ms=(time.perf_counter() - started) * 1000, client_name=client_log_name, profile_name=client_profile_name, connection_type=connection_type)
@@ -7555,6 +7787,7 @@ def collect_metrics():
         **dot_metrics,
         **quic_metrics,
         **queue_metrics,
+        **get_runtime_metrics(),
     }
 
 
@@ -8916,6 +9149,54 @@ class WebHandler(BaseHTTPRequestHandler):
             "# HELP pyguarddns_dnssec_retired_root_ksks Retired RFC5011 root KSKs",
             "# TYPE pyguarddns_dnssec_retired_root_ksks gauge",
             f"pyguarddns_dnssec_retired_root_ksks {m['dnssec_retired_ksks']}",
+            "",
+            "# HELP pyguarddns_dns_requests_total DNS requests handled by the hot path",
+            "# TYPE pyguarddns_dns_requests_total counter",
+            f"pyguarddns_dns_requests_total {m['dns_requests_total']}",
+            "",
+            "# HELP pyguarddns_dns_cache_hits_total DNS responses served from the response cache",
+            "# TYPE pyguarddns_dns_cache_hits_total counter",
+            f"pyguarddns_dns_cache_hits_total {m['dns_cache_hits_total']}",
+            "",
+            "# HELP pyguarddns_dns_cache_misses_total DNS responses requiring upstream resolution",
+            "# TYPE pyguarddns_dns_cache_misses_total counter",
+            f"pyguarddns_dns_cache_misses_total {m['dns_cache_misses_total']}",
+            "",
+            "# HELP pyguarddns_dns_filter_blocks_total DNS queries blocked by the filter engine",
+            "# TYPE pyguarddns_dns_filter_blocks_total counter",
+            f"pyguarddns_dns_filter_blocks_total {m['dns_filter_blocks_total']}",
+            "",
+            "# HELP pyguarddns_dns_filter_allows_total DNS queries allowed through the filter engine",
+            "# TYPE pyguarddns_dns_filter_allows_total counter",
+            f"pyguarddns_dns_filter_allows_total {m['dns_filter_allows_total']}",
+            "",
+            "# HELP pyguarddns_dns_upstream_errors_total DNS requests that failed with an upstream/handler error",
+            "# TYPE pyguarddns_dns_upstream_errors_total counter",
+            f"pyguarddns_dns_upstream_errors_total {m['dns_upstream_errors_total']}",
+            "",
+            "# HELP pyguarddns_query_log_dropped_total Query log entries dropped because the async write queue was full",
+            "# TYPE pyguarddns_query_log_dropped_total counter",
+            f"pyguarddns_query_log_dropped_total {m['query_log_dropped_total']}",
+            "",
+            "# HELP pyguarddns_query_log_queue_size Current size of the async query log write queue",
+            "# TYPE pyguarddns_query_log_queue_size gauge",
+            f"pyguarddns_query_log_queue_size {m['query_log_queue_size']}",
+            "",
+            "# HELP pyguarddns_unknown_client_queue_size Current size of the async unknown-client registration queue",
+            "# TYPE pyguarddns_unknown_client_queue_size gauge",
+            f"pyguarddns_unknown_client_queue_size {m['unknown_client_queue_size']}",
+            "",
+            "# HELP pyguarddns_unknown_client_dropped_total Unknown-client registrations dropped because the queue was full",
+            "# TYPE pyguarddns_unknown_client_dropped_total counter",
+            f"pyguarddns_unknown_client_dropped_total {m['unknown_client_dropped_total']}",
+            "",
+            "# HELP pyguarddns_runtime_snapshot_generation Generation counter of the in-RAM client/profile snapshot",
+            "# TYPE pyguarddns_runtime_snapshot_generation counter",
+            f"pyguarddns_runtime_snapshot_generation {m['runtime_snapshot_generation']}",
+            "",
+            "# HELP pyguarddns_filter_engine_generation Generation counter of the active filter engine instance",
+            "# TYPE pyguarddns_filter_engine_generation counter",
+            f"pyguarddns_filter_engine_generation {m['filter_engine_generation']}",
         ]
         body = "\n".join(lines).encode("utf-8")
         self.send_response(200)
@@ -9145,6 +9426,8 @@ class WebHandler(BaseHTTPRequestHandler):
                 self.send_json([])
         elif path == "/api/metrics":
             self.send_json(collect_metrics())
+        elif path == "/api/runtime_metrics":
+            self.send_json(get_runtime_metrics())
         else:
             self.send_json({"error": "not found"}, 404)
 
@@ -10190,6 +10473,9 @@ def main():
         start_db_writer()
         log.write(f"{now_iso()} db writer ready\n")
         log.flush()
+        start_unknown_client_worker()
+        log.write(f"{now_iso()} unknown-client worker ready\n")
+        log.flush()
         threading.Thread(target=db_maintenance_loop, name="db-maintenance", daemon=True).start()
         log.write(f"{now_iso()} db maintenance ready\n")
         log.flush()
@@ -10245,6 +10531,7 @@ def cli_main():
     init_db()
     start_memory_db_sync()
     start_db_writer()
+    start_unknown_client_worker()
 
     if cmd == "status":
         print_console_status()

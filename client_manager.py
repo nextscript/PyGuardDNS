@@ -351,6 +351,24 @@ class ClientManager:
                 continue
         return None
 
+    def get_clients_full(self):
+        """Return all clients joined with their profile's filtering/safe-search flags.
+
+        Used to build the RAM client/profile snapshot for the DNS hot path -
+        mirrors the join `get_client_by_ip` uses so the snapshot carries the
+        same fields callers rely on (profile_filtering, safe_search_*, ...).
+        """
+        with self._lock:
+            rows = self.db.execute("""
+                SELECT c.*, p.name as profile_name, p.filtering_enabled as profile_filtering,
+                       p.safe_search_google, p.safe_search_bing, p.safe_search_ddg,
+                       p.youtube_restricted
+                FROM clients c
+                LEFT JOIN profiles p ON p.id = c.profile_id
+                ORDER BY c.id ASC
+            """).fetchall()
+        return [dict(r) for r in rows]
+
     def get_client(self, client_id: int) -> Optional[dict]:
         with self._lock:
             row = self.db.execute("""
@@ -377,6 +395,7 @@ class ClientManager:
             )
             self.db.commit()
             cid = self.db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self._notify()
         return self.get_client(cid)
 
     def update_client(self, client_id: int, **kwargs) -> Optional[dict]:
@@ -395,6 +414,7 @@ class ClientManager:
                 (name, ip, cidr, profile_id, int(filtering_enabled), now, client_id),
             )
             self.db.commit()
+        self._notify()
         return self.get_client(client_id)
 
     def delete_client(self, client_id: int) -> bool:
@@ -404,6 +424,7 @@ class ClientManager:
         with self._lock:
             self.db.execute("DELETE FROM clients WHERE id=?", (client_id,))
             self.db.commit()
+        self._notify()
         return True
 
     # ------------------------------------------------------------------ #
