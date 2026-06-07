@@ -1305,13 +1305,11 @@ def _healthcheck_worker_pass():
 
 
 def rows(query, params=()):
-    with db_lock:
-        return [dict(r) for r in db.execute(query, params).fetchall()]
+    return [dict(r) for r in db.execute(query, params).fetchall()]
 
 
 def one(query, params=()):
-    with db_lock:
-        row = db.execute(query, params).fetchone()
+    row = db.execute(query, params).fetchone()
     return dict(row) if row else None
 
 
@@ -1587,11 +1585,11 @@ def ensure_client(client_ip):
         ipaddress.ip_address(client_ip)
     except ValueError:
         return
-    existing = one("SELECT id FROM clients WHERE ip=?", (client_ip,))
-    if existing:
-        return
     try:
         with db_lock:
+            existing = db.execute("SELECT id FROM clients WHERE ip=?", (client_ip,)).fetchone()
+            if existing:
+                return
             now = now_iso()
             db.execute(
                 "INSERT OR IGNORE INTO clients(name,ip,cidr,filtering_enabled,created_at,updated_at) VALUES(?,?,?,?,?,?)",
