@@ -747,6 +747,7 @@ def init_db():
                 "UPDATE upstreams SET resolver=?, resolver_type=?, transport=? WHERE id=?",
                 (parsed["resolver"], parsed["type"], parsed["transport"], upstream["id"]),
             )
+        normalize_dnscrypt_relay_upstreams()
         db.execute("UPDATE upstreams SET latency_ms=NULL WHERE last_error<>'' AND latency_ms > 1000")
         backfill_clients_from_querylog()
         db.commit()
@@ -3265,6 +3266,24 @@ def active_dnscrypt_relay():
     return relay
 
 
+def normalize_dnscrypt_relay_upstreams():
+    changed = 0
+    for upstream in db.execute("SELECT id,resolver FROM upstreams WHERE resolver LIKE 'sdns://%'").fetchall():
+        resolver = (upstream["resolver"] or "").strip()
+        if detect_dns_stamp_type(resolver) != "dnscrypt_relay":
+            continue
+        try:
+            parsed = parse_dnscrypt_relay_stamp(resolver)
+        except Exception:
+            continue
+        db.execute(
+            "UPDATE upstreams SET address=?, port=?, resolver_type='dnscrypt_relay', transport='dnscrypt-relay', dnscrypt_relay='' WHERE id=?",
+            (parsed["address"], int(parsed["port"]), upstream["id"]),
+        )
+        changed += 1
+    return changed
+
+
 def plain_upstream_supported(upstream):
     return upstream.get("transport") in ("udp", "tcp") and upstream.get("resolver_type") in ("plain_udp", "plain_udp_host", "plain_tcp", "plain_tcp_host")
 
@@ -3321,6 +3340,24 @@ def test_upstream(upstream_id):
             db.execute("UPDATE upstreams SET latency_ms=NULL, last_error=? WHERE id=?", (str(exc), upstream_id))
             db.commit()
         return {"ok": False, "error": str(exc)}
+
+
+def parse_upstream_form(form):
+    parsed = detect_upstream(form.get("resolver", form.get("address", "")))
+    dnscrypt_relay = form.get("dnscrypt_relay", "").strip()
+    if dnscrypt_relay:
+        relay_detected = detect_upstream(dnscrypt_relay)
+        if relay_detected.get("type") != "dnscrypt_relay":
+            raise ValueError("DNSCrypt Relay must be a relay sdns:// stamp")
+    return {
+        "name": form.get("name", "").strip(),
+        "address": parsed["address"],
+        "port": int(parsed["port"]),
+        "resolver": parsed["resolver"],
+        "resolver_type": parsed["type"],
+        "transport": parsed["transport"],
+        "dnscrypt_relay": dnscrypt_relay if parsed["type"] == "dnscrypt_stamp" else "",
+    }
 
 
 FALLBACK_DOT_DNS = [
@@ -6236,8 +6273,39 @@ def upstreams_page():
             f"<span class='small text-secondary'>{label}</span>"
             f"</label></form>"
         )
+    edit_modals = ""
     def upstream_row(r):
+        nonlocal edit_modals
         rid = r['id']
+        edit_id = f"upstreamEdit-{rid}"
+        enabled_checked = "checked" if r["enabled"] else ""
+        edit_modals += f"""
+<div id="{edit_id}" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="modal-box">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+      <h2 class="h5" style="margin:0">Edit {html_escape(r['name'])}</h2>
+      <button class="btn btn-sm btn-outline-light" type="button" onclick="document.getElementById('{edit_id}').classList.remove('show')" style="border:none;font-size:1.2rem">&times;</button>
+    </div>
+    <form method="post" action="/upstreams/edit">
+      <input type="hidden" name="id" value="{rid}">
+      <label class="form-label">Name</label><input class="form-control mb-2" name="name" value="{html_escape(r['name'])}" required>
+      <label class="form-label">Resolver</label><input class="form-control mb-2" name="resolver" value="{html_escape(r['resolver'] or (r['address'] + ':' + str(r['port'])))}" required>
+      <label class="form-label">DNSCrypt Relay (optional)</label><input class="form-control mb-2" name="dnscrypt_relay" value="{html_escape(r.get('dnscrypt_relay', ''))}" placeholder="sdns://gQ04OS4xMDYuNzguMTA2">
+      <label class="settings-switch mb-3" for="upstream-enabled-{rid}">
+        <span><span class="settings-label">Enabled</span><span class="settings-help">Use this upstream for DNS forwarding.</span></span>
+        <input type="hidden" name="enabled" value="0">
+        <span class="toggle settings-toggle">
+          <input id="upstream-enabled-{rid}" type="checkbox" role="switch" name="enabled" value="1" {enabled_checked}>
+          <span class="toggle-track"></span><span class="toggle-thumb"></span>
+        </span>
+      </label>
+      <div style="display:flex;gap:.5rem;justify-content:flex-end">
+        <button class="btn btn-outline-light" type="button" onclick="document.getElementById('{edit_id}').classList.remove('show')">Cancel</button>
+        <button class="btn btn-success">Save</button>
+      </div>
+    </form>
+  </div>
+</div>"""
         return (
             f"<tr id='upstream-row-{rid}'>"
             f"<td data-label='Name'>{html_escape(r['name'])}</td>"
@@ -6250,6 +6318,7 @@ def upstreams_page():
             f"<td data-label='Error' class='text-secondary' id='upstream-error-{rid}'>{html_escape(r['last_error'])}</td>"
             f"<td data-label='Actions' class='d-flex gap-2'>"
             f"<button class='btn btn-sm btn-outline-light' onclick='testUpstream({rid},this)'>Test</button>"
+            f"<button class='btn btn-sm btn-outline-light' type='button' onclick=\"document.getElementById('{edit_id}').classList.add('show')\">Edit</button>"
             f"<form method='post' action='/upstreams/delete'><input type='hidden' name='id' value='{rid}'><button class='btn btn-sm btn-outline-danger'>Delete</button></form>"
             f"</td></tr>"
         )
@@ -6353,7 +6422,7 @@ async function detectRelay() {{
   }} catch (error) {{}}
 }}
 relayInput.addEventListener('input', detectRelay);
-</script>""", "Upstreams")
+</script>{edit_modals}""", "Upstreams")
 
 
 def settings_page(message="", is_error=False, values=None):
@@ -7947,16 +8016,25 @@ class WebHandler(BaseHTTPRequestHandler):
                     console_event("warn", "Profile delete failed", f"ID {pid} not found or default profile")
             self.redirect("/profiles")
         elif path == "/upstreams/add":
-            parsed = detect_upstream(form.get("resolver", form.get("address", "")))
-            dnscrypt_relay = form.get("dnscrypt_relay", "").strip()
-            if dnscrypt_relay:
-                relay_detected = detect_upstream(dnscrypt_relay)
-                if relay_detected.get("type") != "dnscrypt_relay":
-                    raise ValueError("DNSCrypt Relay must be a relay sdns:// stamp")
+            parsed = parse_upstream_form(form)
             with db_lock:
                 db.execute(
                     "INSERT INTO upstreams(name,address,port,resolver,resolver_type,transport,dnscrypt_relay,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                    (form.get("name", ""), parsed["address"], int(parsed["port"]), parsed["resolver"], parsed["type"], parsed["transport"], dnscrypt_relay if parsed["type"] == "dnscrypt_stamp" else "", now_iso()),
+                    (parsed["name"], parsed["address"], parsed["port"], parsed["resolver"], parsed["resolver_type"], parsed["transport"], parsed["dnscrypt_relay"], now_iso()),
+                )
+                db.commit()
+            self.redirect("/upstreams")
+        elif path == "/upstreams/edit":
+            parsed = parse_upstream_form(form)
+            enabled = 1 if form.get("enabled") == "1" else 0
+            with db_lock:
+                db.execute(
+                    """UPDATE upstreams
+                       SET name=?, address=?, port=?, resolver=?, resolver_type=?, transport=?, dnscrypt_relay=?,
+                           enabled=?, latency_ms=NULL, last_error=''
+                       WHERE id=?""",
+                    (parsed["name"], parsed["address"], parsed["port"], parsed["resolver"], parsed["resolver_type"],
+                     parsed["transport"], parsed["dnscrypt_relay"], enabled, form.get("id")),
                 )
                 db.commit()
             self.redirect("/upstreams")
