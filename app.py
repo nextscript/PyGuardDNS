@@ -137,6 +137,14 @@ upstream_queue_wait_samples = []
 upstream_queue_wait_lock = threading.Lock()
 dot_pools = {}
 dot_pools_lock = threading.RLock()
+quic_sessions = {}
+quic_sessions_lock = threading.RLock()
+_quic_loop = None
+_quic_loop_thread = None
+_quic_loop_lock = threading.Lock()
+QUIC_IDLE_TIMEOUT = 45.0
+MAX_QUIC_FAILURES_BEFORE_PENALTY = 3
+QUIC_PENALTY_COOLDOWN_SECONDS = 120.0
 instance_lock_file = None
 cache_bytes_used = 0
 _upstream_rr_index = 0
@@ -275,10 +283,14 @@ def get_dnssec_validator():
         with _dnssec_validator_lock:
             if _dnssec_validator is None:
                 def dnssec_fetch(request_wire):
-                    response_wire, _ = forward_query(request_wire)
+                    dnssec_timeout = get_timeout_setting("dnssec_validation_timeout", 3.0)
+                    response_wire, _ = forward_query(request_wire, timeout_override=dnssec_timeout)
                     return response_wire
 
-                _dnssec_validator = DNSSECValidator(query_func=dnssec_fetch)
+                _dnssec_validator = DNSSECValidator(
+                    timeout=get_timeout_setting("dnssec_validation_timeout", 3.0),
+                    query_func=dnssec_fetch,
+                )
                 _dnssec_validator.reload_trust_anchor()
     return _dnssec_validator
 
@@ -688,6 +700,12 @@ def init_db():
             "disable_ipv6": "0",
             "upstream_mode": "sequential",
             "upstream_timeout": "2.5",
+            "tcp_connect_timeout": "3.0",
+            "tls_handshake_timeout": "4.0",
+            "dns_query_timeout": "2.5",
+            "dnssec_validation_timeout": "3.0",
+            "doq_total_timeout": "1.8",
+            "doh3_total_timeout": "2.2",
             "block_mode": "zero_ip",
             "block_response_ttl": "60",
             "custom_block_ipv4": "0.0.0.0",
@@ -946,6 +964,17 @@ def parse_positive_float(value, default, name):
     if number <= 0:
         raise ValueError(f"{name} must be greater than 0")
     return number
+
+
+def get_timeout_setting(key, fallback):
+    try:
+        raw = get_setting(key, str(fallback))
+    except sqlite3.Error:
+        return fallback
+    try:
+        return parse_positive_float(raw, fallback, key)
+    except ValueError:
+        return fallback
 
 
 def certificate_matches_name(cert, server_name):
@@ -1747,8 +1776,11 @@ def extract_cname_targets(packet: bytes) -> list[str]:
 
 
 def query_plain_upstream(upstream, request, timeout=2.5):
+    connect_timeout = get_timeout_setting("tcp_connect_timeout", timeout)
+    query_timeout = get_timeout_setting("dns_query_timeout", timeout)
     if upstream.get("transport") == "tcp":
-        with socket.create_connection((upstream["address"], int(upstream["port"])), timeout=timeout) as s:
+        with socket.create_connection((upstream["address"], int(upstream["port"])), timeout=connect_timeout) as s:
+            s.settimeout(query_timeout)
             s.sendall(struct.pack("!H", len(request)) + request)
             header = s.recv(2)
             if len(header) != 2:
@@ -1764,7 +1796,7 @@ def query_plain_upstream(upstream, request, timeout=2.5):
                 remaining -= len(chunk)
             return b"".join(chunks)
     with socket.socket(socket_family_for_host(upstream["address"]), socket.SOCK_DGRAM) as s:
-        s.settimeout(timeout)
+        s.settimeout(query_timeout)
         s.sendto(request, (upstream["address"], int(upstream["port"])))
         response, _ = s.recvfrom(4096)
         return response
@@ -1861,6 +1893,9 @@ def resolve_upstream_host(host):
 
 
 def query_doh_upstream(upstream, request, timeout=4.0):
+    connect_timeout = get_timeout_setting("tcp_connect_timeout", timeout)
+    tls_timeout = get_timeout_setting("tls_handshake_timeout", timeout)
+    query_timeout = get_timeout_setting("dns_query_timeout", timeout)
     host, port, path = doh_request_parts(upstream["resolver"])
     authority = doh_authority(host, port)
     ips = resolve_upstream_host(host)
@@ -1869,12 +1904,12 @@ def query_doh_upstream(upstream, request, timeout=4.0):
         if i > 0:
             time.sleep(0.1)
         try:
-            raw = socket.create_connection((ip, port), timeout=timeout)
+            raw = socket.create_connection((ip, port), timeout=connect_timeout)
             with raw:
-                raw.settimeout(timeout)
+                raw.settimeout(tls_timeout)
                 context = ssl.create_default_context()
                 conn = context.wrap_socket(raw, server_hostname=host)
-                conn.settimeout(timeout)
+                conn.settimeout(query_timeout)
                 with conn:
                     http_request = (
                         f"POST {path} HTTP/1.1\r\n"
@@ -1896,10 +1931,204 @@ def query_doh_upstream(upstream, request, timeout=4.0):
     raise OSError(str(last_error) if last_error else "DoH request failed")
 
 
+def _quic_session_key(protocol_name, upstream):
+    resolver = upstream.get("resolver") or ""
+    return f"{protocol_name}:{upstream.get('id', '')}:{resolver}:{upstream['address']}:{int(upstream.get('port', 0))}"
+
+
+class _QuicSession:
+    def __init__(self, protocol_name, upstream):
+        self.protocol_name = protocol_name
+        self.upstream = dict(upstream)
+        self.lock = None
+        self.ctx = None
+        self.proto = None
+        self.last_used = 0.0
+        self.handshake_count = 0
+        self.reuse_count = 0
+        self.reconnect_count = 0
+        self.error_count = 0
+        self.consecutive_failures = 0
+        self.penalized_until = 0.0
+        self.latencies_ms = []
+        self.ever_connected = False
+
+    def record_latency(self, latency_ms):
+        self.latencies_ms.append(latency_ms)
+        if len(self.latencies_ms) > 50:
+            self.latencies_ms = self.latencies_ms[-25:]
+
+    def is_penalized(self):
+        return self.penalized_until > time.time()
+
+    def record_success(self, latency_ms):
+        self.record_latency(latency_ms)
+        self.consecutive_failures = 0
+        self.penalized_until = 0.0
+
+    def record_failure(self):
+        self.error_count += 1
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= MAX_QUIC_FAILURES_BEFORE_PENALTY:
+            self.penalized_until = time.time() + QUIC_PENALTY_COOLDOWN_SECONDS
+
+    def avg_latency_ms(self):
+        if not self.latencies_ms:
+            return None
+        return sum(self.latencies_ms) / len(self.latencies_ms)
+
+    def metrics(self):
+        return {
+            "quic_handshake_count": self.handshake_count,
+            "quic_reuse_count": self.reuse_count,
+            "quic_reconnect_count": self.reconnect_count,
+            "quic_error_count": self.error_count,
+        }
+
+
+def _get_quic_loop():
+    global _quic_loop, _quic_loop_thread
+    with _quic_loop_lock:
+        if _quic_loop is None or _quic_loop.is_closed():
+            import asyncio
+            _quic_loop = asyncio.new_event_loop()
+            _quic_loop_thread = threading.Thread(target=_quic_loop.run_forever, name="quic-pool-loop", daemon=True)
+            _quic_loop_thread.start()
+            asyncio.run_coroutine_threadsafe(_quic_idle_sweep(), _quic_loop)
+        return _quic_loop
+
+
+async def _quic_idle_sweep():
+    import asyncio as _aio
+    while True:
+        await _aio.sleep(15.0)
+        now = time.time()
+        with quic_sessions_lock:
+            sessions = list(quic_sessions.values())
+        for session in sessions:
+            if session.proto is not None and now - session.last_used > QUIC_IDLE_TIMEOUT:
+                await _quic_session_reset(session)
+
+
+async def _quic_session_reset(session):
+    ctx = session.ctx
+    session.ctx = None
+    session.proto = None
+    if ctx is not None:
+        try:
+            await ctx.__aexit__(None, None, None)
+        except Exception:
+            pass
+
+
+async def _quic_session_attempt(session, request, cfg, ips, make_protocol, run_query, quic_connect):
+    port = int(session.upstream.get("port", 0))
+    needs_connect = (
+        session.proto is None
+        or session.ctx is None
+        or time.time() - session.last_used > QUIC_IDLE_TIMEOUT
+    )
+    if needs_connect:
+        await _quic_session_reset(session)
+        last_err = None
+        for ip in ips[:4]:
+            try:
+                ctx = quic_connect(ip, port, configuration=cfg, create_protocol=make_protocol)
+                proto = await ctx.__aenter__()
+                session.ctx = ctx
+                session.proto = proto
+                session.handshake_count += 1
+                if session.ever_connected:
+                    session.reconnect_count += 1
+                session.ever_connected = True
+                last_err = None
+                break
+            except Exception as exc:
+                last_err = exc
+                continue
+        if session.proto is None:
+            raise OSError(str(last_err) if last_err else f"{session.protocol_name} connect failed")
+    else:
+        session.reuse_count += 1
+
+    start = time.perf_counter()
+    try:
+        result = await run_query(session.proto, request)
+    except Exception:
+        await _quic_session_reset(session)
+        session.record_failure()
+        raise
+    latency_ms = (time.perf_counter() - start) * 1000.0
+    session.last_used = time.time()
+    session.record_success(latency_ms)
+    return result
+
+
+async def _quic_session_query(session, request, total_timeout, cfg, ips, make_protocol, run_query):
+    import asyncio as _aio
+    from aioquic.asyncio import connect as quic_connect
+    if session.lock is None:
+        session.lock = _aio.Lock()
+    async with session.lock:
+        try:
+            return await _aio.wait_for(
+                _quic_session_attempt(session, request, cfg, ips, make_protocol, run_query, quic_connect),
+                timeout=total_timeout,
+            )
+        except _aio.TimeoutError:
+            session.record_failure()
+            await _quic_session_reset(session)
+            raise OSError(f"{session.protocol_name} query timed out")
+
+
+def _quic_pooled_query(protocol_name, upstream, request, total_timeout, cfg, ips, make_protocol, run_query):
+    import asyncio
+    import concurrent.futures
+
+    key = _quic_session_key(protocol_name, upstream)
+    with quic_sessions_lock:
+        session = quic_sessions.get(key)
+        if session is None:
+            session = _QuicSession(protocol_name, upstream)
+            quic_sessions[key] = session
+
+    if session.is_penalized():
+        raise OSError(f"{protocol_name} upstream temporarily disabled after repeated failures")
+
+    loop = _get_quic_loop()
+    future = asyncio.run_coroutine_threadsafe(
+        _quic_session_query(session, request, total_timeout, cfg, ips, make_protocol, run_query),
+        loop,
+    )
+    try:
+        return future.result(total_timeout + 2.0)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        raise OSError(f"{protocol_name} query timed out")
+
+
+def quic_pool_metrics():
+    totals = {
+        "quic_handshake_count": 0,
+        "quic_reuse_count": 0,
+        "quic_reconnect_count": 0,
+        "quic_error_count": 0,
+        "quic_pool_size": 0,
+        "quic_penalized_count": 0,
+    }
+    with quic_sessions_lock:
+        sessions = list(quic_sessions.values())
+    totals["quic_pool_size"] = len(sessions)
+    for session in sessions:
+        for key, value in session.metrics().items():
+            totals[key] += value
+        if session.is_penalized():
+            totals["quic_penalized_count"] += 1
+    return totals
+
+
 def query_doh_http3_upstream(upstream, request, timeout=4.0):
     try:
-        import asyncio
-        from aioquic.asyncio import connect as quic_connect
         from aioquic.asyncio.protocol import QuicConnectionProtocol
         from aioquic.h3.connection import H3_ALPN, H3Connection
         from aioquic.h3.events import DataReceived, HeadersReceived
@@ -1909,6 +2138,7 @@ def query_doh_http3_upstream(upstream, request, timeout=4.0):
 
     host, port, path = doh_request_parts(upstream["resolver"])
     server_name = host if not looks_like_ip(host) else None
+    total_timeout = get_timeout_setting("doh3_total_timeout", timeout)
 
     class _DoH3Protocol(QuicConnectionProtocol):
         def __init__(self, *args, **kwargs):
@@ -1949,8 +2179,9 @@ def query_doh_http3_upstream(upstream, request, timeout=4.0):
             self._h3.send_headers(stream_id=stream_id, headers=headers)
             self._h3.send_data(stream_id=stream_id, data=dns_request, end_stream=True)
             self.transmit()
-            await _aio.wait_for(self._done[stream_id].wait(), timeout=timeout)
-            state = self._responses.get(stream_id, {})
+            await self._done[stream_id].wait()
+            state = self._responses.pop(stream_id, {})
+            self._done.pop(stream_id, None)
             status = state.get("headers", {}).get(":status", "")
             if status != "200":
                 raise OSError(f"DoH HTTP/3 response failed: {status or 'missing status'}")
@@ -1959,27 +2190,16 @@ def query_doh_http3_upstream(upstream, request, timeout=4.0):
                 raise OSError("short DoH HTTP/3 DNS response")
             return body
 
-    async def _run():
-        cfg = QuicConfiguration(alpn_protocols=H3_ALPN, is_client=True)
-        if server_name:
-            cfg.server_name = server_name
-        ips = resolve_upstream_host(host)
-        last_err = None
-        for ip in ips[:4]:
-            try:
-                async with quic_connect(ip, port, configuration=cfg, create_protocol=_DoH3Protocol) as proto:
-                    return await proto.doh3_query(request)
-            except Exception as exc:
-                last_err = exc
-                continue
-        if last_err:
-            message = str(last_err) or last_err.__class__.__name__
-            raise OSError(message)
-        raise OSError("DoH HTTP/3 request failed")
+    async def _run_query(proto, dns_request):
+        return await proto.doh3_query(dns_request)
 
-    loop = asyncio.new_event_loop()
+    cfg = QuicConfiguration(alpn_protocols=H3_ALPN, is_client=True)
+    if server_name:
+        cfg.server_name = server_name
+    ips = resolve_upstream_host(host)
+
     try:
-        return loop.run_until_complete(_run())
+        return _quic_pooled_query("doh3", upstream, request, total_timeout, cfg, ips, _DoH3Protocol, _run_query)
     except OSError as exc:
         # Some DoH endpoints, including dns.cloudflare.com, are valid DoH hosts
         # but don't reliably answer HTTP/3. Keep the resolver usable by falling
@@ -1990,8 +2210,6 @@ def query_doh_http3_upstream(upstream, request, timeout=4.0):
             return query_doh_upstream(fallback, request, timeout=timeout)
         except OSError:
             raise exc
-    finally:
-        loop.close()
 
 
 def query_doh_stamp_upstream(upstream, request, timeout=4.0):
@@ -2055,6 +2273,9 @@ class DotConnection:
         return ips[:4]
 
     def connect(self, timeout=4.0):
+        connect_timeout = get_timeout_setting("tcp_connect_timeout", timeout)
+        tls_timeout = get_timeout_setting("tls_handshake_timeout", timeout)
+        query_timeout = get_timeout_setting("dns_query_timeout", timeout)
         host = self.upstream["address"]
         port = int(self.upstream.get("port", 853))
         tls_name = self.upstream.get("tls_name") or self.upstream.get("hostname") or dot_tls_server_name(host)
@@ -2065,11 +2286,11 @@ class DotConnection:
         for ip in ordered_ips:
             raw = None
             try:
-                raw = socket.create_connection((ip, port), timeout=timeout)
-                raw.settimeout(timeout)
+                raw = socket.create_connection((ip, port), timeout=connect_timeout)
+                raw.settimeout(tls_timeout)
                 context = ssl.create_default_context()
                 conn = context.wrap_socket(raw, server_hostname=tls_name)
-                conn.settimeout(timeout)
+                conn.settimeout(query_timeout)
                 self.conn = conn
                 self.last_used = time.time()
                 self.handshake_count += 1
@@ -2106,7 +2327,7 @@ class DotConnection:
     def _send_and_receive(self, request: bytes, timeout=4.0) -> bytes:
         if len(request) > 65535:
             raise OSError("DoT DNS request too large")
-        self.conn.settimeout(timeout)
+        self.conn.settimeout(get_timeout_setting("dns_query_timeout", timeout))
         self.conn.sendall(struct.pack("!H", len(request)) + request)
         header = self._recv_exact(2)
         length = struct.unpack("!H", header)[0]
@@ -2171,6 +2392,9 @@ def dot_pool_metrics():
 
 
 def query_dot_upstream_once(upstream, request, timeout=4.0):
+    connect_timeout = get_timeout_setting("tcp_connect_timeout", timeout)
+    tls_timeout = get_timeout_setting("tls_handshake_timeout", timeout)
+    query_timeout = get_timeout_setting("dns_query_timeout", timeout)
     host = upstream["address"]
     port = int(upstream["port"])
     ips = resolve_via_configured_dns(host) if not looks_like_ip(host) else [host]
@@ -2178,12 +2402,12 @@ def query_dot_upstream_once(upstream, request, timeout=4.0):
     last_error = None
     for ip in ips[:4]:
         try:
-            raw = socket.create_connection((ip, port), timeout=timeout)
+            raw = socket.create_connection((ip, port), timeout=connect_timeout)
             with raw:
-                raw.settimeout(timeout)
+                raw.settimeout(tls_timeout)
                 context = ssl.create_default_context()
                 conn = context.wrap_socket(raw, server_hostname=tls_name)
-                conn.settimeout(timeout)
+                conn.settimeout(query_timeout)
                 with conn:
                     conn.sendall(struct.pack("!H", len(request)) + request)
                     header = conn.recv(2)
@@ -2228,8 +2452,6 @@ def query_doq_upstream(upstream, request, timeout=4.0):
     if os.environ.get("LOCALDNSGUARD_ENABLE_EXPERIMENTAL_DOQ_UPSTREAM", "0") != "1":
         raise OSError("DoQ upstream forwarding is experimental and disabled by default")
     try:
-        import asyncio
-        from aioquic.asyncio import connect as quic_connect
         from aioquic.asyncio.protocol import QuicConnectionProtocol
         from aioquic.quic.configuration import QuicConfiguration
         from aioquic.quic.events import StreamDataReceived
@@ -2239,6 +2461,7 @@ def query_doq_upstream(upstream, request, timeout=4.0):
     host = upstream["address"]
     port = int(upstream["port"])
     server_name = host if not looks_like_ip(host) else None
+    total_timeout = get_timeout_setting("doq_total_timeout", timeout)
 
     class _DoQProtocol(QuicConnectionProtocol):
         def __init__(self, *args, **kwargs):
@@ -2259,8 +2482,9 @@ def query_doq_upstream(upstream, request, timeout=4.0):
             self._stream_done[sid] = _aio.Event()
             self._quic.send_stream_data(sid, struct.pack("!H", len(dns_request)) + dns_request, end_stream=True)
             self.transmit()
-            await _aio.wait_for(self._stream_done[sid].wait(), timeout=timeout)
-            data = self._stream_data.get(sid, b"")
+            await self._stream_done[sid].wait()
+            data = self._stream_data.pop(sid, b"")
+            self._stream_done.pop(sid, None)
             if len(data) < 2:
                 raise OSError("DoQ: short response")
             length = struct.unpack("!H", data[:2])[0]
@@ -2269,26 +2493,23 @@ def query_doq_upstream(upstream, request, timeout=4.0):
                 raise OSError("DoQ: invalid DNS response")
             return response
 
-    async def _run():
-        cfg = QuicConfiguration(alpn_protocols=["doq"], is_client=True)
-        if server_name:
-            cfg.server_name = server_name
-        ips = resolve_via_configured_dns(host) if not looks_like_ip(host) else [host]
-        last_err = None
-        for ip in ips[:4]:
-            try:
-                async with quic_connect(ip, port, configuration=cfg, create_protocol=_DoQProtocol) as proto:
-                    return await proto.doq_query(request)
-            except Exception as exc:
-                last_err = exc
-                continue
-        raise OSError(str(last_err) if last_err else "DoQ failed")
+    async def _run_query(proto, dns_request):
+        return await proto.doq_query(dns_request)
 
-    loop = asyncio.new_event_loop()
+    cfg = QuicConfiguration(alpn_protocols=["doq"], is_client=True)
+    if server_name:
+        cfg.server_name = server_name
+    ips = resolve_via_configured_dns(host) if not looks_like_ip(host) else [host]
+
     try:
-        return loop.run_until_complete(_run())
-    finally:
-        loop.close()
+        return _quic_pooled_query("doq", upstream, request, total_timeout, cfg, ips, _DoQProtocol, _run_query)
+    except OSError as exc:
+        fallback = dict(upstream)
+        fallback["resolver_type"] = "dot"
+        try:
+            return query_dot_upstream(fallback, request, timeout=timeout)
+        except OSError:
+            raise exc
 
 
 def _stamp_b64decode(payload):
@@ -2452,15 +2673,17 @@ def wrap_anonymized_dnscrypt_packet(stamp_info, packet):
 
 
 def send_anonymized_dnscrypt_packet(stamp_info, relay_info, packet, timeout=4.0, transport="udp"):
+    connect_timeout = get_timeout_setting("tcp_connect_timeout", timeout)
+    query_timeout = get_timeout_setting("dns_query_timeout", timeout)
     relay_packet = wrap_anonymized_dnscrypt_packet(stamp_info, packet)
     relay_target = {"address": relay_info["address"], "port": relay_info["port"]}
     if transport == "tcp":
-        with socket.create_connection((relay_target["address"], int(relay_target["port"])), timeout=timeout) as s:
-            s.settimeout(timeout)
+        with socket.create_connection((relay_target["address"], int(relay_target["port"])), timeout=connect_timeout) as s:
+            s.settimeout(query_timeout)
             s.sendall(struct.pack("!H", len(relay_packet)) + relay_packet)
             return _read_dnscrypt_tcp_response(s)
     with socket.socket(socket_family_for_host(relay_target["address"]), socket.SOCK_DGRAM) as s:
-        s.settimeout(timeout)
+        s.settimeout(query_timeout)
         s.sendto(relay_packet, (relay_target["address"], int(relay_target["port"])))
         response, _ = s.recvfrom(4096)
         return response
@@ -2706,15 +2929,17 @@ def _read_dnscrypt_tcp_response(conn):
 def send_dnscrypt_packet(stamp_info, packet, timeout=4.0, transport="udp", relay_info=None):
     if relay_info:
         return send_anonymized_dnscrypt_packet(stamp_info, relay_info, packet, timeout=timeout, transport=transport)
+    connect_timeout = get_timeout_setting("tcp_connect_timeout", timeout)
+    query_timeout = get_timeout_setting("dns_query_timeout", timeout)
     address = stamp_info["address"]
     port = int(stamp_info["port"])
     if transport == "tcp":
-        with socket.create_connection((address, port), timeout=timeout) as s:
-            s.settimeout(timeout)
+        with socket.create_connection((address, port), timeout=connect_timeout) as s:
+            s.settimeout(query_timeout)
             s.sendall(struct.pack("!H", len(packet)) + packet)
             return _read_dnscrypt_tcp_response(s)
     with socket.socket(socket_family_for_host(address), socket.SOCK_DGRAM) as s:
-        s.settimeout(timeout)
+        s.settimeout(query_timeout)
         s.sendto(packet, (address, port))
         response, _ = s.recvfrom(4096)
         return response
@@ -3395,14 +3620,14 @@ def upstream_queue_wait_metrics():
     return {"upstream_queue_wait_ms_avg": round(avg, 3), "upstream_queue_wait_ms_p95": round(p95, 3)}
 
 
-def forward_query(request):
+def forward_query(request, timeout_override=None):
     wait_start = time.perf_counter()
     if not upstream_concurrency.acquire(timeout=3.0):
         record_upstream_queue_wait(time.perf_counter() - wait_start)
         raise OSError("upstream busy")
     record_upstream_queue_wait(time.perf_counter() - wait_start)
     try:
-        return _forward_query(request)
+        return _forward_query(request, timeout_override=timeout_override)
     finally:
         upstream_concurrency.release()
 
@@ -3437,12 +3662,12 @@ def _query_one_upstream(upstream, request, update_metrics=True, timeout_override
     return response, label
 
 
-def _forward_query(request):
+def _forward_query(request, timeout_override=None):
     mode = get_setting("upstream_mode", "sequential")
     if mode == "parallel_fastest":
-        return _forward_query_parallel(request)
+        return _forward_query_parallel(request, timeout_override=timeout_override)
     if mode == "load_balance":
-        return _forward_query_loadbalance(request)
+        return _forward_query_loadbalance(request, timeout_override=timeout_override)
     upstreams = active_upstreams()
     last_error = ""
     for upstream in upstreams:
@@ -3450,7 +3675,7 @@ def _forward_query(request):
             last_error = f"{upstream['resolver_type']} not yet supported"
             continue
         try:
-            return _query_one_upstream(upstream, request)
+            return _query_one_upstream(upstream, request, timeout_override=timeout_override)
         except OSError as exc:
             last_error = str(exc)
             maybe_update_upstream_status(upstream, latency=None, error=last_error)
@@ -3459,7 +3684,7 @@ def _forward_query(request):
     raise OSError(last_error or "no upstream available")
 
 
-def _forward_query_parallel(request):
+def _forward_query_parallel(request, timeout_override=None):
     upstreams = [u for u in active_upstreams() if upstream_supported(u)]
     if not upstreams:
         return _query_fallback_plain(request)
@@ -3470,7 +3695,7 @@ def _forward_query_parallel(request):
 
     def try_one(upstream):
         try:
-            result = _query_one_upstream(upstream, request)
+            result = _query_one_upstream(upstream, request, timeout_override=timeout_override)
             with lock:
                 if first[0] is None:
                     first[0] = result
@@ -3490,7 +3715,7 @@ def _forward_query_parallel(request):
     raise OSError(errors[-1] if errors else "all upstreams timed out")
 
 
-def _forward_query_loadbalance(request):
+def _forward_query_loadbalance(request, timeout_override=None):
     global _upstream_rr_index
     upstreams = [u for u in active_upstreams() if upstream_supported(u)]
     if not upstreams:
@@ -3502,7 +3727,7 @@ def _forward_query_loadbalance(request):
     last_error = ""
     for upstream in ordered:
         try:
-            return _query_one_upstream(upstream, request)
+            return _query_one_upstream(upstream, request, timeout_override=timeout_override)
         except OSError as exc:
             last_error = str(exc)
             maybe_update_upstream_status(upstream, latency=None, error=last_error)
@@ -6488,6 +6713,8 @@ def settings_page(message="", is_error=False, values=None):
 .settings-radio input{{margin-top:.2rem;accent-color:var(--accent);flex-shrink:0}}
 .settings-label{{display:block;font-size:.9rem;font-weight:700;color:var(--text)}}
 .settings-help{{font-size:.78rem;color:var(--muted2);margin-top:.12rem}}
+.settings-subhead{{font-size:.72rem;font-weight:800;letter-spacing:.07em;text-transform:uppercase;color:var(--muted2);margin-top:.4rem;padding-top:.85rem;border-top:1px solid rgba(30,45,61,.55)}}
+.settings-subhead:first-child{{margin-top:0;padding-top:0;border-top:none}}
 .settings-toggle{{margin-left:auto}}
 .settings-actions{{display:flex;justify-content:flex-end;gap:.65rem;margin-top:.1rem}}
 .settings-textarea{{min-height:150px;font-family:ui-monospace,SFMono-Regular,Consolas,Liberation Mono,monospace;font-size:.8rem;line-height:1.35;resize:vertical}}
@@ -6524,19 +6751,34 @@ def settings_page(message="", is_error=False, values=None):
       </div>
       <div class="settings-section-body settings-stack">
         {encrypted_alert}
+
+        <div class="settings-subhead">Web &amp; DNS Listener</div>
         <div class="settings-field-grid">
           <div><label class="form-label">LOCALDNSGUARD_WEB_HOST</label><input class="form-control" name="localdnsguard_web_host" value="{html_escape(value('localdnsguard_web_host', WEB_HOST))}"></div>
           <div><label class="form-label">LOCALDNSGUARD_WEB_PORT</label><input class="form-control" name="localdnsguard_web_port" type="number" min="0" max="65535" value="{html_escape(value('localdnsguard_web_port', WEB_PORT))}"></div>
-          <div><label class="form-label">Encrypted DNS Listen Host</label><input class="form-control" name="encrypted_dns_host" value="{html_escape(value('encrypted_dns_host', DNS_HOST))}"></div>
-        </div>
-        <div class="settings-field-grid">
           <div><label class="form-label">LOCALDNSGUARD_DNS_HOST</label><input class="form-control" name="localdnsguard_dns_host" value="{html_escape(value('localdnsguard_dns_host', DNS_HOST))}"></div>
           <div><label class="form-label">LOCALDNSGUARD_DNS_PORT</label><input class="form-control" name="localdnsguard_dns_port" type="number" min="0" max="65535" value="{html_escape(value('localdnsguard_dns_port', DNS_PORT))}"></div>
-          <div><label class="form-label">Public DNS Domain</label><input class="form-control" name="encrypted_dns_domain" placeholder="dns.example.com" value="{html_escape(value('encrypted_dns_domain', ENCRYPTED_DNS_DOMAIN))}"></div>
         </div>
+
+        <div class="settings-subhead">Upstream &amp; Validation Timeouts</div>
         <div class="settings-field-grid">
           <div><label class="form-label">Upstream Timeout</label><input class="form-control" name="upstream_timeout" type="number" min="0.1" step="0.1" value="{html_escape(value('upstream_timeout', '2.5'))}"></div>
-          <div class="settings-help" style="display:flex;align-items:center;grid-column:span 2">Number of seconds to wait for a response from the upstream server.</div>
+          <div><label class="form-label">TCP Connect Timeout</label><input class="form-control" name="tcp_connect_timeout" type="number" min="0.1" step="0.1" value="{html_escape(value('tcp_connect_timeout', '3.0'))}"></div>
+          <div><label class="form-label">TLS Handshake Timeout</label><input class="form-control" name="tls_handshake_timeout" type="number" min="0.1" step="0.1" value="{html_escape(value('tls_handshake_timeout', '4.0'))}"></div>
+        </div>
+        <div class="settings-field-grid">
+          <div><label class="form-label">DNS Query Timeout</label><input class="form-control" name="dns_query_timeout" type="number" min="0.1" step="0.1" value="{html_escape(value('dns_query_timeout', '2.5'))}"></div>
+          <div><label class="form-label">DNSSEC Validation Timeout</label><input class="form-control" name="dnssec_validation_timeout" type="number" min="0.1" step="0.1" value="{html_escape(value('dnssec_validation_timeout', '3.0'))}"></div>
+        </div>
+        <div class="settings-field-grid">
+          <div><label class="form-label">DoQ Total Timeout</label><input class="form-control" name="doq_total_timeout" type="number" min="0.1" step="0.1" value="{html_escape(value('doq_total_timeout', '1.8'))}"></div>
+          <div><label class="form-label">DoH/3 Total Timeout</label><input class="form-control" name="doh3_total_timeout" type="number" min="0.1" step="0.1" value="{html_escape(value('doh3_total_timeout', '2.2'))}"></div>
+        </div>
+
+        <div class="settings-subhead">Encrypted DNS Endpoints</div>
+        <div class="settings-field-grid">
+          <div><label class="form-label">Encrypted DNS Listen Host</label><input class="form-control" name="encrypted_dns_host" value="{html_escape(value('encrypted_dns_host', DNS_HOST))}"></div>
+          <div><label class="form-label">Public DNS Domain</label><input class="form-control" name="encrypted_dns_domain" placeholder="dns.example.com" value="{html_escape(value('encrypted_dns_domain', ENCRYPTED_DNS_DOMAIN))}"></div>
         </div>
         <div class="settings-field-grid two">
           {switch("dns_over_tls_enabled", "DNS over TLS", "Accept encrypted DNS over TCP/TLS. Default port is 853.", "0")}
@@ -7248,6 +7490,7 @@ def collect_metrics():
     cache_stats_data = cache_stats()
     regex_stats = get_filter_engine().regex_index_stats()
     dot_metrics = dot_pool_metrics()
+    quic_metrics = quic_pool_metrics()
     queue_metrics = upstream_queue_wait_metrics()
     dnssec_metrics = get_dnssec_metrics()
     validator = get_dnssec_validator()
@@ -7283,6 +7526,7 @@ def collect_metrics():
         "dnssec_next_rfc5011_check": dnssec_anchor.get("next_check", ""),
         "dnssec_last_error": dnssec_anchor.get("last_error", ""),
         **dot_metrics,
+        **quic_metrics,
         **queue_metrics,
     }
 
@@ -8062,7 +8306,8 @@ class WebHandler(BaseHTTPRequestHandler):
                 "filter_update_interval_hours", "allowed_networks", "custom_block_ipv4", "custom_block_ipv6",
                 "log_retention_days", "auto_clear_query_log_hours", "localdnsguard_web_host", "localdnsguard_web_port",
                 "localdnsguard_dns_host", "localdnsguard_dns_port", "encrypted_dns_host", "encrypted_dns_domain",
-                "upstream_timeout",
+                "upstream_timeout", "tcp_connect_timeout", "tls_handshake_timeout", "dns_query_timeout",
+                "dnssec_validation_timeout", "doq_total_timeout", "doh3_total_timeout",
                 "dns_over_tls_enabled", "dns_over_tls_port", "dns_over_https_enabled", "dns_over_https_port",
                 "dns_over_quic_enabled", "dns_over_quic_port",
                 "encrypted_dns_certificate_pem", "encrypted_dns_private_key_pem",
@@ -8071,6 +8316,12 @@ class WebHandler(BaseHTTPRequestHandler):
                 parse_port(form.get("localdnsguard_web_port", WEB_PORT), WEB_PORT, "LOCALDNSGUARD_WEB_PORT")
                 parse_port(form.get("localdnsguard_dns_port", DNS_PORT), DNS_PORT, "LOCALDNSGUARD_DNS_PORT")
                 parse_positive_float(form.get("upstream_timeout", "2.5"), 2.5, "Upstream timeout")
+                parse_positive_float(form.get("tcp_connect_timeout", "3.0"), 3.0, "TCP connect timeout")
+                parse_positive_float(form.get("tls_handshake_timeout", "4.0"), 4.0, "TLS handshake timeout")
+                parse_positive_float(form.get("dns_query_timeout", "2.5"), 2.5, "DNS query timeout")
+                parse_positive_float(form.get("dnssec_validation_timeout", "3.0"), 3.0, "DNSSEC validation timeout")
+                parse_positive_float(form.get("doq_total_timeout", "1.8"), 1.8, "DoQ total timeout")
+                parse_positive_float(form.get("doh3_total_timeout", "2.2"), 2.2, "DoH/3 total timeout")
                 parse_port(form.get("dns_over_tls_port", DNS_TLS_PORT), DNS_TLS_PORT, "DNS-over-TLS port")
                 parse_port(form.get("dns_over_https_port", DNS_HTTPS_PORT), DNS_HTTPS_PORT, "DNS-over-HTTPS port")
                 parse_port(form.get("dns_over_quic_port", DNS_QUIC_PORT), DNS_QUIC_PORT, "DNS-over-QUIC port")
