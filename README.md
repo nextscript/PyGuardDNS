@@ -27,9 +27,12 @@ By default, the application listens on DNS port `53` for UDP/TCP and serves the 
 - DNS rewrites for local or custom target addresses
 - Block response modes: zero IP, custom IP, NXDOMAIN, REFUSED, and NODATA
 - DNS cache with configurable TTL and cache size
+- RAM-snapshot request path: settings, client/profile data, and filter rules are read from atomically-swapped in-memory snapshots, so answering a DNS query needs no SQLite access, global locks, or synchronous query-log writes
+- Asynchronous unknown-client registration with TTL-based deduplication and batched background inserts, keeping per-query database writes off the DNS hot path
+- Runtime metrics for the DNS request hot path (cache hits/misses, filter decisions, upstream errors, query-log drops, queue sizes) exposed via `/metrics` and `/api/runtime_metrics`
 - Upstream resolver management with health checks, latency measurement, automatic pause on failures, and manual testing
 - Support for multiple upstream resolver types, including classic DNS, DNS-over-TLS, DNS-over-HTTPS, and DNSCrypt stamps
-- Optional encrypted DNS server for DNS-over-TLS and DNS-over-QUIC on port `853`
+- Optional encrypted DNS server for DNS-over-TLS and DNS-over-QUIC on port `853`, with persistent connection reuse to keep encrypted DNS latency close to dedicated resolvers
 - Admin login with password, sessions, CSRF protection, and login rate limiting
 - API tokens for external automation
 - JSON API and Prometheus-compatible metrics at `/metrics`
@@ -42,6 +45,7 @@ By default, the application listens on DNS port `53` for UDP/TCP and serves the 
 - DNSSEC self-validation with local root trust anchor (SERVFAIL on bogus, AD flag set on valid)
 - Automatic missing dependency detection and installation at startup
 - Benchmark script for generated filter-engine rule sets
+- Benchmark script for the DNS request hot path with cache-hit, clean-miss, blocked, and mixed modes, including a slow-disk simulation
 
 ## Requirements
 
@@ -175,6 +179,16 @@ The `block_mode` setting controls DNS responses for blocked requests:
 
 Invalid modes fall back to `zero_ip`.
 
+## Request Path and Performance
+
+`handle_dns_request` answers DNS queries entirely from in-memory snapshots: settings, client/profile data, and filter rules are built once and swapped in atomically whenever something changes (rule edits, profile changes, restores). This means a query never waits on a SQLite read, a global lock, or a synchronous query-log write.
+
+Unknown clients are registered asynchronously: new IPs are deduplicated with a TTL-based set, queued, and inserted in batches by a background worker, which then triggers a snapshot rebuild. If the queue fills up, registrations are dropped and counted in `unknown_client_dropped_total` instead of blocking DNS responses.
+
+DNS-over-TLS and DNS-over-QUIC connections are reused instead of performing a new TCP/TLS/QUIC handshake for every query, which keeps encrypted DNS latency close to dedicated resolvers (see `dot_doq_latency_fix.md`).
+
+Hot-path counters (cache hits/misses, filter decisions, upstream errors, query-log drops, queue sizes, dropped client registrations) are available through `/metrics` and `/api/runtime_metrics`, and `benchmark_request_path.py` can reproduce cache-hit, clean-miss, blocked, and mixed traffic patterns, optionally with a simulated slow disk, to measure the effect of changes on this path.
+
 ## Blocklist Updates
 
 Remote blocklist updates are designed to keep the last working rules if the new download is bad. An update is rejected if:
@@ -233,9 +247,10 @@ Useful endpoints:
 - `POST /api/cache/clear`
 - `GET /api/backup`
 - `GET /api/metrics`
+- `GET /api/runtime_metrics`
 - `GET /metrics`
 
-`/metrics` returns Prometheus-compatible metrics, including query counts, block rate, cache rate, active clients, upstreams, and DNS-over-TLS pool values.
+`/metrics` returns Prometheus-compatible metrics, including query counts, block rate, cache rate, active clients, upstreams, and DNS-over-TLS pool values. `/api/runtime_metrics` returns the same DNS hot-path counters as JSON, such as cache hits/misses, filter decisions, upstream errors, query-log drops, queue sizes, and `unknown_client_dropped_total`.
 
 ## CLI
 
@@ -317,7 +332,7 @@ python -m pytest
 Syntax check:
 
 ```sh
-python -m py_compile app.py dns_engine.py blocklist_manager.py client_manager.py benchmark_filter_engine.py
+python -m py_compile app.py dns_engine.py blocklist_manager.py client_manager.py benchmark_filter_engine.py benchmark_request_path.py
 ```
 
 Benchmark the filter engine with generated rules:
@@ -325,6 +340,14 @@ Benchmark the filter engine with generated rules:
 ```sh
 python benchmark_filter_engine.py --rules 100000 --samples 5000
 ```
+
+Benchmark the DNS request hot path (`handle_dns_request`) with synthetic traffic:
+
+```sh
+python benchmark_request_path.py --mode mixed --per-thread 300 --levels 1,2,4,8,16
+```
+
+`--mode` selects the traffic pattern (`cache-hit`, `clean-miss`, `blocked`, `mixed`), and `--simulate-slow-db`/`--slow-db-delay` simulate a slow disk to verify that DNS latency stays decoupled from query-log persistence speed. The output includes p50/latency, cache-hit-ratio, and queue-size columns sourced from the runtime metrics.
 
 ## Security Notes
 
@@ -342,6 +365,7 @@ dnssec_validator.py       DNSSEC chain-of-trust validation and trust anchor stor
 blocklist_manager.py      Import, parsing, update, and storage of blocklists
 client_manager.py         Profiles, clients, profile rules, and service blocks
 benchmark_filter_engine.py Synthetic filter-engine benchmark
+benchmark_request_path.py Synthetic benchmark for the DNS request hot path
 data/root-anchors.xml     IANA root trust anchor (KSK key digests and public keys)
 data/root.key             Root DNSKEYs in BIND format (optional override)
 requirements.txt          Runtime Python dependencies
@@ -350,4 +374,5 @@ start-pyguarddns.bat      Windows start script
 start-pyguarddns.sh       Linux/macOS start script
 tests/                    Pytest test suite
 ```
+
 
