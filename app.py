@@ -1038,6 +1038,9 @@ MIGRATIONS = [
     (12, "add DNSCrypt relay column to upstreams", lambda: (
         _ensure_column("upstreams", "dnscrypt_relay", "TEXT NOT NULL DEFAULT ''"),
     )),
+    (13, "drop legacy blocklist_entries table", lambda: db.executescript("""
+        DROP TABLE IF EXISTS blocklist_entries;
+    """)),
 ]
 
 

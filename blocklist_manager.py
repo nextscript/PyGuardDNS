@@ -471,18 +471,6 @@ CREATE TABLE IF NOT EXISTS blocklists (
     import_report TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS blocklist_entries (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    blocklist_id INTEGER NOT NULL,
-    action TEXT NOT NULL DEFAULT 'block',
-    pattern_type TEXT NOT NULL,
-    pattern TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_blocklist_entries_list ON blocklist_entries(blocklist_id);
-CREATE INDEX IF NOT EXISTS idx_blocklist_entries_action ON blocklist_entries(action, pattern_type, pattern);
 """
 
 
@@ -901,34 +889,6 @@ class BlocklistManager:
             list_id = str(bl["id"])
             cache = load_blocklist_cache(list_id)
             if cache:
-                build_indexes_from_cache(cache, engine)
-                continue
-            old_entries = self.db.execute(
-                "SELECT action, pattern_type, pattern FROM blocklist_entries WHERE blocklist_id=? ORDER BY id ASC",
-                (bl["id"],),
-            ).fetchall()
-            if old_entries:
-                text_lines = []
-                for row in old_entries:
-                    action = row["action"]
-                    pt = row["pattern_type"]
-                    pattern = row["pattern"]
-                    if pt == "domain":
-                        text_lines.append(f"{'@@' if action == 'allow' else ''}||{pattern}^")
-                    elif pt == "regex":
-                        raw = f"/{pattern}/"
-                        text_lines.append(f"@@{raw}" if action == "allow" else raw)
-                    elif pt == "wildcard":
-                        text_lines.append(f"{'@@' if action == 'allow' else ''}*.{pattern.lstrip('*.')}")
-                text = "\n".join(text_lines)
-                url = bl.get("url", "")
-                result = convert_blocklist_text(text, list_id, url)
-                save_blocklist_cache(list_id, result["cache"])
-                save_cosmetic_rules(list_id, result["cosmetic"])
-                save_unsupported_rules(list_id, result["unsupported"])
-                if not url:
-                    save_original_text(list_id, text)
-                cache = result["cache"]
                 build_indexes_from_cache(cache, engine)
 
     def rebuild_cache(self, list_id: int) -> dict:
