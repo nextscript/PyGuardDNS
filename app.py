@@ -30,7 +30,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import MappingProxyType
 from urllib.parse import parse_qs, quote, urlparse
-from urllib.request import urlopen
+import urllib.request
 
 import bcrypt
 
@@ -3300,7 +3300,7 @@ def resolve_via_configured_dns(hostname):
 
 def fetch_url_text(url, max_bytes=100_000_000):
     try:
-        with urlopen(url, timeout=8) as response:
+        with urllib.request.urlopen(url, timeout=8) as response:
             return response.read(max_bytes).decode("utf-8", errors="ignore")
     except OSError as original_error:
         parsed = urlparse(url)
@@ -3565,6 +3565,29 @@ _update_check_cache = {
 }
 
 
+GITHUB_API_URL = "https://api.github.com/repos/nextscript/PyGuardDNS/commits"
+GITHUB_ZIP_URL = "https://github.com/nextscript/PyGuardDNS/archive/refs/heads/main.zip"
+COMMIT_HASH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_commit")
+
+
+def _get_local_commit_hash():
+    try:
+        if os.path.exists(COMMIT_HASH_FILE):
+            with open(COMMIT_HASH_FILE, "r") as f:
+                return f.read().strip()
+    except Exception:
+        pass
+    return None
+
+
+def _save_local_commit_hash(commit_hash):
+    try:
+        with open(COMMIT_HASH_FILE, "w") as f:
+            f.write(commit_hash)
+    except Exception:
+        pass
+
+
 def check_for_updates(force=False):
     global _update_check_cache
     
@@ -3574,35 +3597,38 @@ def check_for_updates(force=False):
             return _update_check_cache["result"]
     
     try:
-        no_prompt_env = os.environ.copy()
-        no_prompt_env["GIT_TERMINAL_PROMPT"] = "0"
-        result = subprocess.run(
-            ["git", "fetch", "origin"],
-            capture_output=True, text=True, timeout=30,
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-            env=no_prompt_env
-        )
-        if result.returncode != 0:
-            stderr_msg = result.stderr.strip() or "Unknown git error"
-            return {"ok": False, "error": f"Failed to fetch from remote: {stderr_msg}"}
+        req = urllib.request.Request(GITHUB_API_URL, headers={"User-Agent": "PyGuardDNS"})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            commits = json.loads(response.read().decode())
         
-        result = subprocess.run(
-            ["git", "log", "--oneline", "HEAD..origin/main"],
-            capture_output=True, text=True, timeout=10,
-            cwd=os.path.dirname(os.path.abspath(__file__))
-        )
-        if result.returncode != 0:
-            stderr_msg = result.stderr.strip() or "Unknown git error"
-            return {"ok": False, "error": f"Failed to check for updates: {stderr_msg}"}
+        if not commits:
+            check_result = {"ok": True, "available": False, "count": 0, "commits": []}
+            _update_check_cache["result"] = check_result
+            _update_check_cache["last_check"] = time.time()
+            return check_result
         
-        updates = [line for line in result.stdout.strip().split("\n") if line]
-        if updates:
+        latest_commit = commits[0]
+        latest_hash = latest_commit["sha"]
+        latest_message = latest_commit["commit"]["message"].split("\n")[0]
+        
+        local_hash = _get_local_commit_hash()
+        
+        if local_hash and local_hash != latest_hash:
+            new_commits = []
+            for c in commits:
+                if c["sha"] == local_hash:
+                    break
+                new_commits.append(f"{c['sha'][:7]} {c['commit']['message'].split(chr(10))[0]}")
+            
             check_result = {
                 "ok": True,
                 "available": True,
-                "count": len(updates),
-                "commits": updates
+                "count": len(new_commits),
+                "commits": new_commits
             }
+        elif not local_hash:
+            _save_local_commit_hash(latest_hash)
+            check_result = {"ok": True, "available": False, "count": 0, "commits": []}
         else:
             check_result = {"ok": True, "available": False, "count": 0, "commits": []}
         
@@ -3628,18 +3654,69 @@ def start_update_checker():
 
 
 def perform_update():
+    import zipfile
+    import shutil
+    import tempfile
+    
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    temp_dir = None
+    
     try:
-        result = subprocess.run(
-            ["git", "pull", "origin", "main"],
-            capture_output=True, text=True, timeout=60,
-            cwd=os.path.dirname(os.path.abspath(__file__))
-        )
-        if result.returncode != 0:
-            return {"ok": False, "error": "Update failed: " + result.stderr}
+        req = urllib.request.Request(GITHUB_API_URL, headers={"User-Agent": "PyGuardDNS"})
+        with urllib.request.urlopen(req, timeout=30) as response:
+            commits = json.loads(response.read().decode())
         
-        return {"ok": True, "output": result.stdout}
+        if not commits:
+            return {"ok": False, "error": "Keine Commits gefunden"}
+        
+        latest_hash = commits[0]["sha"]
+        
+        req = urllib.request.Request(GITHUB_ZIP_URL, headers={"User-Agent": "PyGuardDNS"})
+        with urllib.request.urlopen(req, timeout=120) as response:
+            temp_dir = tempfile.mkdtemp()
+            zip_path = os.path.join(temp_dir, "update.zip")
+            with open(zip_path, "wb") as f:
+                f.write(response.read())
+            
+            with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                zip_ref.extractall(temp_dir)
+            
+            extracted_dirs = [d for d in os.listdir(temp_dir) if os.path.isdir(os.path.join(temp_dir, d))]
+            if not extracted_dirs:
+                return {"ok": False, "error": "ZIP entpackt aber kein Verzeichnis gefunden"}
+            
+            source_dir = os.path.join(temp_dir, extracted_dirs[0])
+            
+            skip_items = {".git", ".last_commit", "db", "logs", "__pycache__", ".env"}
+            
+            for item in os.listdir(source_dir):
+                if item in skip_items:
+                    continue
+                
+                src_path = os.path.join(source_dir, item)
+                dst_path = os.path.join(project_dir, item)
+                
+                if os.path.isdir(src_path):
+                    if os.path.exists(dst_path):
+                        shutil.rmtree(dst_path, ignore_errors=True)
+                    shutil.copytree(src_path, dst_path, ignore=shutil.ignore_patterns(*skip_items))
+                else:
+                    shutil.copy2(src_path, dst_path)
+            
+            _save_local_commit_hash(latest_hash)
+            _update_check_cache["result"] = {"ok": True, "available": False, "count": 0, "commits": []}
+            _update_check_cache["last_check"] = time.time()
+            
+            return {"ok": True, "output": f"Update erfolgreich installiert ({latest_hash[:7]})"}
+    
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
+    finally:
+        if temp_dir and os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 
 def restart_server():
