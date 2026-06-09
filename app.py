@@ -3574,13 +3574,17 @@ def check_for_updates(force=False):
             return _update_check_cache["result"]
     
     try:
+        no_prompt_env = os.environ.copy()
+        no_prompt_env["GIT_TERMINAL_PROMPT"] = "0"
         result = subprocess.run(
             ["git", "fetch", "origin"],
             capture_output=True, text=True, timeout=30,
-            cwd=os.path.dirname(os.path.abspath(__file__))
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            env=no_prompt_env
         )
         if result.returncode != 0:
-            return {"ok": False, "error": "Failed to fetch from remote"}
+            stderr_msg = result.stderr.strip() or "Unknown git error"
+            return {"ok": False, "error": f"Failed to fetch from remote: {stderr_msg}"}
         
         result = subprocess.run(
             ["git", "log", "--oneline", "HEAD..origin/main"],
@@ -3588,7 +3592,8 @@ def check_for_updates(force=False):
             cwd=os.path.dirname(os.path.abspath(__file__))
         )
         if result.returncode != 0:
-            return {"ok": False, "error": "Failed to check for updates"}
+            stderr_msg = result.stderr.strip() or "Unknown git error"
+            return {"ok": False, "error": f"Failed to check for updates: {stderr_msg}"}
         
         updates = [line for line in result.stdout.strip().split("\n") if line]
         if updates:
