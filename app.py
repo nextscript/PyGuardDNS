@@ -3559,6 +3559,94 @@ def detect_upstream(resolver):
     return result
 
 
+_update_check_cache = {
+    "result": None,
+    "last_check": 0
+}
+
+
+def check_for_updates(force=False):
+    global _update_check_cache
+    
+    if not force and _update_check_cache["result"] is not None:
+        time_since_check = time.time() - _update_check_cache["last_check"]
+        if time_since_check < 21600:
+            return _update_check_cache["result"]
+    
+    try:
+        result = subprocess.run(
+            ["git", "fetch", "origin"],
+            capture_output=True, text=True, timeout=30,
+            cwd=os.path.dirname(os.path.abspath(__file__))
+        )
+        if result.returncode != 0:
+            return {"ok": False, "error": "Failed to fetch from remote"}
+        
+        result = subprocess.run(
+            ["git", "log", "--oneline", "HEAD..origin/main"],
+            capture_output=True, text=True, timeout=10,
+            cwd=os.path.dirname(os.path.abspath(__file__))
+        )
+        if result.returncode != 0:
+            return {"ok": False, "error": "Failed to check for updates"}
+        
+        updates = [line for line in result.stdout.strip().split("\n") if line]
+        if updates:
+            check_result = {
+                "ok": True,
+                "available": True,
+                "count": len(updates),
+                "commits": updates
+            }
+        else:
+            check_result = {"ok": True, "available": False, "count": 0, "commits": []}
+        
+        _update_check_cache["result"] = check_result
+        _update_check_cache["last_check"] = time.time()
+        return check_result
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _update_checker_thread():
+    while True:
+        try:
+            check_for_updates(force=True)
+        except Exception:
+            pass
+        time.sleep(21600)
+
+
+def start_update_checker():
+    thread = threading.Thread(target=_update_checker_thread, daemon=True)
+    thread.start()
+
+
+def perform_update():
+    try:
+        result = subprocess.run(
+            ["git", "pull", "origin", "main"],
+            capture_output=True, text=True, timeout=60,
+            cwd=os.path.dirname(os.path.abspath(__file__))
+        )
+        if result.returncode != 0:
+            return {"ok": False, "error": "Update failed: " + result.stderr}
+        
+        return {"ok": True, "output": result.stdout}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def restart_server():
+    def delayed_restart():
+        time.sleep(1)
+        python = sys.executable
+        os.execl(python, python, *sys.argv)
+    
+    threading.Thread(target=delayed_restart, daemon=True).start()
+    return {"ok": True, "message": "DNS Server Update..."}
+
+
 def decide(domain, qtype_name, client_ip, client_info=None):
     normalized = normalize_domain(domain)
     if not is_lan_allowed(client_ip):
@@ -5192,6 +5280,7 @@ def dashboard_page():
   </div>
   <span style="font-size:.72rem;color:var(--muted)">Live &bull; updated <span id="last-refresh">—</span></span>
 </div>
+<div id="update-alert-container"></div>
 <div class="card-grid">{cards_html}</div>
 <div class="three-col">
   <div class="panel">
@@ -5348,6 +5437,73 @@ async function manualRefreshDash() {{
 }}
 setInterval(refreshDash, 3000);
 refreshDash();
+
+async function checkForUpdates() {{
+  try {{
+    const r = await fetch('/api/update/check', {{cache:'no-store'}});
+    if (!r.ok) return;
+    const d = await r.json();
+    const container = document.getElementById('update-alert-container');
+    if (!container) return;
+    
+    if (d.ok && d.available && d.count > 0) {{
+      const commitList = d.commits.slice(0, 5).map(c => `<li>${{c}}</li>`).join('');
+      const moreText = d.count > 5 ? `<li>...and ${{d.count - 5}} more</li>` : '';
+      
+      container.innerHTML = `
+        <div style="background:linear-gradient(135deg,#f59e0b 0%,#f97316 100%);color:white;padding:1rem 1.5rem;border-radius:.75rem;margin-bottom:1.5rem;box-shadow:0 4px 12px rgba(245,158,11,0.3);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem">
+          <div style="flex:1;min-width:200px">
+            <div style="font-size:1.1rem;font-weight:600;margin-bottom:.25rem">
+              <svg style="vertical-align:middle;margin-right:.5rem" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.778-7.778zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+              Update Available: ${{d.count}} new commit${{d.count > 1 ? 's' : ''}}
+            </div>
+            <div style="font-size:.85rem;opacity:.9">
+              <ul style="margin:.5rem 0 0 0;padding-left:1.5rem">${{commitList}}${{moreText}}</ul>
+            </div>
+          </div>
+          <button onclick="applyUpdate()" style="background:white;color:#f59e0b;border:none;padding:.75rem 1.5rem;border-radius:.5rem;font-weight:600;cursor:pointer;font-size:.95rem;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,0.15);transition:all .2s" onmouseover="this.style.transform='translateY(-2px)';this.style.boxShadow='0 4px 12px rgba(0,0,0,0.2)'" onmouseout="this.style.transform='';this.style.boxShadow='0 2px 8px rgba(0,0,0,0.15)'">
+            <svg style="vertical-align:middle;margin-right:.5rem" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+            Update Now
+          </button>
+        </div>
+      `;
+    }}
+  }} catch(e) {{
+    console.error('Update check failed:', e);
+  }}
+}}
+
+async function applyUpdate() {{
+  if (!confirm('Apply update and restart server?')) return;
+  
+  const container = document.getElementById('update-alert-container');
+  if (container) {{
+    container.innerHTML = `
+      <div style="background:linear-gradient(135deg,#3b82f6 0%,#2563eb 100%);color:white;padding:1.5rem;border-radius:.75rem;margin-bottom:1.5rem;text-align:center;box-shadow:0 4px 12px rgba(59,130,246,0.3)">
+        <div style="font-size:1.2rem;font-weight:600">
+          <svg style="vertical-align:middle;margin-right:.5rem;animation:spin 1s linear infinite" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+          DNS Server Update...
+        </div>
+        <div style="font-size:.9rem;opacity:.9;margin-top:.5rem">Applying updates and restarting server</div>
+      </div>
+      <style>@keyframes spin {{ from {{ transform: rotate(0deg); }} to {{ transform: rotate(360deg); }} }}</style>
+    `;
+  }}
+  
+  try {{
+    const r = await fetch('/api/update/apply', {{method:'POST'}});
+    const d = await r.json();
+    if (!d.ok) {{
+      alert('Update failed: ' + (d.error || 'Unknown error'));
+      location.reload();
+    }}
+  }} catch(e) {{
+    console.error('Update failed:', e);
+  }}
+}}
+
+checkForUpdates();
+setInterval(checkForUpdates, 21600000);
 </script>
 """)
 
@@ -9487,6 +9643,8 @@ class WebHandler(BaseHTTPRequestHandler):
                     **h,
                 })
             self.send_json(all_health)
+        elif path == "/api/update/check":
+            self.send_json(check_for_updates())
         elif path == "/api/audit-log":
             limit = int(params.get("limit", ["100"])[0])
             offset = int(params.get("offset", ["0"])[0])
@@ -9556,6 +9714,12 @@ class WebHandler(BaseHTTPRequestHandler):
             set_setting("filtering_enabled", "1")
             log_admin_action(self.session_user(), "filtering_resume", "Filtering resumed", self.client_address[0])
             self.send_json({"ok": True})
+        elif path == "/api/update/apply":
+            result = perform_update()
+            if result.get("ok"):
+                log_admin_action(self.session_user(), "update_apply", "Update applied, restarting...", self.client_address[0])
+                restart_server()
+            self.send_json(result)
         elif path == "/api/blocklists/add":
             global blocklist_manager
             name = form.get("name", "").strip()
@@ -10085,6 +10249,8 @@ CONSOLE_COMMANDS = [
     "cache clear",
     "update blocklist",
     "dedupe blocklists",
+    "check update",
+    "apply update",
     "restart",
     "stop",
     "help",
@@ -10168,6 +10334,8 @@ def console_help():
         "cache clear": "Clear DNS cache",
         "update blocklist": "Update remote blocklists",
         "dedupe blocklists": "Remove duplicate blocklist entries",
+        "check update": "Check for available updates from GitHub",
+        "apply update": "Install updates and restart server",
         "restart": "Restart runtime servers",
         "stop": "Stop server",
         "help": "Show this help",
@@ -10399,6 +10567,46 @@ def run_console_command(command):
         except Exception as exc:
             console_event("error", "Blocklist dedupe failed", exc)
         return True
+    if cmd in {"check update", "check updates", "update check"}:
+        console_event("work", "Checking for updates...")
+        try:
+            result = check_for_updates(force=True)
+            if not result.get("ok"):
+                console_event("error", "Update check failed", result.get("error", "Unknown error"))
+            elif result.get("available") and result.get("count", 0) > 0:
+                console_event("ok", f"Update available: {result['count']} new commit(s)")
+                for commit in result.get("commits", [])[:5]:
+                    console_event("info", f"  {commit}")
+                if result["count"] > 5:
+                    console_event("info", f"  ...and {result['count'] - 5} more")
+                console_event("info", "Use 'apply update' to install and restart")
+            else:
+                console_event("ok", "No updates available. You are up to date.")
+        except Exception as exc:
+            console_event("error", "Update check failed", exc)
+        return True
+    if cmd in {"apply update", "update apply", "install update"}:
+        console_event("work", "Checking for updates...")
+        try:
+            check_result = check_for_updates(force=True)
+            if not check_result.get("ok"):
+                console_event("error", "Update check failed", check_result.get("error", "Unknown error"))
+                return True
+            if not check_result.get("available") or check_result.get("count", 0) == 0:
+                console_event("ok", "No updates available. You are up to date.")
+                return True
+            
+            console_event("work", f"Applying {check_result['count']} update(s)...")
+            result = perform_update()
+            if result.get("ok"):
+                console_event("ok", "Update applied successfully")
+                console_event("info", "DNS Server Update...")
+                restart_server()
+            else:
+                console_event("error", "Update failed", result.get("error", "Unknown error"))
+        except Exception as exc:
+            console_event("error", "Update failed", exc)
+        return True
     if cmd == "restart":
         console_event("work", "Restarting runtime servers")
         try:
@@ -10590,6 +10798,9 @@ def main():
         log.flush()
         threading.Thread(target=_healthcheck_worker, name="healthcheck", daemon=True).start()
         log.write(f"{now_iso()} healthcheck worker ready\n")
+        log.flush()
+        start_update_checker()
+        log.write(f"{now_iso()} update checker ready (checks every 6 hours)\n")
         log.flush()
         try:
             eng = build_filter_engine()
