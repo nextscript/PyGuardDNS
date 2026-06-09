@@ -7273,8 +7273,15 @@ def settings_page(message="", is_error=False, values=None):
       <h1 class="page-title" style="margin-bottom:.15rem">Settings</h1>
       <div class="small text-secondary">Core DNS, cache, access, and response behavior.</div>
     </div>
-    <button class="btn btn-success">Save Changes</button>
+    <div style="display:flex;gap:.65rem;align-items:center">
+      <button type="button" class="btn btn-outline-light" id="settings-update-btn" onclick="settingsCheckUpdate()">
+        <svg style="vertical-align:middle;margin-right:.35rem" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+        Check for Updates
+      </button>
+      <button class="btn btn-success">Save Changes</button>
+    </div>
   </div>
+  <div id="settings-update-result"></div>
   {f'<div class="alert {"alert-danger" if is_error else "alert-success"}">{html_escape(message)}</div>' if message else ''}
 
   <div class="settings-grid">
@@ -7560,6 +7567,70 @@ async function updateFilterLists() {{
     pollFilterListUpdateStatus();
   }} catch(e) {{
     status.textContent = 'Error: ' + e.message;
+  }}
+}}
+
+async function settingsCheckUpdate() {{
+  const btn = document.getElementById('settings-update-btn');
+  const result = document.getElementById('settings-update-result');
+  if (!btn || !result) return;
+  
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Checking...';
+  result.innerHTML = '';
+  
+  try {{
+    const r = await fetch('/api/update/check', {{cache:'no-store'}});
+    const d = await r.json();
+    
+    if (d.ok) {{
+      if (d.available && d.count > 0) {{
+        const commitList = d.commits.slice(0, 5).map(c => `<li>${{c}}</li>`).join('');
+        const moreText = d.count > 5 ? `<li>...and ${{d.count - 5}} more</li>` : '';
+        result.innerHTML = `
+          <div class="alert alert-warning" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem">
+            <div>
+              <strong>Update available: ${{d.count}} new commit${{d.count > 1 ? 's' : ''}}</strong>
+              <ul style="margin:.5rem 0 0 0;padding-left:1.5rem;font-size:.85rem">${{commitList}}${{moreText}}</ul>
+            </div>
+            <button type="button" class="btn btn-warning" onclick="settingsApplyUpdate()">Update Now</button>
+          </div>
+        `;
+      }} else {{
+        result.innerHTML = '<div class="alert alert-success">You are up to date!</div>';
+      }}
+    }} else {{
+      result.innerHTML = `<div class="alert alert-danger">Update check failed: ${{d.error || 'Unknown error'}}</div>`;
+    }}
+  }} catch(e) {{
+    result.innerHTML = `<div class="alert alert-danger">Update check failed: ${{e.message}}</div>`;
+  }} finally {{
+    btn.disabled = false;
+    btn.innerHTML = '<svg style="vertical-align:middle;margin-right:.35rem" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>Check for Updates';
+  }}
+}}
+
+async function settingsApplyUpdate() {{
+  if (!confirm('Apply update and restart server?')) return;
+  
+  const result = document.getElementById('settings-update-result');
+  if (result) {{
+    result.innerHTML = `
+      <div class="alert alert-info text-center">
+        <span class="spinner-border spinner-border-sm me-2"></span>
+        <strong>Applying update...</strong> Server will restart.
+      </div>
+    `;
+  }}
+  
+  try {{
+    const r = await fetch('/api/update/apply', {{method:'POST'}});
+    const d = await r.json();
+    if (!d.ok) {{
+      result.innerHTML = `<div class="alert alert-danger">Update failed: ${{d.error || 'Unknown error'}}</div>`;
+    }}
+  }} catch(e) {{
+    result.innerHTML = `<div class="alert alert-danger">Update failed: ${{e.message}}</div>`;
   }}
 }}
 </script>""", "Settings")
