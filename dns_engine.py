@@ -110,8 +110,9 @@ class RegexIndex:
         if "|" in pattern or "?" in pattern:
             return set()
 
-        pattern = pattern.replace(r"\.", ".")
-        chunks = re.split(r"[\\\[\]\(\)\{\}\^\$\*\+\|]+", pattern)
+        # Work with a copy where escaped dots are plain dots (for splitting).
+        flattened = pattern.replace(r"\.", ".")
+        chunks = re.split(r"[\\\[\]\(\)\{\}\^\$\*\+\|]+", flattened)
 
         ignored = {"com", "net", "org", "de", "www", "http", "https", "example", "invalid", "local"}
         literals = set()
@@ -124,6 +125,28 @@ class RegexIndex:
                 continue
             if not re.fullmatch(r"[a-z0-9._-]+", chunk):
                 continue
+
+            # Reject literals that are adjacent to a dynamic regex construct
+            # (character class, group, quantifier, etc.) in the original
+            # pattern.  Such a literal may not appear as a standalone token
+            # in a matching domain, causing the candidate prefilter to skip
+            # the regex even though it would match.
+            #
+            # Safe neighbors:  ^ $ .  (alphanumeric means the literal is
+            # embedded in a longer safe identifier and is handled elsewhere).
+            # Unsafe neighbors:  [ ] ( ) { } * + \ etc.
+            idx = flattened.find(chunk)
+            if idx < 0:
+                continue
+            if idx > 0:
+                prev = flattened[idx - 1]
+                if prev not in "^.$_-" and not prev.isalnum():
+                    continue
+            end = idx + len(chunk)
+            if end < len(flattened):
+                nxt = flattened[end]
+                if nxt not in "$.-_" and not nxt.isalnum():
+                    continue
 
             literals.add(chunk)
             for label in chunk.split("."):
