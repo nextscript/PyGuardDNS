@@ -889,6 +889,7 @@ class BlocklistManager:
             list_id = str(bl["id"])
             cache = load_blocklist_cache(list_id)
             if cache:
+                cache["list_name"] = bl["name"]
                 build_indexes_from_cache(cache, engine)
 
     def rebuild_cache(self, list_id: int) -> dict:

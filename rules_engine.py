@@ -428,6 +428,7 @@ def read_unsupported_rules(list_id: str) -> list:
 
 def build_indexes_from_cache(cache: dict, engine) -> dict:
     counts = {"valid": 0, "invalid": 0}
+    source = cache.get("list_name") or cache.get("list_id", "blocklist")
     for raw in cache.get("rules", []):
         result = parse_rule_line(raw)
         if result is None or "error" in result:
@@ -437,26 +438,26 @@ def build_indexes_from_cache(cache: dict, engine) -> dict:
         pattern = result["pattern"]
         if prefix == "bd::":
             engine.exact_block.add(pattern)
-            engine._track_source(pattern, cache.get("list_id", "blocklist"))
+            engine._track_source(pattern, source)
         elif prefix == "bs::":
             engine.suffix_block.add(pattern)
             engine.suffix_block_trie.add(pattern, pattern)
-            engine._track_source(pattern, cache.get("list_id", "blocklist"))
+            engine._track_source(pattern, source)
         elif prefix == "br::":
             compiled = re.compile(pattern, re.IGNORECASE)
             engine.regex_block.add(compiled, f"/{pattern}/")
-            engine._track_source(f"/{pattern}/", cache.get("list_id", "blocklist"))
+            engine._track_source(f"/{pattern}/", source)
         elif prefix == "ad::":
             engine.exact_allow.add(pattern)
-            engine._track_source(pattern, cache.get("list_id", "blocklist"))
+            engine._track_source(pattern, source)
         elif prefix == "as::":
             engine.suffix_allow.add(pattern)
             engine.suffix_allow_trie.add(pattern, pattern)
-            engine._track_source(pattern, cache.get("list_id", "blocklist"))
+            engine._track_source(pattern, source)
         elif prefix == "ar::":
             compiled = re.compile(pattern, re.IGNORECASE)
             engine.regex_allow.add(compiled, f"/{pattern}/")
-            engine._track_source(f"/{pattern}/", cache.get("list_id", "blocklist"))
+            engine._track_source(f"/{pattern}/", source)
         counts["valid"] += 1
     return counts
 
