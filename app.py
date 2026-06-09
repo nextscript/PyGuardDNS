@@ -1464,7 +1464,12 @@ def one(query, params=()):
 
 
 def normalize_domain(domain):
-    domain = (domain or "").strip().rstrip(".").lower()
+    domain = (domain or "").strip()
+    if "://" in domain:
+        from urllib.parse import urlparse
+        parsed = urlparse(domain)
+        domain = parsed.hostname or domain
+    domain = domain.rstrip(".").lower()
     if not domain:
         return ""
     try:
