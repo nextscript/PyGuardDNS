@@ -26,6 +26,26 @@ PREFIX_MEANING = {
     "ar::": "allow regex",
 }
 
+DANGEROUS_REGEX_MESSAGE = "Pattern is too broad or may cause excessive CPU usage."
+
+
+def is_dangerous_regex(pattern: str) -> bool:
+    cleaned = pattern.strip()
+
+    if cleaned in (".*", ".+", "^.*$", "^.+$"):
+        return True
+
+    if cleaned.startswith(".*") or cleaned.startswith(".+"):
+        return True
+
+    if re.search(r"\([^()]*[+*?]\)[+*?]", cleaned):
+        return True
+
+    if cleaned.count("(") != cleaned.count(")") and ("+" in cleaned or "*" in cleaned):
+        return True
+
+    return False
+
 _write_lock = threading.Lock()
 
 
@@ -61,6 +81,8 @@ def parse_rule_line(line: str) -> Optional[dict]:
             re.compile(pattern)
         except re.error:
             return {"error": "Invalid regex pattern", "line": line}
+        if is_dangerous_regex(pattern):
+            return {"error": DANGEROUS_REGEX_MESSAGE, "line": line}
         return {"action": "block", "type": "regex", "pattern": pattern, "raw": line, "prefix": "br::"}
     if line.startswith("ad::"):
         domain = line[4:].strip()
@@ -80,6 +102,8 @@ def parse_rule_line(line: str) -> Optional[dict]:
             re.compile(pattern)
         except re.error:
             return {"error": "Invalid regex pattern", "line": line}
+        if is_dangerous_regex(pattern):
+            return {"error": DANGEROUS_REGEX_MESSAGE, "line": line}
         return {"action": "allow", "type": "regex", "pattern": pattern, "raw": line, "prefix": "ar::"}
 
     prefix = line.split("::")[0] + "::" if "::" in line else ""
