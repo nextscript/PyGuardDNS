@@ -461,7 +461,6 @@ data/trust_anchors.json   RFC 5011 trust anchor state
 requirements.txt          Runtime Python dependencies
 start-pyguarddns.bat      Windows start script
 start-pyguarddns.sh       Linux/macOS start script
-tests/                    Pytest test suite
 ```
 
 
