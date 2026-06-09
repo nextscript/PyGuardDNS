@@ -10415,7 +10415,7 @@ def ensure_requirements():
 
 def main():
     global dns_servers, encrypted_dns_servers, _active_engine, _filter_engine_generation
-    ensure_requirements()
+    threading.Thread(target=ensure_requirements, name="ensure-reqs", daemon=True).start()
     install_crash_handlers()
     if not acquire_instance_lock():
         console_event("warn", f"{APP_NAME} is already running", "Please do not start a second window.")
@@ -10435,9 +10435,9 @@ def main():
             ram_location = RAM_DB_PATH if RAM_DB_PATH else ":memory:"
             log.write(f"{now_iso()} database running in RAM ({ram_location}) with {DB_MEMORY_SYNC_INTERVAL:g}s disk sync\n")
             log.flush()
-        dnssec_ok, dnssec_state = process_dnssec_trust_anchor_startup()
-        log.write(f"{now_iso()} dnssec trust-anchor startup {'ready' if dnssec_ok else 'failed'} {dnssec_state}\n")
-        log.flush()
+        threading.Thread(target=lambda: (
+            process_dnssec_trust_anchor_startup()
+        ), name="dnssec-startup", daemon=True).start()
         log.write(f"{now_iso()} web ready on {WEB_HOST}:{WEB_PORT}\n")
         log.flush()
         start_db_writer()
@@ -10452,18 +10452,14 @@ def main():
         threading.Thread(target=_healthcheck_worker, name="healthcheck", daemon=True).start()
         log.write(f"{now_iso()} healthcheck worker ready\n")
         log.flush()
-        invalidate_rules_cache()
-        log.write(f"{now_iso()} custom rule cache lazy\n")
-        log.flush()
-        # Force engine rebuild right before DNS starts
         try:
             eng = build_filter_engine()
             with _active_engine_lock:
                 _active_engine = eng
                 _filter_engine_generation += 1
-            log.write(f"{now_iso()} engine force-reloaded: {len(eng.suffix_block)} suffix blocks, gen={_filter_engine_generation}\n")
+            log.write(f"{now_iso()} engine ready: {len(eng.suffix_block)} suffix blocks, gen={_filter_engine_generation}\n")
         except Exception as exc:
-            log.write(f"{now_iso()} engine force-reload FAILED: {exc}\n")
+            log.write(f"{now_iso()} engine build FAILED: {exc}\n")
         log.flush()
         dns_servers = list(start_dns_servers())
         log.write(f"{now_iso()} dns ready on {DNS_HOST}:{DNS_PORT}\n")
