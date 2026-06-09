@@ -144,9 +144,13 @@ def create(name: str, address: str, port: int = 53, resolver: str = "",
             "latency_ms": 0.0,
             "success_rate": 1.0,
             "timeout_count": 0,
+            "tls_failures": 0,
+            "http_failures": 0,
+            "servfail_count": 0,
             "last_error": "",
             "last_checked": 0.0,
             "consecutive_failures": 0,
+            "backoff_level": 0,
             "paused": False,
             "total_queries": 0,
             "successful_queries": 0,
@@ -189,6 +193,13 @@ def update_health(upstream_id: int, success: bool, latency_ms: float = 0.0, erro
     h["total_queries"] = h.get("total_queries", 0) + 1
     h["successful_queries"] = h.get("successful_queries", 0) + (1 if success else 0)
     h["timeout_count"] = h.get("timeout_count", 0) + (0 if success else 1)
+    error_lower = (error or "").lower()
+    if "tls" in error_lower or "ssl" in error_lower or "certificate" in error_lower:
+        h["tls_failures"] = h.get("tls_failures", 0) + 1
+    if "http" in error_lower or "status" in error_lower:
+        h["http_failures"] = h.get("http_failures", 0) + 1
+    if "servfail" in error_lower:
+        h["servfail_count"] = h.get("servfail_count", 0) + 1
     total = h["total_queries"]
     h["success_rate"] = h["successful_queries"] / total if total > 0 else 1.0
     h["consecutive_failures"] = (h.get("consecutive_failures", 0) + 1) if not success else 0
@@ -198,10 +209,29 @@ def update_health(upstream_id: int, success: bool, latency_ms: float = 0.0, erro
         h["last_error"] = ""
         if h["consecutive_failures"] == 0:
             h["paused"] = False
+            h["backoff_level"] = 0
     else:
         h["last_error"] = (error or "")[:500]
-        if h["consecutive_failures"] >= 5:
+        backoff_level = h.get("backoff_level", 0)
+        cf = h["consecutive_failures"]
+        if cf == 1:
+            h["backoff_level"] = 0
+        elif cf >= 10:
+            h["backoff_level"] = 4
+        elif cf >= 7:
+            h["backoff_level"] = 3
+        elif cf >= 4:
+            h["backoff_level"] = 2
+        if h.get("backoff_level", 0) >= 4:
             h["paused"] = True
+        elif h.get("backoff_level", 0) >= 2:
+            backoff_seconds = {0: 0, 1: 30, 2: 60, 3: 300, 4: 900}.get(h.get("backoff_level", 0), 0)
+            if backoff_seconds and h.get("last_checked", 0) > 0:
+                backoff_until = h.get("backoff_until", 0)
+                if backoff_until > time.time():
+                    h["paused"] = True
+                else:
+                    h["paused"] = False
     data["latency_ms"] = h["latency_ms"] if success else data.get("latency_ms")
     data["last_error"] = h["last_error"]
     _save_file(data)
@@ -227,6 +257,23 @@ def set_health_paused(upstream_id: int, paused: bool) -> bool:
     return True
 
 
+def _health_score(data: dict) -> float:
+    h = data.get("health", {})
+    success_rate = h.get("success_rate", 1.0)
+    latency = data.get("latency_ms") or 999999
+    total = h.get("total_queries", 0)
+    if total < 5:
+        base = 0.8
+    else:
+        base = success_rate * 100.0
+    latency_score = max(0.0, 100.0 - latency * 0.5)
+    timeout_penalty = h.get("timeout_count", 0) * 2.0
+    failure_penalty = h.get("consecutive_failures", 0) * 5.0
+    tls_penalty = h.get("tls_failures", 0) * 10.0
+    score = base + latency_score - timeout_penalty - failure_penalty - tls_penalty
+    return max(0.0, score)
+
+
 def active_upstreams() -> list[dict]:
     _load_cache()
     result = []
@@ -248,9 +295,11 @@ def active_upstreams() -> list[dict]:
                 "last_checked": h.get("last_checked", 0),
                 "total_queries": h.get("total_queries", 0),
                 "successful_queries": h.get("successful_queries", 0),
+                "health_score": _health_score(data),
             })
     result.sort(key=lambda x: (
         0 if not x.get("last_error") else 1,
+        -(x.get("health_score") or 0),
         x.get("latency_ms") or 999999,
         x.get("id", 0),
     ))

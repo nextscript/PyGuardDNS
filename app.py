@@ -2405,6 +2405,32 @@ def query_doh_stamp_upstream(upstream, request, timeout=4.0):
     return query_doh_upstream(converted, request, timeout=timeout)
 
 
+def query_dot_stamp_upstream(upstream, request, timeout=4.0):
+    parsed = parse_dot_stamp(upstream["resolver"])
+    converted = dict(upstream)
+    converted.update({
+        "resolver": f"tls://{parsed['address']}",
+        "address": parsed["address"],
+        "port": parsed["port"],
+        "resolver_type": "dot",
+        "transport": "tls",
+    })
+    return query_dot_upstream(converted, request, timeout=timeout)
+
+
+def query_doq_stamp_upstream(upstream, request, timeout=4.0):
+    parsed = parse_doq_stamp(upstream["resolver"])
+    converted = dict(upstream)
+    converted.update({
+        "resolver": f"quic://{parsed['address']}",
+        "address": parsed["address"],
+        "port": parsed["port"],
+        "resolver_type": "doq",
+        "transport": "quic",
+    })
+    return query_doq_upstream(converted, request, timeout=timeout)
+
+
 def query_dns_stamp_unknown_upstream(upstream, request, timeout=4.0):
     parsed = detect_upstream(upstream["resolver"])
     if parsed.get("type") == "dns_stamp_unknown" or not parsed.get("supported"):
@@ -2629,8 +2655,6 @@ def dot_tls_server_name(host):
 
 
 def query_doq_upstream(upstream, request, timeout=4.0):
-    if os.environ.get("LOCALDNSGUARD_ENABLE_EXPERIMENTAL_DOQ_UPSTREAM", "0") != "1":
-        raise OSError("DoQ upstream forwarding is experimental and disabled by default")
     try:
         from aioquic.asyncio.protocol import QuicConnectionProtocol
         from aioquic.quic.configuration import QuicConfiguration
@@ -2798,6 +2822,41 @@ def parse_dnscrypt_relay_stamp(stamp):
         raise ValueError("DNSCrypt relay stamp is missing server address")
     host, port = split_host_port(server, 443)
     return {"address": host, "port": port}
+
+
+def parse_dot_stamp(stamp):
+    if not stamp.startswith("sdns://"):
+        raise ValueError("invalid DoT stamp")
+    raw = _stamp_b64decode(stamp[7:])
+    if len(raw) < 3 or raw[0] != 0x03:
+        raise ValueError("not a DoT stamp")
+    offset = 1 + 8
+    address, offset = _read_stamp_lp(raw, offset)
+    port_bytes, offset = _read_stamp_lp(raw, offset)
+    provider_name, offset = _read_stamp_lp(raw, offset)
+    addr = address.decode("utf-8", errors="ignore").strip()
+    port_str = port_bytes.decode("utf-8", errors="ignore").strip()
+    provider = provider_name.decode("utf-8", errors="ignore").strip()
+    port = int(port_str) if port_str else 853
+    host, _ = split_host_port(addr, port)
+    return {"address": host, "port": port, "provider_name": provider}
+
+def parse_doq_stamp(stamp):
+    if not stamp.startswith("sdns://"):
+        raise ValueError("invalid DoQ stamp")
+    raw = _stamp_b64decode(stamp[7:])
+    if len(raw) < 3 or raw[0] != 0x04:
+        raise ValueError("not a DoQ stamp")
+    offset = 1 + 8
+    address, offset = _read_stamp_lp(raw, offset)
+    port_bytes, offset = _read_stamp_lp(raw, offset)
+    provider_name, offset = _read_stamp_lp(raw, offset)
+    addr = address.decode("utf-8", errors="ignore").strip()
+    port_str = port_bytes.decode("utf-8", errors="ignore").strip()
+    provider = provider_name.decode("utf-8", errors="ignore").strip()
+    port = int(port_str) if port_str else 853
+    host, _ = split_host_port(addr, port)
+    return {"address": host, "port": port, "provider_name": provider}
 
 
 def extract_txt_answers(response):
@@ -3403,6 +3462,34 @@ def detect_upstream(resolver):
                 })
             except Exception as exc:
                 result.update({"address": raw, "port": 0, "type": stamp_type, "transport": "https", "supported": False, "label": f"{labels[stamp_type]} ({exc})"})
+        elif stamp_type == "dot_stamp":
+            try:
+                parsed_stamp = parse_dot_stamp(raw)
+                result.update({
+                    "resolver": f"tls://{parsed_stamp['address']}",
+                    "address": parsed_stamp["address"],
+                    "port": parsed_stamp["port"],
+                    "type": "dot",
+                    "transport": "tls",
+                    "supported": True,
+                    "label": labels[stamp_type],
+                })
+            except Exception as exc:
+                result.update({"address": raw, "port": 0, "type": stamp_type, "transport": "tls", "supported": False, "label": f"{labels[stamp_type]} ({exc})"})
+        elif stamp_type == "doq_stamp":
+            try:
+                parsed_stamp = parse_doq_stamp(raw)
+                result.update({
+                    "resolver": f"quic://{parsed_stamp['address']}",
+                    "address": parsed_stamp["address"],
+                    "port": parsed_stamp["port"],
+                    "type": "doq",
+                    "transport": "quic",
+                    "supported": True,
+                    "label": labels[stamp_type],
+                })
+            except Exception as exc:
+                result.update({"address": raw, "port": 0, "type": stamp_type, "transport": "quic", "supported": False, "label": f"{labels[stamp_type]} ({exc})"})
         elif stamp_type == "dnscrypt_relay":
             try:
                 parsed_stamp = parse_dnscrypt_relay_stamp(raw)
@@ -3442,9 +3529,7 @@ def detect_upstream(resolver):
                 suffix = " (with port)" if ":" in rest and not rest.startswith("[") else ""
                 if not looks_like_ip(host):
                     suffix = " (hostname)"
-                supported = resolver_type in ("plain_udp", "plain_tcp", "dot")
-                if resolver_type == "doq":
-                    label += " (experimental, disabled by default)"
+                supported = resolver_type in ("plain_udp", "plain_tcp", "dot", "doq")
                 result.update({"address": host, "port": port, "type": resolver_type + ("_host" if not looks_like_ip(host) and resolver_type in ("plain_udp", "plain_tcp") else ""), "transport": transport, "supported": supported, "label": label + suffix})
             return result
 
@@ -3456,10 +3541,10 @@ def detect_upstream(resolver):
     transport = "udp"
     supported = True
     if has_port and port == 853:
-        label = "Encrypted DNS-over-QUIC, inferred from port 853 (experimental, disabled by default)"
+        label = "Encrypted DNS-over-QUIC, inferred from port 853"
         resolver_type = "doq"
         transport = "quic"
-        supported = False
+        supported = True
     elif has_port:
         label = "Regular DNS over UDP, with port"
     elif not is_ip:
@@ -3523,6 +3608,19 @@ def get_cached(domain, qtype_name):
             return None
         if item["expires"] > time.time():
             return item["response"]
+        stale_enabled = get_setting("serve_stale_enabled", "0") == "1"
+        if stale_enabled:
+            max_stale = int(get_setting("serve_stale_max_age", "86400") or "86400")
+            age = time.time() - item["expires"]
+            if age <= max_stale and not item.get("stale_refresh"):
+                item["stale_refresh"] = True
+                threading.Thread(target=_refresh_stale_cache_entry, args=(domain, qtype_name, key), daemon=True).start()
+                return item["response"]
+            if age > max_stale:
+                evicted = dns_cache.pop(key, None)
+                if evicted:
+                    cache_bytes_used -= len(evicted.get("response", b""))
+                return None
         if get_setting("cache_optimistic", "0") == "1" and not item.get("stale_refresh"):
             item["stale_refresh"] = True
             threading.Thread(target=_refresh_stale_cache_entry, args=(domain, qtype_name, key), daemon=True).start()
@@ -3538,19 +3636,15 @@ def _refresh_stale_cache_entry(domain, qtype_name, key):
     try:
         qtype_code = QTYPE_CODE.get(qtype_name)
         if not qtype_code:
-            with cache_lock:
-                evicted = dns_cache.pop(key, None)
-                if evicted:
-                    cache_bytes_used -= len(evicted.get("response", b""))
             return
         _, request = build_query(domain, qtype_code)
         response, _ = forward_query(request)
         set_cached(domain, qtype_name, response)
     except Exception:
         with cache_lock:
-            evicted = dns_cache.pop(key, None)
-            if evicted:
-                cache_bytes_used -= len(evicted.get("response", b""))
+            item = dns_cache.get(key)
+            if item:
+                item.pop("stale_refresh", None)
 
 
 def set_cached(domain, qtype_name, response):
@@ -3576,7 +3670,7 @@ def set_cached(domain, qtype_name, response):
             evicted = dns_cache.pop(oldest_key, None)
             if evicted:
                 cache_bytes_used -= len(evicted.get("response", b""))
-        dns_cache[key] = {"expires": time.time() + ttl, "response": response}
+        dns_cache[key] = {"expires": time.time() + ttl, "response": response, "fresh": True}
         cache_bytes_used += entry_size
 
 
@@ -3585,6 +3679,7 @@ def cache_stats():
     with cache_lock:
         entries = len(dns_cache)
         expired = sum(1 for item in dns_cache.values() if item.get("expires", 0) <= now)
+        stale = sum(1 for item in dns_cache.values() if item.get("expires", 0) <= now and item.get("stale_refresh"))
         bytes_used = cache_bytes_used
         soonest_expiry = min((item.get("expires", 0) for item in dns_cache.values()), default=0)
     row = one("""
@@ -3603,6 +3698,7 @@ def cache_stats():
         "enabled": get_setting("cache_enabled", "1") == "1",
         "entries": entries,
         "expired_entries": expired,
+        "stale_entries": stale,
         "bytes_used": bytes_used,
         "max_bytes": max_bytes,
         "usage_percent": round((bytes_used / max_bytes * 100) if max_bytes else 0, 1),
@@ -3613,6 +3709,8 @@ def cache_stats():
         "min_ttl_seconds": int(get_setting("cache_min_ttl", "0") or "0"),
         "max_ttl_seconds": int(get_setting("cache_max_ttl", "0") or "0"),
         "next_expiry_seconds": max(0, round(soonest_expiry - now)) if soonest_expiry else None,
+        "serve_stale_enabled": get_setting("serve_stale_enabled", "0") == "1",
+        "serve_stale_max_age": int(get_setting("serve_stale_max_age", "86400") or "86400"),
     }
 
 
@@ -3653,7 +3751,7 @@ def plain_upstream_supported(upstream):
 
 
 def upstream_supported(upstream):
-    return plain_upstream_supported(upstream) or upstream.get("resolver_type") in ("doh", "doh_stamp", "doh_http3", "dot", "dnscrypt_stamp", "dnscrypt_relay", "dns_stamp_unknown", "plain_dns_stamp")
+    return plain_upstream_supported(upstream) or upstream.get("resolver_type") in ("doh", "doh_stamp", "doh_http3", "dot", "dot_stamp", "doq", "doq_stamp", "dnscrypt_stamp", "dnscrypt_relay", "dns_stamp_unknown", "plain_dns_stamp")
 
 
 def probe_upstream(upstream):
@@ -3675,7 +3773,11 @@ def probe_upstream(upstream):
     elif upstream.get("resolver_type") == "dot":
         query_dot_upstream(upstream, request, timeout=4.0)
     elif upstream.get("resolver_type") == "doq":
-        raise OSError("DoQ upstream forwarding is experimental and disabled by default")
+        query_doq_upstream(upstream, request, timeout=4.0)
+    elif upstream.get("resolver_type") == "dot_stamp":
+        query_dot_stamp_upstream(upstream, request, timeout=4.0)
+    elif upstream.get("resolver_type") == "doq_stamp":
+        query_doq_stamp_upstream(upstream, request, timeout=4.0)
     elif upstream.get("resolver_type") == "dnscrypt_stamp":
         query_dnscrypt_upstream(upstream, request, timeout=4.0)
     elif upstream.get("resolver_type") in ("dns_stamp_unknown", "plain_dns_stamp"):
@@ -3783,7 +3885,11 @@ def _query_one_upstream(upstream, request, update_metrics=True, timeout_override
     elif upstream.get("resolver_type") == "dot":
         response = query_dot_upstream(upstream, request, timeout=timeout)
     elif upstream.get("resolver_type") == "doq":
-        raise OSError("DoQ upstream forwarding is experimental and disabled by default")
+        response = query_doq_upstream(upstream, request, timeout=timeout)
+    elif upstream.get("resolver_type") == "dot_stamp":
+        response = query_dot_stamp_upstream(upstream, request, timeout=timeout)
+    elif upstream.get("resolver_type") == "doq_stamp":
+        response = query_doq_stamp_upstream(upstream, request, timeout=timeout)
     elif upstream.get("resolver_type") == "dnscrypt_stamp":
         response = query_dnscrypt_upstream(upstream, request, timeout=timeout)
     elif upstream.get("resolver_type") in ("dns_stamp_unknown", "plain_dns_stamp"):
@@ -3820,9 +3926,27 @@ def _forward_query(request, timeout_override=None):
 
 
 def _forward_query_parallel(request, timeout_override=None):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     upstreams = [u for u in active_upstreams() if upstream_supported(u)]
     if not upstreams:
         return _query_fallback_plain(request)
+    try:
+        race_count = max(1, int(get_setting("upstream_race_count", "2")))
+    except (ValueError, TypeError):
+        race_count = 2
+    race_count = min(race_count, len(upstreams))
+    if race_count < 2:
+        ordered = sorted(upstreams, key=lambda u: u.get("latency_ms") or 999999)
+        for upstream in ordered:
+            try:
+                return _query_one_upstream(upstream, request, timeout_override=timeout_override)
+            except OSError as exc:
+                maybe_update_upstream_status(upstream, latency=None, error=str(exc))
+        raise OSError("all upstreams failed")
+    candidates = sorted(upstreams, key=lambda u: (
+        u.get("latency_ms") or 999999,
+        -(u.get("health", {}).get("success_rate", 1.0)),
+    ))[:race_count]
     first = [None]
     errors = []
     lock = threading.Lock()
@@ -3839,12 +3963,19 @@ def _forward_query_parallel(request, timeout_override=None):
             maybe_update_upstream_status(upstream, latency=None, error=str(exc))
             with lock:
                 errors.append(str(exc))
-                if len(errors) >= len(upstreams):
+                if len(errors) >= len(candidates):
                     done.set()
 
-    for u in upstreams:
-        threading.Thread(target=try_one, args=(u,), daemon=True).start()
-    done.wait(timeout=3.5)
+    with ThreadPoolExecutor(max_workers=race_count) as ex:
+        futures = [ex.submit(try_one, u) for u in candidates]
+        try:
+            for f in as_completed(futures, timeout=3.5):
+                if first[0] is not None:
+                    for ff in futures:
+                        ff.cancel()
+                    break
+        except TimeoutError:
+            pass
     if first[0] is not None:
         return first[0]
     raise OSError(errors[-1] if errors else "all upstreams timed out")
