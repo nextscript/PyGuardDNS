@@ -10,11 +10,25 @@ import threading
 import time
 import zipfile
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+from rules_engine import (
+    convert_blocklist_text,
+    save_blocklist_cache,
+    save_cosmetic_rules,
+    save_unsupported_rules,
+    save_original_text,
+    load_original_text,
+    load_blocklist_cache,
+    build_indexes_from_cache,
+    parse_rule_line,
+    read_cosmetic_rules,
+    read_unsupported_rules,
+)
 
 try:
     import idna
@@ -533,24 +547,6 @@ class BlocklistManager:
                 continue
             seen_entries.add(entry)
             unique_entries.append(entry)
-        if skip_existing_entries:
-            existing_entries = {
-                (row["action"], row["pattern_type"], row["pattern"])
-                for row in self.db.execute(
-                    """
-                    SELECT be.action, be.pattern_type, be.pattern
-                    FROM blocklist_entries be
-                    JOIN blocklists bl ON bl.id = be.blocklist_id
-                    WHERE bl.list_type=?
-                    """,
-                    (list_type,),
-                ).fetchall()
-            }
-            before_existing_filter = len(unique_entries)
-            unique_entries = [entry for entry in unique_entries if entry not in existing_entries]
-            report["existing_rule_duplicates"] = before_existing_filter - len(unique_entries)
-        else:
-            report["existing_rule_duplicates"] = 0
         if not unique_entries:
             return 0
         created = now_iso()
@@ -561,14 +557,18 @@ class BlocklistManager:
                 """INSERT INTO blocklists(name,url,list_type,rule_count,last_update,last_successful_update,last_rule_count,
                    last_unique_rule_count,last_sha256,etag,last_modified,duplicate_rule_count,import_report,created_at)
                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (name, source, list_type, len(unique_entries), created, created, len(unique_entries), report["unique_rules"], sha256, etag, last_modified, report["duplicate_rules"] + report["existing_rule_duplicates"], json.dumps(report), created),
+                (name, source, list_type, len(unique_entries), created, created, len(unique_entries), report["unique_rules"], sha256, etag, last_modified, report["duplicate_rules"], json.dumps(report), created),
             )
             bl_id = curs.lastrowid
-            self.db.executemany(
-                "INSERT INTO blocklist_entries(blocklist_id,action,pattern_type,pattern,created_at) VALUES(?,?,?,?,?)",
-                [(bl_id, action, pt, pattern, created) for action, pt, pattern in unique_entries],
-            )
             self.db.commit()
+        bl_id_val = curs.lastrowid
+        list_id_str = str(bl_id_val)
+        result = convert_blocklist_text(text, list_id_str, source)
+        save_blocklist_cache(list_id_str, result["cache"])
+        save_cosmetic_rules(list_id_str, result["cosmetic"])
+        save_unsupported_rules(list_id_str, result["unsupported"])
+        if not source:
+            save_original_text(list_id_str, text)
         if notify_reload:
             self._notify_reload()
         return len(unique_entries)
@@ -601,11 +601,6 @@ class BlocklistManager:
                 report = import_report(entries, total_lines=len(text.splitlines()))
                 created = now_iso()
                 with self._update_lock:
-                    self._delete_entries(list_id)
-                    self.db.executemany(
-                        "INSERT INTO blocklist_entries(blocklist_id,action,pattern_type,pattern,created_at) VALUES(?,?,?,?,?)",
-                        [(list_id, action, pt, pattern, created) for action, pt, pattern in entries],
-                    )
                     self.db.execute(
                         """UPDATE blocklists SET rule_count=?, last_update=?, last_error='', last_successful_update=?,
                            last_rule_count=?, last_unique_rule_count=?, last_sha256=?, etag=?, last_modified=?,
@@ -614,6 +609,11 @@ class BlocklistManager:
                          fetched.get("etag", ""), fetched.get("last_modified", ""), report["duplicate_rules"], json.dumps(report), list_id),
                     )
                     self.db.commit()
+                list_id_str = str(list_id)
+                result = convert_blocklist_text(text, list_id_str, item.get("url", ""))
+                save_blocklist_cache(list_id_str, result["cache"])
+                save_cosmetic_rules(list_id_str, result["cosmetic"])
+                save_unsupported_rules(list_id_str, result["unsupported"])
                 self._notify_reload()
             except Exception as exc:
                 with self._update_lock:
@@ -748,9 +748,22 @@ class BlocklistManager:
         if not item:
             return False
         with self._update_lock:
-            self._delete_entries(list_id)
             self.db.execute("DELETE FROM blocklists WHERE id=?", (list_id,))
             self.db.commit()
+        list_id_str = str(list_id)
+        for subdir in ("cache", "cosmetic", "unsupported", "original"):
+            path = os.path.join("data", "blocklists", subdir, f"{list_id_str}.json")
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except OSError:
+                pass
+            txt_path = os.path.join("data", "blocklists", subdir, f"{list_id_str}.txt")
+            try:
+                if os.path.isfile(txt_path):
+                    os.remove(txt_path)
+            except OSError:
+                pass
         if notify_reload:
             self._notify_reload()
         return True
@@ -768,9 +781,8 @@ class BlocklistManager:
     def get_stats(self):
         rows = self.db.execute(
             "SELECT bl.id, bl.name, bl.list_type, bl.rule_count, bl.last_update, "
-            "bl.last_error, bl.enabled, COUNT(be.id) as actual_rules "
-            "FROM blocklists bl LEFT JOIN blocklist_entries be ON be.blocklist_id = bl.id "
-            "GROUP BY bl.id ORDER BY bl.id ASC"
+            "bl.last_error, bl.enabled "
+            "FROM blocklists bl ORDER BY bl.id ASC"
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -781,51 +793,126 @@ class BlocklistManager:
     def _delete_by_name(self, name: str):
         existing = self.db.execute("SELECT id FROM blocklists WHERE name=?", (name,)).fetchone()
         if existing:
-            self._delete_entries(existing["id"])
-            self.db.execute("DELETE FROM blocklists WHERE id=?", (existing["id"],))
-
-    def _delete_entries(self, list_id: int):
-        self.db.execute("DELETE FROM blocklist_entries WHERE blocklist_id=?", (list_id,))
+            self.delete(existing["id"], notify_reload=False)
 
     def _notify_reload(self):
         if self.reload_callback:
             self.reload_callback()
 
     def get_entries(self, list_id: int):
-        return [dict(r) for r in self.db.execute(
-            """
-            SELECT be.action, be.pattern_type, be.pattern, bl.name as list_name
-            FROM blocklist_entries be
-            JOIN blocklists bl ON bl.id = be.blocklist_id
-            WHERE be.blocklist_id=? AND bl.enabled=1
-            ORDER BY be.id ASC
-            """,
-            (list_id,)
-        ).fetchall()]
+        cache = load_blocklist_cache(str(list_id))
+        if not cache:
+            return []
+        entries = []
+        for raw in cache.get("rules", []):
+            result = parse_rule_line(raw)
+            if result is None or "error" in result:
+                continue
+            pt = result["type"]
+            if pt in ("exact", "suffix"):
+                pattern_type = "domain"
+            elif pt == "regex":
+                pattern_type = "regex"
+            else:
+                continue
+            entries.append({
+                "action": result["action"],
+                "pattern_type": pattern_type,
+                "pattern": result["pattern"],
+                "list_name": "",
+            })
+        return entries
 
     def load_into_engine(self, engine):
         rows = self.db.execute(
-            """
-            SELECT be.action, be.pattern_type, be.pattern, bl.name as list_name
-            FROM blocklist_entries be
-            JOIN blocklists bl ON bl.id = be.blocklist_id
-            WHERE bl.enabled = 1
-            ORDER BY be.id ASC
-            """
+            "SELECT id, name, url FROM blocklists WHERE enabled = 1 ORDER BY id ASC"
         ).fetchall()
-        for row in rows:
-            action = row["action"]
-            pt = row["pattern_type"]
-            pattern = row["pattern"]
-            list_name = row["list_name"]
-            if pt == "domain":
-                raw = f"{'@@' if action == 'allow' else ''}||{pattern}^"
-            elif pt == "regex":
-                raw = f"/{pattern}/"
-                if action == "allow":
-                    raw = "@@" + raw
-            elif pt == "wildcard":
-                raw = f"{'@@' if action == 'allow' else ''}*.{pattern.lstrip('*.')}"
-            else:
+        for bl in rows:
+            list_id = str(bl["id"])
+            cache = load_blocklist_cache(list_id)
+            if cache:
+                build_indexes_from_cache(cache, engine)
                 continue
-            engine.add_rule(raw, action, list_name=list_name)
+            old_entries = self.db.execute(
+                "SELECT action, pattern_type, pattern FROM blocklist_entries WHERE blocklist_id=? ORDER BY id ASC",
+                (bl["id"],),
+            ).fetchall()
+            if old_entries:
+                text_lines = []
+                for row in old_entries:
+                    action = row["action"]
+                    pt = row["pattern_type"]
+                    pattern = row["pattern"]
+                    if pt == "domain":
+                        text_lines.append(f"{'@@' if action == 'allow' else ''}||{pattern}^")
+                    elif pt == "regex":
+                        raw = f"/{pattern}/"
+                        text_lines.append(f"@@{raw}" if action == "allow" else raw)
+                    elif pt == "wildcard":
+                        text_lines.append(f"{'@@' if action == 'allow' else ''}*.{pattern.lstrip('*.')}")
+                text = "\n".join(text_lines)
+                url = bl.get("url", "")
+                result = convert_blocklist_text(text, list_id, url)
+                save_blocklist_cache(list_id, result["cache"])
+                save_cosmetic_rules(list_id, result["cosmetic"])
+                save_unsupported_rules(list_id, result["unsupported"])
+                if not url:
+                    save_original_text(list_id, text)
+                cache = result["cache"]
+                build_indexes_from_cache(cache, engine)
+
+    def rebuild_cache(self, list_id: int) -> dict:
+        item = self._get(list_id)
+        if not item:
+            return {"ok": False, "error": "not found"}
+        if not item["url"]:
+            text = load_original_text(str(list_id))
+            if text is None:
+                return {"ok": False, "error": "no original text saved and no URL to re-download"}
+        else:
+            try:
+                fetched = fetch_url_text(item["url"])
+                text = fetched["text"]
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+        list_id_str = str(list_id)
+        result = convert_blocklist_text(text, list_id_str, item.get("url", ""))
+        save_blocklist_cache(list_id_str, result["cache"])
+        save_cosmetic_rules(list_id_str, result["cosmetic"])
+        save_unsupported_rules(list_id_str, result["unsupported"])
+        with self._update_lock:
+            self.db.execute(
+                "UPDATE blocklists SET last_sha256=? WHERE id=?",
+                (result["sha256"], list_id),
+            )
+            self.db.commit()
+        self._notify_reload()
+        return {"ok": True, "counts": result["cache"]["counts"]}
+
+    def get_cache_info(self, list_id: int) -> dict:
+        list_id_str = str(list_id)
+        cache = load_blocklist_cache(list_id_str)
+        if not cache:
+            return {}
+        return {
+            "converted_count": cache["counts"]["converted"],
+            "cosmetic_count": cache["counts"]["cosmetic"],
+            "unsupported_count": cache["counts"]["unsupported"],
+            "raw_count": cache["counts"]["raw"],
+            "converted_at": cache["converted_at"],
+            "source_sha256": cache["source_sha256"],
+            "cosmetic_rules": read_cosmetic_rules(list_id_str),
+            "unsupported_rules": read_unsupported_rules(list_id_str),
+        }
+
+    def get_cache_rules(self, list_id: int) -> list:
+        cache = load_blocklist_cache(str(list_id))
+        if cache:
+            return cache.get("rules", [])
+        return []
+
+    def get_cosmetic_rules(self, list_id: int) -> list:
+        return read_cosmetic_rules(str(list_id))
+
+    def get_unsupported_rules(self, list_id: int) -> list:
+        return read_unsupported_rules(str(list_id))

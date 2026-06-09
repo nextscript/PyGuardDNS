@@ -52,6 +52,23 @@ except ModuleNotFoundError:
         return {"secure": 0, "insecure": 0, "bogus": 0, "indeterminate": 0, "validation_seconds_total": 0.0}
 
 import logging
+from rules_engine import (
+    parse_rule_line,
+    read_rules,
+    write_rules,
+    validate_rules,
+    count_rules,
+    load_rules_into_engine,
+    migration_needed,
+    run_migration,
+    load_blocklist_cache,
+    save_blocklist_cache,
+    convert_blocklist_text,
+    save_cosmetic_rules,
+    save_unsupported_rules,
+    save_original_text,
+)
+import upstream_manager as um
 logger = logging.getLogger("dnssec")
 
 
@@ -154,7 +171,6 @@ doh_host_cache = {}
 doh_connection_cache = {}
 dnscrypt_cert_cache = {}
 rules_cache = None
-rules_cache_rebuild_running = False
 shutdown_signal_received = False
 dns_concurrency = threading.BoundedSemaphore(int(os.environ.get("LOCALDNSGUARD_MAX_DNS_WORKERS", "48")))
 upstream_concurrency = threading.BoundedSemaphore(int(os.environ.get("LOCALDNSGUARD_MAX_UPSTREAM_WORKERS", "64")))
@@ -303,26 +319,7 @@ rules_reload_pending = 0
 
 def build_filter_engine():
     engine = FilterEngine()
-    data = rows(
-        """
-        SELECT action, pattern_type, pattern, target, comment
-        FROM rules
-        WHERE enabled=1
-        ORDER BY
-          CASE action WHEN 'rewrite' THEN 0 WHEN 'allow' THEN 1 WHEN 'block' THEN 2 ELSE 3 END,
-          id ASC
-        """
-    )
-    for row in data:
-        action = row["action"]
-        pattern = row["pattern"]
-        target = row["target"]
-        if action == "rewrite" and target:
-            engine.add_rule(f"{pattern} -> {target}", "rewrite")
-        elif action == "allow":
-            engine.add_rule(f"@@{pattern}", "allow")
-        else:
-            engine.add_rule(pattern, "block")
+    load_rules_into_engine(engine)
     global blocklist_manager
     if blocklist_manager is not None:
         blocklist_manager.load_into_engine(engine)
@@ -415,10 +412,17 @@ def clear_dnssec_validator():
 
 def reload_filter_engine():
     global _active_engine, _filter_engine_generation
-    new_engine = build_filter_engine()
+    try:
+        new_engine = build_filter_engine()
+    except Exception as exc:
+        with open("startup.log", "a", encoding="utf-8") as log:
+            log.write(f"{now_iso()} FILTER ENGINE BUILD FAILED: {exc}\n")
+        raise
     with _active_engine_lock:
         _active_engine = new_engine
         _filter_engine_generation += 1
+    with open("startup.log", "a", encoding="utf-8") as log:
+        log.write(f"{now_iso()} filter engine reloaded (gen={_filter_engine_generation}, suffix_blocks={len(new_engine.suffix_block)})\n")
 
 
 def get_filter_engine():
@@ -917,24 +921,29 @@ def init_db():
             blocklist_manager = BlocklistManager(db, reload_callback=reload_filter_engine)
             blocklist_manager.init_schema()
             _set_blocklist_dns_resolver(resolve_via_configured_dns)
+            reload_filter_engine()
+        if migration_needed():
+            run_migration()
         global client_manager
         if client_manager is None:
             client_manager = ClientManager(db, reload_callback=reload_client_state, db_lock=db_lock)
             client_manager.init_schema()
             reload_client_snapshot()
-        if not db.execute("SELECT 1 FROM upstreams WHERE enabled=1").fetchone():
-            db.execute(
-                "INSERT INTO upstreams(name,address,port,resolver,resolver_type,transport,enabled,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                ("Cloudflare DoT", "1.1.1.1", 853, DEFAULT_UPSTREAM, "dot", "tls", 1, now_iso()),
-            )
-        for upstream in db.execute("SELECT * FROM upstreams WHERE resolver='' OR resolver IS NULL").fetchall():
-            parsed = detect_upstream(upstream["address"])
-            db.execute(
-                "UPDATE upstreams SET resolver=?, resolver_type=?, transport=? WHERE id=?",
-                (parsed["resolver"], parsed["type"], parsed["transport"], upstream["id"]),
-            )
+        um.load_all()
+        if not um.get_all():
+            um.migrate_from_sqlite(db)
+        existing = um.get_all()
+        if not existing:
+            um.create("Cloudflare DoT", "1.1.1.1", 853, DEFAULT_UPSTREAM, "dot", "tls", enabled=True)
+            existing = um.get_all()
+        for up in existing:
+            if not up.get("resolver"):
+                parsed = detect_upstream(up["address"])
+                um.update(up["id"], resolver=parsed["resolver"], resolver_type=parsed["type"], transport=parsed["transport"])
         normalize_dnscrypt_relay_upstreams()
-        db.execute("UPDATE upstreams SET latency_ms=NULL WHERE last_error<>'' AND latency_ms > 1000")
+        for up in um.get_all():
+            if up.get("last_error") and up.get("latency_ms") is not None and up["latency_ms"] > 1000:
+                um.update(up["id"], latency_ms=None)
         backfill_clients_from_querylog()
         db.commit()
 
@@ -1390,54 +1399,21 @@ def reset_login_rate_limit(ip):
 
 
 def _ensure_upstream_health(upstream_id):
-    db.execute(
-        "INSERT OR IGNORE INTO upstream_health(upstream_id,consecutive_failures) VALUES(?,0)",
-        (upstream_id,),
-    )
-    db.commit()
+    pass
 
 
 def update_upstream_health(upstream_id, success, latency_ms=0, error=""):
     try:
-        with db_lock:
-            _ensure_upstream_health(upstream_id)
-            row = db.execute("SELECT * FROM upstream_health WHERE upstream_id=?", (upstream_id,)).fetchone()
-            if not row:
-                return
-            total = row["total_queries"] + 1
-            successful = row["successful_queries"] + (1 if success else 0)
-            success_rate = successful / total if total > 0 else 1.0
-            timeout_count = row["timeout_count"] + (1 if not success else 0)
-            consecutive = (row["consecutive_failures"] + 1) if not success else 0
-            if success and consecutive == 0:
-                paused = 0
-            elif not success and consecutive >= 5:
-                paused = 1
-            else:
-                paused = row["paused"]
-            db.execute(
-                """UPDATE upstream_health SET
-                    latency_ms=?, success_rate=?, timeout_count=?,
-                    last_error=?, last_checked=?, consecutive_failures=?,
-                    paused=?, total_queries=?, successful_queries=?
-                WHERE upstream_id=?""",
-                (latency_ms if success else row["latency_ms"],
-                 success_rate, timeout_count,
-                 error[:500] if error else "", time.time(),
-                 consecutive, paused, total, successful, upstream_id),
-            )
-            if paused and not row["paused"]:
-                log_admin_action("system", "upstream_auto_paused",
-                                 f"Upstream {upstream_id} auto-paused after {consecutive} consecutive failures", "")
-            db.commit()
+        paused = um.update_health(upstream_id, success, latency_ms, error)
+        if paused:
+            log_admin_action("system", "upstream_auto_paused",
+                             f"Upstream {upstream_id} auto-paused after 5 consecutive failures", "")
     except Exception:
         pass
 
 
 def get_upstream_health(upstream_id):
-    db.execute("INSERT OR IGNORE INTO upstream_health(upstream_id,consecutive_failures) VALUES(?,0)", (upstream_id,))
-    db.commit()
-    return dict(db.execute("SELECT * FROM upstream_health WHERE upstream_id=?", (upstream_id,)).fetchone() or {"upstream_id": upstream_id})
+    return um.get_health(upstream_id)
 
 
 def _healthcheck_worker():
@@ -1450,13 +1426,12 @@ def _healthcheck_worker():
 
 
 def _healthcheck_worker_pass():
-    upstreams = rows("SELECT id,name,address,port,resolver,resolver_type,transport,dnscrypt_relay FROM upstreams WHERE enabled=1 AND resolver_type <> 'dnscrypt_relay'")
+    upstreams = [u for u in um.get_all() if u.get("enabled") and u.get("resolver_type") != "dnscrypt_relay"]
     if not upstreams:
         return
     _, query = build_query("google.com", 1)
     for up in upstreams:
         try:
-            _ensure_upstream_health(up["id"])
             start = time.perf_counter()
             response, _ = _query_one_upstream(up, query, update_metrics=False, timeout_override=3.0)
             rtt = (time.perf_counter() - start) * 1000
@@ -1741,9 +1716,11 @@ def backfill_clients_from_querylog():
             continue
         known.add(ip)
         now = now_iso()
+        default_profile = db.execute("SELECT id FROM profiles WHERE is_default=1").fetchone()
+        default_id = default_profile["id"] if default_profile else None
         db.execute(
-            "INSERT OR IGNORE INTO clients(name,ip,cidr,filtering_enabled,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-            (ip, ip, "", 1, now, now),
+            "INSERT OR IGNORE INTO clients(name,ip,cidr,profile_id,filtering_enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            (ip, ip, "", default_id, 1, now, now),
         )
 
 
@@ -1789,14 +1766,16 @@ def unknown_client_worker():
         try:
             now = now_iso()
             with db_lock:
+                default_profile = db.execute("SELECT id FROM profiles WHERE is_default=1").fetchone()
+                default_id = default_profile["id"] if default_profile else None
                 for client_ip in batch:
                     try:
                         existing = db.execute("SELECT id FROM clients WHERE ip=?", (client_ip,)).fetchone()
                         if existing:
                             continue
                         db.execute(
-                            "INSERT OR IGNORE INTO clients(name,ip,cidr,filtering_enabled,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-                            (client_ip, client_ip, "", 1, now, now),
+                            "INSERT OR IGNORE INTO clients(name,ip,cidr,profile_id,filtering_enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                            (client_ip, client_ip, "", default_id, 1, now, now),
                         )
                         inserted = True
                     except sqlite3.IntegrityError:
@@ -1860,9 +1839,6 @@ def pattern_matches(pattern_type, pattern, domain):
 
 
 def invalidate_rules_cache(reload_now: bool = True):
-    global rules_cache
-    with rules_lock:
-        rules_cache = None
     if reload_now:
         reload_filter_engine()
         reload_client_snapshot()
@@ -1909,65 +1885,15 @@ def rules_reload_worker(reason: str = "Rule changes"):
 
 
 def rebuild_rules_cache_background():
-    # Custom-rule cache is small now, so rebuild synchronously and avoid
-    # background workers that can keep the process busy after huge imports.
-    global rules_cache
-    with rules_lock:
-        rules_cache = build_rules_cache()
+    pass
 
 
 def build_rules_cache():
-    cache = {
-        "rewrite": {"domain": {}, "exact": {}, "wildcard": [], "regex": []},
-        "allow": {"domain": {}, "exact": {}, "wildcard": [], "regex": []},
-        "block": {"domain": {}, "exact": {}, "wildcard": [], "regex": []},
-    }
-    data = rows(
-        """
-        SELECT id,scope,client,action,pattern_type,pattern,target,comment
-        FROM rules
-        WHERE enabled=1
-        ORDER BY
-          CASE action WHEN 'rewrite' THEN 0 WHEN 'allow' THEN 1 WHEN 'block' THEN 2 ELSE 3 END,
-          id ASC
-        """
-    )
-    for rule in data:
-        action = rule["action"]
-        pattern_type = rule["pattern_type"]
-        if action not in cache or pattern_type not in cache[action]:
-            continue
-        pattern = normalize_domain(rule["pattern"])
-        if not pattern:
-            continue
-        stored = dict(rule)
-        stored["pattern"] = pattern
-        if pattern_type in ("domain", "exact"):
-            cache[action][pattern_type].setdefault(pattern, stored)
-        elif pattern_type == "regex":
-            try:
-                stored["compiled"] = re.compile(rule["pattern"], re.IGNORECASE)
-                cache[action]["regex"].append(stored)
-            except re.error:
-                continue
-        else:
-            cache[action][pattern_type].append(stored)
-    return cache
+    return {"rules": read_rules()}
 
 
 def get_rules_cache():
-    global rules_cache
-    with rules_lock:
-        if rules_cache is not None:
-            return rules_cache
-        if rules_cache_rebuild_running:
-            return {
-                "rewrite": {"domain": {}, "exact": {}, "wildcard": [], "regex": []},
-                "allow": {"domain": {}, "exact": {}, "wildcard": [], "regex": []},
-                "block": {"domain": {}, "exact": {}, "wildcard": [], "regex": []},
-            }
-        rules_cache = build_rules_cache()
-        return rules_cache
+    return build_rules_cache()
 
 
 def domain_suffixes(domain):
@@ -3702,57 +3628,16 @@ def is_local_nodata_query(qtype_name):
 
 
 def active_upstreams():
-    return rows(
-        """
-        SELECT u.*,
-               COALESCE(uh.paused,0) AS health_paused,
-               uh.success_rate, uh.timeout_count, uh.consecutive_failures,
-               uh.last_checked, uh.total_queries, uh.successful_queries
-        FROM upstreams u
-        LEFT JOIN upstream_health uh ON uh.upstream_id=u.id
-        WHERE u.enabled=1 AND COALESCE(uh.paused,0)=0 AND u.resolver_type <> 'dnscrypt_relay'
-        ORDER BY
-          CASE WHEN u.last_error='' THEN 0 ELSE 1 END,
-          CASE WHEN u.latency_ms IS NULL THEN 999999 ELSE u.latency_ms END,
-          u.id ASC
-        """
-    )
+    return um.active_upstreams()
 
 
 def active_dnscrypt_relay():
-    relay = one(
-        """
-        SELECT u.*
-        FROM upstreams u
-        LEFT JOIN upstream_health uh ON uh.upstream_id=u.id
-        WHERE u.enabled=1
-          AND u.resolver_type='dnscrypt_relay'
-          AND COALESCE(uh.paused,0)=0
-        ORDER BY
-          CASE WHEN u.last_error='' THEN 0 ELSE 1 END,
-          CASE WHEN u.latency_ms IS NULL THEN 999999 ELSE u.latency_ms END,
-          u.id ASC
-        """
-    )
-    return relay
+    relays = um.active_dnscrypt_relays()
+    return relays[0] if relays else None
 
 
 def normalize_dnscrypt_relay_upstreams():
-    changed = 0
-    for upstream in db.execute("SELECT id,resolver FROM upstreams WHERE resolver LIKE 'sdns://%'").fetchall():
-        resolver = (upstream["resolver"] or "").strip()
-        if detect_dns_stamp_type(resolver) != "dnscrypt_relay":
-            continue
-        try:
-            parsed = parse_dnscrypt_relay_stamp(resolver)
-        except Exception:
-            continue
-        db.execute(
-            "UPDATE upstreams SET address=?, port=?, resolver_type='dnscrypt_relay', transport='dnscrypt-relay', dnscrypt_relay='' WHERE id=?",
-            (parsed["address"], int(parsed["port"]), upstream["id"]),
-        )
-        changed += 1
-    return changed
+    um.normalize_dnscrypt_relay()
 
 
 def plain_upstream_supported(upstream):
@@ -3795,21 +3680,17 @@ def probe_upstream(upstream):
 
 
 def test_upstream(upstream_id):
-    upstream = one("SELECT * FROM upstreams WHERE id=?", (upstream_id,))
+    upstream = um.get(upstream_id)
     if not upstream:
         raise ValueError("upstream not found")
     try:
         if upstream.get("resolver_type") == "doh":
             probe_upstream(upstream)
         latency = probe_upstream(upstream)
-        with db_lock:
-            db.execute("UPDATE upstreams SET latency_ms=?, last_error='' WHERE id=?", (latency, upstream_id))
-            db.commit()
+        um.update(upstream_id, latency_ms=latency, last_error="")
         return {"ok": True, "latency_ms": latency}
     except Exception as exc:
-        with db_lock:
-            db.execute("UPDATE upstreams SET latency_ms=NULL, last_error=? WHERE id=?", (str(exc), upstream_id))
-            db.commit()
+        um.update(upstream_id, latency_ms=None, last_error=str(exc))
         return {"ok": False, "error": str(exc)}
 
 
@@ -3987,15 +3868,7 @@ def maybe_update_upstream_status(upstream, latency=None, error=""):
         return
     upstream_metric_last_write[upstream_id] = now
     try:
-        with db_lock:
-            if error:
-                db.execute("UPDATE upstreams SET latency_ms=NULL, last_error=? WHERE id=?", (error, upstream_id))
-            else:
-                previous = upstream.get("latency_ms")
-                value = latency
-                if previous is not None:
-                    value = (float(previous) * 0.65) + (latency * 0.35)
-                db.execute("UPDATE upstreams SET latency_ms=?, last_error='' WHERE id=?", (round(value, 2), upstream_id))
+        um.maybe_update_latency(upstream_id, latency, error)
         if error:
             update_upstream_health(upstream_id, False, 0, error)
         elif latency is not None:
@@ -4891,7 +4764,7 @@ def stats_summary():
         "clients": clients,
         "rules": one("SELECT COUNT(*) c FROM rules WHERE enabled=1")["c"]
         + one("SELECT COALESCE(SUM(bl.rule_count),0) c FROM blocklists bl WHERE bl.enabled=1")["c"],
-        "upstreams": one("SELECT COUNT(*) c FROM upstreams WHERE enabled=1")["c"],
+        "upstreams": sum(1 for u in um.get_all() if u.get("enabled")),
         "uptime": int(time.time() - BOOT_TIME),
     }
 
@@ -5043,7 +4916,7 @@ def extended_dashboard_data():
         "total_cache_hits": combined["cache_hits"] or 1,
         "rules_count": one("SELECT COUNT(*) c FROM rules WHERE enabled=1")["c"]
         + one("SELECT COALESCE(SUM(bl.rule_count),0) c FROM blocklists bl WHERE bl.enabled=1")["c"],
-        "upstreams_count": one("SELECT COUNT(*) c FROM upstreams WHERE enabled=1")["c"],
+        "upstreams_count": sum(1 for u in um.get_all() if u.get("enabled")),
         "clients_24h": combined["clients_24h"],
     }
     dash_cache["data"] = result
@@ -5504,23 +5377,36 @@ def status_options(current):
     return "".join(f'<option value="{o}" {"selected" if o == current else ""}>{o}</option>' for o in options)
 
 
+def h(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
 def rules_page(kind=None):
-    rule_rows = rows("SELECT * FROM rules ORDER BY id DESC LIMIT 500")
-    table = "".join(f"<tr><td data-label='ID'>{r['id']}</td><td data-label='Enabled'>{toggle(r['enabled'])}</td><td data-label='Action'>{r['action']}</td><td data-label='Type'>{r['pattern_type']}</td><td data-label='Pattern' class='td-domain'>{r['pattern']}</td><td data-label='Target' class='td-domain'>{r['target']}</td><td data-label='Comment'>{r['comment']}</td><td data-label='Actions'><form method='post' action='/rules/delete'><input type='hidden' name='id' value='{r['id']}'><button class='btn btn-sm btn-outline-danger'>Delete</button></form></td></tr>" for r in rule_rows)
-    action = kind or "block"
+    current_rules = read_rules()
+    errs = validate_rules(current_rules)
+    counts = count_rules(current_rules)
+    alert_html = ""
+    if errs:
+        alert_html = '<div class="alert alert-danger py-2 mb-3"><strong>' + str(len(errs)) + ' rule error(s) found</strong><br>'
+        for e in errs[:10]:
+            alert_html += f'<code class="d-block small">Line {e["line"]}: {h(e["message"])}</code>'
+        if len(errs) > 10:
+            alert_html += f'<code class="d-block small text-muted">... and {len(errs) - 10} more</code>'
+        alert_html += "</div>"
     return template(f"""
 <h1 class="h3 mb-3">Rules</h1>
-<div class="alert alert-info py-2 mb-3">Rules from blocklists are managed and displayed on the <a href="/blocklists" class="alert-link">Blocklists</a> page. Only manually added rules are shown here.</div>
-<div class="row g-3">
-<div class="col-xl-4"><form class="panel rounded-2 border border-secondary-subtle p-3" method="post" action="/rules/add">
-<h2 class="h5">Add Rule</h2>
-<label class="form-label">Action</label><select class="form-select mb-2" name="action"><option {'selected' if action=='block' else ''}>block</option><option {'selected' if action=='allow' else ''}>allow</option><option {'selected' if action=='rewrite' else ''}>rewrite</option></select>
-<label class="form-label">Type</label><select class="form-select mb-2" name="pattern_type"><option>domain</option><option>exact</option><option>wildcard</option><option>regex</option></select>
-<label class="form-label">Pattern</label><input class="form-control mb-2" name="pattern" placeholder="ads.example.com or *.ads.com" required>
-<label class="form-label">Rewrite Target</label><input class="form-control mb-2" name="target" placeholder="192.168.0.10">
-<label class="form-label">Comment</label><input class="form-control mb-3" name="comment">
-<button class="btn btn-success w-100">Save</button></form></div>
-<div class="col-xl-8"><div class="panel rounded-2 border border-secondary-subtle p-3"><div class="table-responsive"><table class="table table-dark table-hover mobile-card-table"><thead><tr><th>ID</th><th>Enabled</th><th>Action</th><th>Type</th><th>Pattern</th><th>Target</th><th>Comment</th><th></th></tr></thead><tbody>{table}</tbody></table></div></div></div>
+{alert_html}
+<div class="alert alert-info py-2 mb-3">Use <a href="/blocklists" class="alert-link">Blocklists</a> for bulk filter lists. Custom rules on this page are stored in <code>data/rules/user_rules.pgrules</code>.</div>
+<div class="panel rounded-2 border border-secondary-subtle p-3">
+<form method="post" action="/rules/save">
+<div class="mb-2 d-flex justify-content-between align-items-center">
+<span class="text-muted small">{counts["total"]} rules ({counts["block_exact"]} bd, {counts["block_suffix"]} bs, {counts["block_regex"]} br, {counts["allow_exact"]} ad, {counts["allow_suffix"]} as, {counts["allow_regex"]} ar)</span>
+</div>
+<textarea class="form-control font-monospace mb-2" name="rules" rows="20" style="font-size:13px">{h(current_rules)}</textarea>
+<div class="d-flex justify-content-between align-items-center">
+<small class="text-muted">Syntax: <code>bd::</code> block domain, <code>bs::</code> block suffix, <code>br::</code> block regex, <code>ad::</code> allow domain, <code>as::</code> allow suffix, <code>ar::</code> allow regex. One rule per line, <code>#</code> for comments.</small>
+<button class="btn btn-success" type="submit">Save Rules</button>
+</div>
+</form>
 </div>""", "Rules")
 
 
@@ -5560,7 +5446,7 @@ ShadowWhisperer's Dating List: https://adguardteam.github.io/HostlistsRegistry/a
 Ukrainian Security Filter: https://adguardteam.github.io/HostlistsRegistry/assets/filter_62.txt
 Phishing URL Blocklist (PhishTank and OpenPhish): https://adguardteam.github.io/HostlistsRegistry/assets/filter_30.txt
 Dandelion Sprout's Anti-Malware List: https://raw.githubusercontent.com/DandelionSprout/adfilt/master/Alternate%20versions%20Anti-Malware%20List/AntiMalwareHosts.txt
-HaGeZi's Badware Hoster Blocklist: https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/hoster.txtv
+HaGeZi's Badware Hoster Blocklist: https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/hoster.txt
 HaGeZi's Fake DNS Blocklist: https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/adblock/fake.txt
 HaGeZi's DNS Rebind Protection: https://adguardteam.github.io/HostlistsRegistry/assets/filter_71.txt
 HaGeZi's DynDNS Blocklist: https://adguardteam.github.io/HostlistsRegistry/assets/filter_54.txt
@@ -5698,22 +5584,20 @@ def duplicate_blocklist_by_entries(entry_set, list_type):
         return None
     wanted_type = "allow" if list_type == "allow" else "block"
     existing = {}
-    with db_lock:
-        rows = db.execute(
-            """
-            SELECT bl.id, bl.name, be.action, be.pattern_type, be.pattern
-            FROM blocklists bl
-            JOIN blocklist_entries be ON be.blocklist_id = bl.id
-            WHERE bl.list_type=?
-            ORDER BY bl.id ASC, be.id ASC
-            """,
-            (wanted_type,),
-        ).fetchall()
-    for row in rows:
-        existing.setdefault(row["id"], {"name": row["name"], "entries": set()})
-        existing[row["id"]]["entries"].add((row["action"], row["pattern_type"], row["pattern"]))
+    for bl in blocklist_manager.get_all():
+        if (bl.get("list_type") or "block") != wanted_type:
+            continue
+        cache = load_blocklist_cache(str(bl["id"]))
+        if not cache:
+            continue
+        rules = cache.get("rules", [])
+        entry_set_from_cache = frozenset(
+            (r["action"], r["type"], r["pattern"])
+            for raw in rules if (r := parse_rule_line(raw)) and "error" not in r
+        )
+        existing[bl["id"]] = {"name": bl["name"], "entries": entry_set_from_cache}
     for data in existing.values():
-        if frozenset(data["entries"]) == entry_set:
+        if data["entries"] == entry_set:
             return data
     return None
 
@@ -6016,45 +5900,35 @@ def current_blocklist_toggle_status():
 def dedupe_existing_blocklist_entries():
     removed_by_list = {}
     kept_keys = set()
-    with db_lock:
-        rows_to_delete = []
-        rows = db.execute(
-            """
-            SELECT be.id, be.blocklist_id, bl.name, bl.list_type, be.action, be.pattern_type, be.pattern
-            FROM blocklist_entries be
-            JOIN blocklists bl ON bl.id = be.blocklist_id
-            ORDER BY be.id ASC
-            """
-        ).fetchall()
-        for row in rows:
-            list_type = "allow" if row["list_type"] == "allow" else "block"
-            key = (list_type, row["action"], row["pattern_type"], row["pattern"])
+    for bl in blocklist_manager.get_all():
+        bl_id = str(bl["id"])
+        cache = load_blocklist_cache(bl_id)
+        if not cache:
+            continue
+        list_type = "allow" if bl.get("list_type") == "allow" else "block"
+        new_rules = []
+        removed = 0
+        for raw in cache.get("rules", []):
+            result = parse_rule_line(raw)
+            if result is None or "error" in result:
+                new_rules.append(raw)
+                continue
+            key = (list_type, result["action"], result["type"], result["pattern"])
             if key in kept_keys:
-                rows_to_delete.append(row["id"])
-                info = removed_by_list.setdefault(
-                    row["blocklist_id"],
-                    {"name": row["name"], "removed": 0},
-                )
-                info["removed"] += 1
+                removed += 1
             else:
                 kept_keys.add(key)
-        for entry_id in rows_to_delete:
-            db.execute("DELETE FROM blocklist_entries WHERE id=?", (entry_id,))
-        db.execute(
-            """
-            UPDATE blocklists
-            SET rule_count = (
-                SELECT COUNT(*) FROM blocklist_entries
-                WHERE blocklist_entries.blocklist_id = blocklists.id
-            ),
-            last_rule_count = (
-                SELECT COUNT(*) FROM blocklist_entries
-                WHERE blocklist_entries.blocklist_id = blocklists.id
-            )
-            """
-        )
-        db.commit()
-    removed_total = len(rows_to_delete)
+                new_rules.append(raw)
+        if removed:
+            cache["rules"] = new_rules
+            cache["counts"]["converted"] = len(new_rules)
+            save_blocklist_cache(bl_id, cache)
+            removed_by_list[bl["id"]] = {"name": bl["name"], "removed": removed}
+            with db_lock:
+                db.execute("UPDATE blocklists SET rule_count=?, last_rule_count=? WHERE id=?",
+                           (len(new_rules), len(new_rules), bl["id"]))
+                db.commit()
+    removed_total = sum(v["removed"] for v in removed_by_list.values())
     if removed_total:
         reload_filter_engine()
     return {
@@ -6741,7 +6615,7 @@ async function clearCache(btn) {{
 
 def upstreams_page():
     current_mode = get_setting("upstream_mode", "sequential")
-    data = rows("SELECT * FROM upstreams ORDER BY id ASC")
+    data = um.get_all()
     def upstream_toggle(r):
         rid = r["id"]
         checked = "checked" if r["enabled"] else ""
@@ -7591,16 +7465,16 @@ def create_rule_from_querylog(form) -> dict:
     profile_id = form.get("profile_id")
     if not domain:
         raise ValueError("domain required")
-    now = now_iso()
+    prefix = "ad::" if action == "allow" else "bd::"
+    pg_rule = f"{prefix}{domain}"
     if scope == "global":
-        with db_lock:
-            db.execute(
-                "INSERT INTO rules(scope,client,action,pattern_type,pattern,target,enabled,comment,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                ("global", "", action, "domain", domain, "", 1, "created from query log", now),
-            )
-            db.commit()
+        current = read_rules()
+        if current and not current.endswith("\n"):
+            current += "\n"
+        current += pg_rule + "\n"
+        write_rules(current)
         invalidate_rules_cache()
-        return {"ok": True, "scope": "global", "action": action, "pattern": domain}
+        return {"ok": True, "scope": "global", "action": action, "pattern": domain, "rule": pg_rule}
     if scope == "profile":
         if client_manager is None:
             raise ValueError("profiles are not available")
@@ -7638,22 +7512,26 @@ def handle_restore_data(data):
             db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (row["key"], row["value"]))
         _invalidate_settings_cache()
         counts["settings"] = len(settings_rows)
-        db.execute("DELETE FROM rules")
-        rule_rows = [row for row in data.get("rules", []) if row.get("action") != "rewrite"]
-        for row in rule_rows:
-            db.execute("INSERT INTO rules(action,pattern_type,pattern,target,scope,client,enabled,comment,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                       (row.get("action","block"), row.get("pattern_type","domain"), row.get("pattern",""), row.get("target",""),
-                        row.get("scope","global"), row.get("client",""), int(row.get("enabled",1)), row.get("comment",""), row.get("created_at", now_iso())))
-        counts["rules"] = len(rule_rows)
-        rewrite_rows = data.get("dns_rewrites", [])
-        for row in rewrite_rows:
-            db.execute("INSERT INTO rules(action,pattern_type,pattern,target,scope,client,enabled,comment,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                       ("rewrite", row.get("pattern_type","domain"), row.get("pattern",""), row.get("target",""),
-                        row.get("scope","global"), row.get("client",""), int(row.get("enabled",1)), row.get("comment",""), row.get("created_at", now_iso())))
-        counts["dns_rewrites"] = len(rewrite_rows)
+        rule_lines = []
+        for row in data.get("rules", []):
+            action = row.get("action", "block")
+            pt = row.get("pattern_type", "domain")
+            pattern = row.get("pattern", "")
+            if not pattern:
+                continue
+            prefix_map = {"block": {"domain": "bd::", "exact": "bd::", "wildcard": "bs::", "regex": "br::"},
+                          "allow": {"domain": "ad::", "exact": "ad::", "wildcard": "as::", "regex": "ar::"}}
+            prefix = prefix_map.get(action, {}).get(pt, "bd::")
+            rule_lines.append(f"{prefix}{pattern}")
+        for row in data.get("dns_rewrites", []):
+            pattern = row.get("pattern", "")
+            target = row.get("target", "")
+            if pattern and target:
+                rule_lines.append(f"# rewrite: {pattern} -> {target}")
+        if rule_lines:
+            write_rules("\n".join(rule_lines) + "\n")
+        counts["rules"] = len(rule_lines)
         db.execute("DELETE FROM blocklists")
-        db.execute("DELETE FROM blocklist_entries")
-        from blocklist_manager import parse_filter_list
         restored_blocklists = 0
         for row in data.get("blocklists", []):
             name = row.get("name", "") or "unknown"
@@ -7662,11 +7540,12 @@ def handle_restore_data(data):
             enabled = int(row.get("enabled", 1))
             last_update = row.get("last_update", "")
             last_error = ""
-            entries = []
             content = row.get("content", "")
+            entries = []
             if not content and str(url).startswith(("http://", "https://")):
                 try:
-                    content = fetch_url_text(url)
+                    fetched = fetch_url_text(url)
+                    content = fetched["text"]
                     last_update = now_iso()
                 except Exception as exc:
                     last_error = f"Restore update failed: {exc}"
@@ -7681,20 +7560,25 @@ def handle_restore_data(data):
                 (name, url, list_type, enabled, len(entries), last_update, last_error or row.get("last_error", ""), row.get("created_at", now_iso())),
             )
             bl_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-            if entries:
-                created = now_iso()
-                db.executemany(
-                    "INSERT INTO blocklist_entries(blocklist_id,action,pattern_type,pattern,created_at) VALUES(?,?,?,?,?)",
-                    [(bl_id, action, pt, pattern, created) for action, pt, pattern in entries],
-                )
+            if content:
+                list_id_str = str(bl_id)
+                result = convert_blocklist_text(content, list_id_str, url)
+                save_blocklist_cache(list_id_str, result["cache"])
+                save_cosmetic_rules(list_id_str, result["cosmetic"])
+                save_unsupported_rules(list_id_str, result["unsupported"])
+                if not url:
+                    save_original_text(list_id_str, content)
             restored_blocklists += 1
         counts["blocklists"] = restored_blocklists
-        db.execute("DELETE FROM upstreams")
+        for up in um.get_all():
+            um.delete(up["id"])
         for row in data.get("upstreams", []):
-            db.execute("INSERT INTO upstreams(name,address,port,resolver,resolver_type,transport,dnscrypt_relay,enabled,latency_ms,last_error,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                       (row.get("name",""), row.get("address","1.1.1.1"), int(row.get("port",53)), row.get("resolver",""),
-                        row.get("resolver_type","plain_udp"), row.get("transport","udp"), row.get("dnscrypt_relay",""), int(row.get("enabled",1)),
-                        row.get("latency_ms"), row.get("last_error",""), row.get("created_at", now_iso())))
+            um.create(row.get("name",""), row.get("address","1.1.1.1"), int(row.get("port",53)),
+                      row.get("resolver",""), row.get("resolver_type","plain_udp"),
+                      row.get("transport","udp"), row.get("dnscrypt_relay",""),
+                      enabled=bool(row.get("enabled",1)),
+                      latency_ms=row.get("latency_ms"), last_error=row.get("last_error",""),
+                      created_at=row.get("created_at", now_iso()))
         counts["upstreams"] = len(data.get("upstreams", []))
         if client_manager and "profiles" in data:
             for row in data["profiles"]:
@@ -8202,7 +8086,19 @@ class WebHandler(BaseHTTPRequestHandler):
         if not self.valid_csrf(form):
             self.send_html(template("<div class='alert alert-danger'>Invalid CSRF token. Reload the page and try again.</div>", "Security"), 403)
             return
-        if path == "/rules/add":
+        if path == "/rules/save":
+            new_rules = form.get("rules", "")
+            write_rules(new_rules)
+            errs = validate_rules(new_rules)
+            cnts = count_rules(new_rules)
+            if errs:
+                console_event("warn", "Rules saved with errors", f"{len(errs)} invalid rule(s), {cnts['total']} valid")
+            else:
+                console_event("ok", "Rules saved", f"{cnts['total']} valid rules")
+            invalidate_rules_cache(reload_now=False)
+            enqueue_rules_reload("Rules saved")
+            self.redirect("/rules")
+        elif path == "/rules/add":
             action = form.get("action", "block")
             pattern_type = form.get("pattern_type", "domain")
             pattern = normalize_domain(form.get("pattern", ""))
@@ -8328,16 +8224,6 @@ class WebHandler(BaseHTTPRequestHandler):
                 blocklist_manager.update_metadata(bl_id, name, url, list_type)
             self.redirect("/blocklists")
         elif path == "/rules/delete":
-            with db_lock:
-                rule = db.execute("SELECT id,action,pattern_type,pattern FROM rules WHERE id=?", (form.get("id"),)).fetchone()
-                db.execute("DELETE FROM rules WHERE id=?", (form.get("id"),))
-                db.commit()
-            if rule:
-                console_event("ok", "Rule deleted", f"#{rule['id']} {rule['action']} {rule['pattern_type']} {rule['pattern']}")
-            else:
-                console_event("warn", "Rule delete failed", f"ID {form.get('id')} not found")
-            invalidate_rules_cache(reload_now=False)
-            enqueue_rules_reload("Rule deleted")
             self.redirect("/rules")
         elif path == "/rewrites/add":
             pattern_type = form.get("pattern_type", "domain")
@@ -8521,40 +8407,29 @@ class WebHandler(BaseHTTPRequestHandler):
             self.redirect("/profiles")
         elif path == "/upstreams/add":
             parsed = parse_upstream_form(form)
-            with db_lock:
-                db.execute(
-                    "INSERT INTO upstreams(name,address,port,resolver,resolver_type,transport,dnscrypt_relay,created_at) VALUES(?,?,?,?,?,?,?,?)",
-                    (parsed["name"], parsed["address"], parsed["port"], parsed["resolver"], parsed["resolver_type"], parsed["transport"], parsed["dnscrypt_relay"], now_iso()),
-                )
-                db.commit()
+            um.create(parsed["name"], parsed["address"], parsed["port"],
+                      parsed["resolver"], parsed["resolver_type"],
+                      parsed["transport"], parsed["dnscrypt_relay"],
+                      enabled=True)
             self.redirect("/upstreams")
         elif path == "/upstreams/edit":
             parsed = parse_upstream_form(form)
-            enabled = 1 if form.get("enabled") == "1" else 0
-            with db_lock:
-                db.execute(
-                    """UPDATE upstreams
-                       SET name=?, address=?, port=?, resolver=?, resolver_type=?, transport=?, dnscrypt_relay=?,
-                           enabled=?, latency_ms=NULL, last_error=''
-                       WHERE id=?""",
-                    (parsed["name"], parsed["address"], parsed["port"], parsed["resolver"], parsed["resolver_type"],
-                     parsed["transport"], parsed["dnscrypt_relay"], enabled, form.get("id")),
-                )
-                db.commit()
+            enabled = form.get("enabled") == "1"
+            uid = int(form.get("id"))
+            um.update(uid, name=parsed["name"], address=parsed["address"], port=parsed["port"],
+                      resolver=parsed["resolver"], resolver_type=parsed["resolver_type"],
+                      transport=parsed["transport"], dnscrypt_relay=parsed["dnscrypt_relay"],
+                      enabled=enabled, latency_ms=None, last_error="")
             self.redirect("/upstreams")
         elif path == "/upstreams/mode":
             set_setting("upstream_mode", form.get("upstream_mode", "sequential"))
             self.redirect("/upstreams")
         elif path == "/upstreams/toggle":
-            enabled = 1 if form.get("enabled") == "1" else 0
-            with db_lock:
-                db.execute("UPDATE upstreams SET enabled=? WHERE id=?", (enabled, form.get("id")))
-                db.commit()
+            enabled = form.get("enabled") == "1"
+            um.set_enabled(int(form.get("id")), enabled)
             self.redirect("/upstreams")
         elif path == "/upstreams/delete":
-            with db_lock:
-                db.execute("DELETE FROM upstreams WHERE id=?", (form.get("id"),))
-                db.commit()
+            um.delete(int(form.get("id")))
             self.redirect("/upstreams")
         elif path == "/upstreams/test":
             test_upstream(form.get("id"))
@@ -8841,8 +8716,6 @@ class WebHandler(BaseHTTPRequestHandler):
             counts["dns_rewrites"] = len(rewrite_rows)
 
             db.execute("DELETE FROM blocklists")
-            db.execute("DELETE FROM blocklist_entries")
-            from blocklist_manager import parse_filter_list
             restored_blocklists = 0
             for row in data.get("blocklists", []):
                 name = row.get("name", "") or "unknown"
@@ -8851,11 +8724,12 @@ class WebHandler(BaseHTTPRequestHandler):
                 enabled = int(row.get("enabled", 1))
                 last_update = row.get("last_update", "")
                 last_error = ""
-                entries = []
                 content = row.get("content", "")
+                entries = []
                 if not content and str(url).startswith(("http://", "https://")):
                     try:
-                        content = fetch_url_text(url)
+                        fetched = fetch_url_text(url)
+                        content = fetched["text"]
                         last_update = now_iso()
                     except Exception as exc:
                         last_error = f"Restore update failed: {exc}"
@@ -8870,26 +8744,27 @@ class WebHandler(BaseHTTPRequestHandler):
                     (name, url, list_type, enabled, len(entries), last_update, last_error or row.get("last_error", ""), row.get("created_at", now_iso())),
                 )
                 bl_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
-                if entries:
-                    created = now_iso()
-                    db.executemany(
-                        "INSERT INTO blocklist_entries(blocklist_id,action,pattern_type,pattern,created_at) VALUES(?,?,?,?,?)",
-                        [(bl_id, action, pt, pattern, created) for action, pt, pattern in entries],
-                    )
+                if content:
+                    list_id_str = str(bl_id)
+                    result = convert_blocklist_text(content, list_id_str, url)
+                    save_blocklist_cache(list_id_str, result["cache"])
+                    save_cosmetic_rules(list_id_str, result["cosmetic"])
+                    save_unsupported_rules(list_id_str, result["unsupported"])
+                    if not url:
+                        save_original_text(list_id_str, content)
                 restored_blocklists += 1
             counts["blocklists"] = restored_blocklists
 
-            db.execute("DELETE FROM upstreams")
+            for up in um.get_all():
+                um.delete(up["id"])
             upstream_rows = data.get("upstreams", [])
             for row in upstream_rows:
-                db.execute(
-                    "INSERT INTO upstreams(name,address,port,resolver,resolver_type,transport,dnscrypt_relay,enabled,latency_ms,last_error,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                    (row.get("name",""), row.get("address","1.1.1.1"), int(row.get("port",53)),
-                     row.get("resolver",""), row.get("resolver_type","plain_udp"),
-                     row.get("transport","udp"), row.get("dnscrypt_relay",""), int(row.get("enabled",1)),
-                     row.get("latency_ms"), row.get("last_error",""),
-                     row.get("created_at", now_iso()))
-                )
+                um.create(row.get("name",""), row.get("address","1.1.1.1"), int(row.get("port",53)),
+                          row.get("resolver",""), row.get("resolver_type","plain_udp"),
+                          row.get("transport","udp"), row.get("dnscrypt_relay",""),
+                          enabled=bool(row.get("enabled",1)),
+                          latency_ms=row.get("latency_ms"), last_error=row.get("last_error",""),
+                          created_at=row.get("created_at", now_iso()))
             counts["upstreams"] = len(upstream_rows)
 
             if client_manager and "profiles" in data:
@@ -9211,11 +9086,21 @@ class WebHandler(BaseHTTPRequestHandler):
                 hc_last = _healthcheck_last_run
             encrypted_status = encrypted_dns_readiness()
             encrypted_runtime = encrypted_dns_runtime_state()
-            upstream_health = rows(
-                "SELECT u.id,u.name,u.address,u.port,u.resolver_type,uh.success_rate,uh.latency_ms,uh.consecutive_failures,uh.paused,uh.last_checked "
-                "FROM upstreams u LEFT JOIN upstream_health uh ON uh.upstream_id=u.id "
-                "ORDER BY u.id ASC"
-            )
+            upstream_health = []
+            for u in um.get_all():
+                h = u.get("health", {})
+                upstream_health.append({
+                    "id": u["id"],
+                    "name": u.get("name", ""),
+                    "address": u.get("address", ""),
+                    "port": u.get("port", 0),
+                    "resolver_type": u.get("resolver_type", ""),
+                    "success_rate": h.get("success_rate"),
+                    "latency_ms": h.get("latency_ms"),
+                    "consecutive_failures": h.get("consecutive_failures", 0),
+                    "paused": h.get("paused", False),
+                    "last_checked": h.get("last_checked"),
+                })
             validator = get_dnssec_validator()
             dnssec_anchor = validator.trust_anchor_info() if validator else {}
             dnssec_metrics = get_dnssec_metrics()
@@ -9318,7 +9203,19 @@ class WebHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif path == "/api/rules":
-            self.send_json(rows("SELECT * FROM rules ORDER BY id DESC"))
+            rules_text = read_rules()
+            parsed = []
+            for i, line in enumerate(rules_text.split("\n"), 1):
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    parsed.append({"line": i, "text": line.rstrip(), "valid": True, "comment": True})
+                    continue
+                result = parse_rule_line(stripped)
+                if result and "error" not in result:
+                    parsed.append({"line": i, "text": line.rstrip(), "valid": True, "prefix": result["prefix"], "action": result["action"], "pattern": result["pattern"]})
+                else:
+                    parsed.append({"line": i, "text": line.rstrip(), "valid": False, "error": result.get("error", "unknown error") if result else "parse failed"})
+            self.send_json({"rules": parsed, "raw": rules_text})
         elif path == "/api/blocklists":
             self.send_json(blocklist_manager.get_all() if blocklist_manager else [])
         elif path == "/api/blocklists/stats":
@@ -9374,15 +9271,21 @@ class WebHandler(BaseHTTPRequestHandler):
             else:
                 self.send_json([])
         elif path == "/api/upstreams":
-            self.send_json(rows("SELECT * FROM upstreams ORDER BY id ASC"))
+            self.send_json(um.get_all())
         elif path == "/api/upstreams/detect":
             self.send_json(detect_upstream(params.get("resolver", [""])[0]))
         elif path == "/api/upstreams/health":
-            all_health = rows(
-                "SELECT u.id,u.name,u.address,u.port,u.resolver_type,uh.* "
-                "FROM upstreams u LEFT JOIN upstream_health uh ON uh.upstream_id=u.id "
-                "ORDER BY u.id ASC"
-            )
+            all_health = []
+            for up in um.get_all():
+                h = up.get("health", {})
+                all_health.append({
+                    "id": up["id"],
+                    "name": up.get("name", ""),
+                    "address": up.get("address", ""),
+                    "port": up.get("port", 0),
+                    "resolver_type": up.get("resolver_type", ""),
+                    **h,
+                })
             self.send_json(all_health)
         elif path == "/api/audit-log":
             limit = int(params.get("limit", ["100"])[0])
@@ -9400,7 +9303,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 "blocklists": rows("SELECT * FROM blocklists ORDER BY id ASC"),
                 "rules": rows("SELECT * FROM rules WHERE action <> 'rewrite' ORDER BY id ASC"),
                 "dns_rewrites": rows("SELECT * FROM rules WHERE action = 'rewrite' ORDER BY id ASC"),
-                "upstreams": rows("SELECT * FROM upstreams"),
+                "upstreams": um.get_all(),
                 "profiles": rows("SELECT * FROM profiles") if client_manager else [],
                 "clients": rows("SELECT * FROM clients") if client_manager else [],
                 "profile_custom_rules": rows("SELECT * FROM profile_custom_rules") if client_manager else [],
@@ -9625,13 +9528,11 @@ class WebHandler(BaseHTTPRequestHandler):
             if not up_id:
                 self.send_json({"error": "id required"}, 400)
             else:
-                with db_lock:
-                    h = get_upstream_health(int(up_id))
-                    new_paused = 0 if h.get("paused") else 1
-                    db.execute("UPDATE upstream_health SET paused=? WHERE upstream_id=?", (new_paused, int(up_id)))
-                    db.commit()
+                h = um.get_health(int(up_id))
+                new_paused = not h.get("paused", False)
+                um.set_health_paused(int(up_id), new_paused)
                 log_admin_action(self.session_user(), "upstream_pause_toggle", f"{'Paused' if new_paused else 'Unpaused'} upstream {up_id}", self.client_address[0])
-                self.send_json({"ok": True, "paused": bool(new_paused)})
+                self.send_json({"ok": True, "paused": new_paused})
         elif path == "/api/api-tokens":
             action = form.get("action", "")
             if action == "create":
@@ -10445,14 +10346,16 @@ def ensure_requirements():
 
 
 def main():
-    global dns_servers, encrypted_dns_servers
+    global dns_servers, encrypted_dns_servers, _active_engine, _filter_engine_generation
     ensure_requirements()
     install_crash_handlers()
     if not acquire_instance_lock():
         console_event("warn", f"{APP_NAME} is already running", "Please do not start a second window.")
         return
     server_shutdown_event.clear()
+    console_event("info", "DNS server starting ...")
     set_runtime_status("DNS server starting ...", ready=False)
+    start_web_server()
     with open("startup.log", "a", encoding="utf-8") as log:
         log.write(f"{now_iso()} starting {APP_NAME}\n")
         log.flush()
@@ -10467,7 +10370,6 @@ def main():
         dnssec_ok, dnssec_state = process_dnssec_trust_anchor_startup()
         log.write(f"{now_iso()} dnssec trust-anchor startup {'ready' if dnssec_ok else 'failed'} {dnssec_state}\n")
         log.flush()
-        start_web_server()
         log.write(f"{now_iso()} web ready on {WEB_HOST}:{WEB_PORT}\n")
         log.flush()
         start_db_writer()
@@ -10484,6 +10386,16 @@ def main():
         log.flush()
         invalidate_rules_cache()
         log.write(f"{now_iso()} custom rule cache lazy\n")
+        log.flush()
+        # Force engine rebuild right before DNS starts
+        try:
+            eng = build_filter_engine()
+            with _active_engine_lock:
+                _active_engine = eng
+                _filter_engine_generation += 1
+            log.write(f"{now_iso()} engine force-reloaded: {len(eng.suffix_block)} suffix blocks, gen={_filter_engine_generation}\n")
+        except Exception as exc:
+            log.write(f"{now_iso()} engine force-reload FAILED: {exc}\n")
         log.flush()
         dns_servers = list(start_dns_servers())
         log.write(f"{now_iso()} dns ready on {DNS_HOST}:{DNS_PORT}\n")
@@ -10554,7 +10466,7 @@ def cli_main():
             "settings": [r for r in rows("SELECT * FROM settings") if r["key"] not in sensitive_keys],
             "rules": rows("SELECT * FROM rules WHERE action <> 'rewrite' ORDER BY id ASC"),
             "dns_rewrites": rows("SELECT * FROM rules WHERE action = 'rewrite' ORDER BY id ASC"),
-            "upstreams": rows("SELECT * FROM upstreams"),
+            "upstreams": um.get_all(),
             "profiles": rows("SELECT * FROM profiles") if client_manager else [],
             "clients": rows("SELECT * FROM clients") if client_manager else [],
             "profile_custom_rules": rows("SELECT * FROM profile_custom_rules") if client_manager else [],

@@ -699,6 +699,37 @@ class FilterEngine:
                 return None
             current = current.split(".", 1)[1]
 
+    def add_pg_rule(self, prefix: str, pattern: str, list_name: str = ""):
+        if prefix == "bd::":
+            self.exact_block.add(pattern)
+            self._track_source(pattern, list_name)
+        elif prefix == "bs::":
+            self.suffix_block.add(pattern)
+            self.suffix_block_trie.add(pattern, pattern)
+            self._track_source(pattern, list_name)
+        elif prefix == "br::":
+            compiled = re.compile(pattern, re.IGNORECASE)
+            self.regex_block.add(compiled, f"/{pattern}/")
+            self._track_source(f"/{pattern}/", list_name)
+        elif prefix == "ad::":
+            self.exact_allow.add(pattern)
+            self._track_source(pattern, list_name)
+        elif prefix == "as::":
+            self.suffix_allow.add(pattern)
+            self.suffix_allow_trie.add(pattern, pattern)
+            self._track_source(pattern, list_name)
+        elif prefix == "ar::":
+            compiled = re.compile(pattern, re.IGNORECASE)
+            self.regex_allow.add(compiled, f"/{pattern}/")
+            self._track_source(f"/{pattern}/", list_name)
+        self._bump_generation()
+
+    def track_source(self, key: str, list_name: str) -> None:
+        self._track_source(key, list_name)
+
+    def bump_generation(self) -> None:
+        self._bump_generation()
+
     def _track_source(self, key: str, list_name: str) -> None:
         if list_name:
             self.pattern_sources.setdefault(key, set()).add(list_name)
