@@ -320,6 +320,11 @@ rules_reload_pending = 0
 def build_filter_engine():
     engine = FilterEngine()
     load_rules_into_engine(engine)
+    for rewrite in rows("SELECT pattern, target, pattern_type FROM rules WHERE action = 'rewrite' AND enabled = 1"):
+        pattern = rewrite["pattern"]
+        target = rewrite["target"]
+        if pattern and target:
+            engine.add_rule(f"{pattern} -> {target}", "rewrite", "rewrite_rules")
     global blocklist_manager
     if blocklist_manager is not None:
         blocklist_manager.load_into_engine(engine)
@@ -4010,7 +4015,6 @@ def handle_dns_request(request, client_ip, connection_type=""):
 
         if get_setting("disable_ipv6", "0") == "1" and qtype_name == "AAAA":
             response = build_empty_response(request)
-            log_query(client_ip, domain, normalized, qtype_name, "blocked", matched_rule="ipv6 disabled", blocked=1, reason="ipv6_disabled", duration_ms=(time.perf_counter() - started) * 1000, client_name=client_log_name, profile_name=client_profile_name, connection_type=connection_type)
             return response
 
         if is_local_reverse_lookup(normalized, qtype_name):
@@ -6271,14 +6275,37 @@ setInterval(refreshBlocklistJobStatus, 1000);
 
 def rewrites_page():
     rewrites = rows("SELECT * FROM rules WHERE action = 'rewrite' ORDER BY id DESC LIMIT 500")
+    edit_modals = ""
     table = "".join(
         f"<tr><td data-label='ID'>{r['id']}</td><td data-label='Enabled'>{toggle(r['enabled'])}</td>"
         f"<td data-label='Type'>{r['pattern_type']}</td><td data-label='Domain' class='td-domain'>{r['pattern']}</td>"
         f"<td data-label='Target' class='td-domain'>{r['target']}</td><td data-label='Comment'>{r['comment']}</td>"
-        f"<td data-label='Actions'><form method='post' action='/rewrites/delete'><input type='hidden' name='id' value='{r['id']}'>"
+        f"<td data-label='Actions'>"
+        f"<button class='btn btn-sm btn-outline-light' type='button' onclick=\"document.getElementById('rwEdit-{r['id']}').classList.add('show')\">&#x270E;</button>"
+        f"<form method='post' action='/rewrites/delete' style='display:inline;margin-left:.35rem'><input type='hidden' name='id' value='{r['id']}'>"
         f"<button class='btn btn-sm btn-outline-danger'>Delete</button></form></td></tr>"
         for r in rewrites
     )
+    for r in rewrites:
+        eid = f"rwEdit-{r['id']}"
+        edit_modals += f"""
+<div id="{eid}" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="modal-box">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+      <h2 class="h5" style="margin:0">Edit Rewrite #{r['id']}</h2>
+      <button class="btn btn-sm btn-outline-light" onclick="document.getElementById('{eid}').classList.remove('show')" style="border:none;font-size:1.2rem">&times;</button>
+    </div>
+    <form method="post" action="/rewrites/edit">
+      <input type="hidden" name="id" value="{r['id']}">
+      <label class="form-label">Type</label><select class="form-select mb-2" name="pattern_type"><option value="domain" {"selected" if r['pattern_type'] == 'domain' else ""}>domain</option><option value="wildcard" {"selected" if r['pattern_type'] == 'wildcard' else ""}>wildcard</option><option value="regex" {"selected" if r['pattern_type'] == 'regex' else ""}>regex</option></select>
+      <label class="form-label">Domain</label><input class="form-control mb-2" name="pattern" value="{html_escape(r['pattern'])}" required>
+      <label class="form-label">Target (IP or CNAME)</label><input class="form-control mb-2" name="target" value="{html_escape(r['target'])}" required>
+      <label class="form-label">Comment</label><input class="form-control mb-3" name="comment" value="{html_escape(r['comment'])}">
+      <label class="form-check mb-3"><input type="hidden" name="enabled" value="0"><input class="form-check-input" type="checkbox" name="enabled" value="1" {"checked" if r['enabled'] else ""}><span class="form-check-label">Enabled</span></label>
+      <button class="btn btn-success w-100" type="submit">Save</button>
+    </form>
+  </div>
+</div>"""
     return template(f"""
 <h1 class="h3 mb-3">DNS Rewrites</h1>
 <div class="row g-3">
@@ -6290,7 +6317,7 @@ def rewrites_page():
 <label class="form-label">Comment</label><input class="form-control mb-3" name="comment">
 <button class="btn btn-success w-100">Save</button></form></div>
 <div class="col-xl-8"><div class="panel rounded-2 border border-secondary-subtle p-3"><div class="table-responsive"><table class="table table-dark table-hover mobile-card-table"><thead><tr><th>ID</th><th>Enabled</th><th>Type</th><th>Domain</th><th>Target</th><th>Comment</th><th></th></tr></thead><tbody>{table}</tbody></table></div></div></div>
-</div>""", "DNS Rewrites")
+</div>{edit_modals}""", "DNS Rewrites")
 
 
 def clients_page():
@@ -8191,8 +8218,22 @@ class WebHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self.redirect(f"/blocklists?type={list_type}&error={quote(str(exc))}")
         elif path == "/blocklists/update":
-            blocklist_manager.update(form.get("id"))
-            self.redirect("/blocklists")
+            try:
+                bl_id = form.get("id")
+                if not bl_id:
+                    raise ValueError("No blocklist ID provided")
+                bl_id = int(bl_id)
+                bl_item = blocklist_manager.get_by_id(bl_id) if blocklist_manager else None
+                if not bl_item:
+                    raise ValueError("Blocklist not found")
+                if not bl_item.get("url", "").startswith(("http://", "https://")):
+                    raise ValueError("Blocklist has no remote URL to update from")
+                blocklist_manager.update(bl_id)
+                list_type = "allow" if bl_item.get("list_type") == "allow" else "block"
+                self.redirect(f"/blocklists?type={list_type}&success={quote('Update started')}")
+            except Exception as exc:
+                list_type = form.get("list_type", "block")
+                self.redirect(f"/blocklists?type={list_type}&error={quote(str(exc))}")
         elif path == "/blocklists/toggle":
             bl_id = int(form.get("id"))
             enabled = form.get("enabled") == "1"
@@ -8238,6 +8279,26 @@ class WebHandler(BaseHTTPRequestHandler):
             console_event("ok", "Rewrite rule added", f"#{cur.lastrowid} {pattern_type} {pattern} -> {target}")
             invalidate_rules_cache(reload_now=False)
             enqueue_rules_reload("Rewrite rule added")
+            self.redirect("/rewrites")
+        elif path == "/rewrites/edit":
+            with db_lock:
+                rule = db.execute("SELECT id FROM rules WHERE id=?", (form.get("id"),)).fetchone()
+                if rule:
+                    pattern_type = form.get("pattern_type", "domain")
+                    pattern = normalize_domain(form.get("pattern", ""))
+                    target = form.get("target", "")
+                    comment = form.get("comment", "")
+                    enabled = 1 if form.get("enabled") == "1" else 0
+                    db.execute(
+                        "UPDATE rules SET pattern_type=?,pattern=?,target=?,comment=?,enabled=? WHERE id=?",
+                        (pattern_type, pattern, target, comment, enabled, rule["id"]),
+                    )
+                    db.commit()
+                    console_event("ok", "Rewrite rule updated", f"#{rule['id']} {pattern_type} {pattern} -> {target}")
+                else:
+                    console_event("warn", "Rewrite rule edit failed", f"ID {form.get('id')} not found")
+            invalidate_rules_cache(reload_now=False)
+            enqueue_rules_reload("Rewrite rule updated")
             self.redirect("/rewrites")
         elif path == "/rewrites/delete":
             with db_lock:
@@ -9378,9 +9439,16 @@ class WebHandler(BaseHTTPRequestHandler):
             log_admin_action(self.session_user(), "blocklist_delete", f"Deleted blocklist {bl_name}", self.client_address[0])
             self.send_json({"ok": True})
         elif path == "/api/blocklists/update":
-            blocklist_manager.update(form.get("id"))
-            log_admin_action(self.session_user(), "blocklist_update", f"Updated blocklist {form.get('id')}", self.client_address[0])
-            self.send_json({"ok": True})
+            try:
+                bl_id = form.get("id")
+                if not bl_id:
+                    raise ValueError("No blocklist ID provided")
+                bl_id = int(bl_id)
+                blocklist_manager.update(bl_id)
+                log_admin_action(self.session_user(), "blocklist_update", f"Updated blocklist {bl_id}", self.client_address[0])
+                self.send_json({"ok": True})
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, 400)
         elif path == "/api/blocklists/update-all":
             result = blocklist_manager.update_all()
             log_admin_action(self.session_user(), "blocklist_update_all", "Updated all blocklists", self.client_address[0])

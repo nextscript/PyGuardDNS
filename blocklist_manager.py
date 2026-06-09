@@ -573,8 +573,61 @@ class BlocklistManager:
             self._notify_reload()
         return len(unique_entries)
 
+    def _get_from_cache(self, list_id: int) -> Optional[dict]:
+        cache = load_blocklist_cache(str(list_id))
+        if not cache:
+            return None
+        url = cache.get("source_url", "")
+        if not url:
+            return None
+        return {
+            "id": list_id,
+            "name": cache.get("source_url", "").rstrip("/").split("/")[-1] or f"List {list_id}",
+            "url": url,
+            "list_type": "block",
+            "enabled": 1,
+            "rule_count": cache.get("counts", {}).get("converted", 0),
+            "last_rule_count": cache.get("counts", {}).get("converted", 0),
+            "etag": "",
+            "last_modified": "",
+            "last_error": "",
+            "last_update": "",
+            "last_successful_update": "",
+            "last_failed_update": "",
+            "last_unique_rule_count": cache.get("counts", {}).get("converted", 0),
+            "last_sha256": cache.get("source_sha256", ""),
+            "duplicate_rule_count": 0,
+            "import_report": "",
+            "created_at": cache.get("converted_at", ""),
+        }
+
+    def _ensure_db_entry(self, list_id: int, item: dict):
+        existing = self._get(list_id)
+        if existing:
+            return
+        created = now_iso()
+        with self._update_lock:
+            self.db.execute(
+                """INSERT INTO blocklists(id,name,url,list_type,enabled,rule_count,last_update,
+                   last_error,last_successful_update,last_failed_update,last_rule_count,
+                   last_unique_rule_count,last_sha256,etag,last_modified,duplicate_rule_count,
+                   import_report,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (list_id, item.get("name", f"List {list_id}"), item["url"],
+                 item.get("list_type", "block"), 1, item.get("rule_count", 0),
+                 created, "", created, "", item.get("last_rule_count", 0),
+                 item.get("last_unique_rule_count", 0), item.get("last_sha256", ""),
+                 "", "", 0, "", created),
+            )
+            self.db.commit()
+
     def update(self, list_id: int, background: bool = True) -> dict:
         item = self._get(list_id)
+        if not item:
+            item = self._get_from_cache(list_id)
+            if item:
+                self._ensure_db_entry(list_id, item)
+                item = self._get(list_id)
         if not item:
             raise ValueError(f"Blocklist {list_id} not found")
         if not item["url"] or not item["url"].startswith(("http://", "https://")):
@@ -630,6 +683,23 @@ class BlocklistManager:
     def update_all(self, background: bool = True) -> dict:
         lists = self.get_all()
         urls = [bl for bl in lists if bl["url"].startswith(("http://", "https://"))]
+        cache_dir = os.path.join("data", "blocklists", "cache")
+        if os.path.isdir(cache_dir):
+            known_ids = {bl["id"] for bl in lists}
+            for fname in sorted(os.listdir(cache_dir)):
+                if not fname.endswith(".json"):
+                    continue
+                try:
+                    lid = int(fname[:-5])
+                except ValueError:
+                    continue
+                if lid in known_ids:
+                    continue
+                cached = self._get_from_cache(lid)
+                if cached:
+                    self._ensure_db_entry(lid, cached)
+                    lists.append(self._get(lid))
+                    urls.append(lists[-1])
         if not urls:
             self._set_update_status({
                 "running": False,
