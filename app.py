@@ -10213,18 +10213,20 @@ class DoQRuntimeServer:
                     super().__init__(*args, **kwargs)
                     self._buffers = {}
                     self._responded = set()
+                    self._stream_count = 0
 
                 def quic_event_received(self, event):
+                    peer = self._quic._network_paths[0].addr[0] if self._quic._network_paths else ""
+                    log_doq_event(f"EVENT type={type(event).__name__} peer={peer}")
+                    
                     if isinstance(event, ProtocolNegotiated):
-                        peer = self._quic._network_paths[0].addr[0] if self._quic._network_paths else ""
                         update_doq_metric("last_peer", peer)
-                        log_doq_event(f"PROTOCOL_NEGOTIATED peer={peer} alpn={event.alpn_protocol} quic_alpn={self._quic.alpn_protocol}")
+                        log_doq_event(f"PROTOCOL_NEGOTIATED alpn={event.alpn_protocol} quic_alpn={self._quic.alpn_protocol}")
                         return
                     if isinstance(event, HandshakeCompleted):
-                        peer = self._quic._network_paths[0].addr[0] if self._quic._network_paths else ""
                         update_doq_metric("handshakes")
                         update_doq_metric("last_peer", peer)
-                        log_doq_event(f"HANDSHAKE_COMPLETED peer={peer} alpn={self._quic.alpn_protocol} session_resumed={event.session_resumed}")
+                        log_doq_event(f"HANDSHAKE_COMPLETED alpn={self._quic.alpn_protocol} resumed={event.session_resumed}")
                         return
                     if isinstance(event, ConnectionTerminated):
                         if event.error_code:
