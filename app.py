@@ -10217,11 +10217,18 @@ class DoQRuntimeServer:
 
                 def quic_event_received(self, event):
                     peer = self._quic._network_paths[0].addr[0] if self._quic._network_paths else ""
-                    log_doq_event(f"EVENT type={type(event).__name__} peer={peer}")
+                    event_type = type(event).__name__
+                    
+                    # Schreibe immer in Log - auch bei Fehlern
+                    try:
+                        with open("web-error.log", "a", encoding="utf-8") as log:
+                            log.write(f"{now_iso()} dns-over-quic EVENT type={event_type} peer={peer}\n")
+                    except Exception as e:
+                        print(f"LOG ERROR: {e}")
                     
                     if isinstance(event, ProtocolNegotiated):
                         update_doq_metric("last_peer", peer)
-                        log_doq_event(f"PROTOCOL_NEGOTIATED alpn={event.alpn_protocol} quic_alpn={self._quic.alpn_protocol}")
+                        log_doq_event(f"PROTOCOL_NEGOTIATED alpn={event.alpn_protocol}")
                         return
                     if isinstance(event, HandshakeCompleted):
                         update_doq_metric("handshakes")
@@ -10229,20 +10236,16 @@ class DoQRuntimeServer:
                         log_doq_event(f"HANDSHAKE_COMPLETED alpn={self._quic.alpn_protocol} resumed={event.session_resumed}")
                         return
                     if isinstance(event, ConnectionTerminated):
-                        if event.error_code:
-                            error_msg = f"code={event.error_code} (0x{event.error_code:x}) reason={event.reason_phrase}"
-                            update_doq_metric("last_error", f"connection terminated {error_msg}")
-                            log_doq_event(f"connection terminated {error_msg}")
-                            import traceback
-                            log_doq_event(f"traceback: {traceback.format_stack()}")
+                        error_msg = f"code={event.error_code} (0x{event.error_code:x}) reason={event.reason_phrase}" if event.error_code else "no error code"
+                        update_doq_metric("last_error", f"connection terminated {error_msg}")
+                        log_doq_event(f"CONNECTION_TERMINATED {error_msg}")
                         return
                     if not isinstance(event, StreamDataReceived):
-                        log_doq_event(f"NON_STREAM_EVENT type={type(event).__name__}")
+                        log_doq_event(f"NON_STREAM_EVENT type={event_type}")
                         return
                     sid = event.stream_id
                     data = self._buffers.get(sid, b"") + event.data
-                    peer = self._quic._network_paths[0].addr[0] if self._quic._network_paths else ""
-                    log_doq_event(f"STREAM_DATA sid={sid} len={len(event.data)} total={len(data)} end_stream={event.end_stream} peer={peer}")
+                    log_doq_event(f"STREAM_DATA sid={sid} len={len(event.data)} total={len(data)} end_stream={event.end_stream}")
                     if not event.end_stream:
                         self._buffers[sid] = data
                         return
