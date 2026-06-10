@@ -7647,17 +7647,18 @@ async function settingsCheckUpdate() {{
         const moreText = d.count > 5 ? `<li>...and ${{d.count - 5}} more</li>` : '';
         result.innerHTML = `
           <div class="alert alert-warning">
-            <div style="margin-bottom:.5rem">
-              <strong>Update available: ${{d.count}} new commit${{d.count > 1 ? 's' : ''}}</strong>
-              <ul style="margin:.5rem 0 0 0;padding-left:1.5rem;font-size:.85rem">${{commitList}}${{moreText}}</ul>
+            <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem">
+              <div>
+                <strong>Update available: ${{d.count}} new commit${{d.count > 1 ? 's' : ''}}</strong>
+                <ul style="margin:.5rem 0 0 0;padding-left:1.5rem;font-size:.85rem">${{commitList}}${{moreText}}</ul>
+                <div style="margin-top:.5rem;font-size:.85rem;color:var(--muted2)">Use "Apply Update" to install and restart</div>
+              </div>
+              <button type="button" class="btn btn-warning" onclick="settingsApplyUpdate()">Apply Update</button>
             </div>
-            <div style="font-size:.9rem;color:var(--muted2)">Applying update and restarting server...</div>
           </div>
         `;
-        await new Promise(resolve => setTimeout(resolve, 1500));
-        await settingsApplyUpdate();
       }} else {{
-        result.innerHTML = '<div class="alert alert-success">You are up to date!</div>';
+        result.innerHTML = '<div class="alert alert-success">No updates available. You are up to date.</div>';
       }}
     }} else {{
       result.innerHTML = `<div class="alert alert-danger">Update check failed: ${{d.error || 'Unknown error'}}</div>`;
