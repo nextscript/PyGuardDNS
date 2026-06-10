@@ -7828,6 +7828,14 @@ def api_docs_page():
              None,
              '{\n  "settings": [...],\n  "blocklists": [...],\n  "rules": [...],\n  "dns_rewrites": [...],\n  "upstreams": [...]\n}'),
         ]),
+        ("Updates", [
+            ("GET", "/api/update/check", "Check GitHub for new commits. Use ?force=1 to bypass the 6-hour cache.",
+             None,
+             '{\n  "ok": true,\n  "available": true,\n  "count": 3,\n  "commits": ["abc1234 Fix bug", "def5678 Add feature", ...]\n}'),
+            ("POST", "/api/update/apply", "Download and install the latest update from GitHub, then restart the server.",
+             None,
+             '{\n  "ok": true,\n  "output": "Update erfolgreich installiert (abc1234)"\n}'),
+        ]),
     ]
 
     def method_badge(m):
