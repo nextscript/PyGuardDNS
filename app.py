@@ -10218,13 +10218,13 @@ class DoQRuntimeServer:
                     if isinstance(event, ProtocolNegotiated):
                         peer = self._quic._network_paths[0].addr[0] if self._quic._network_paths else ""
                         update_doq_metric("last_peer", peer)
-                        log_doq_event(f"protocol negotiated peer={peer} alpn={event.alpn_protocol}")
+                        log_doq_event(f"PROTOCOL_NEGOTIATED peer={peer} alpn={event.alpn_protocol} quic_alpn={self._quic.alpn_protocol}")
                         return
                     if isinstance(event, HandshakeCompleted):
                         peer = self._quic._network_paths[0].addr[0] if self._quic._network_paths else ""
                         update_doq_metric("handshakes")
                         update_doq_metric("last_peer", peer)
-                        log_doq_event(f"handshake completed peer={peer} alpn={self._quic.alpn_protocol}")
+                        log_doq_event(f"HANDSHAKE_COMPLETED peer={peer} alpn={self._quic.alpn_protocol} session_resumed={event.session_resumed}")
                         return
                     if isinstance(event, ConnectionTerminated):
                         if event.error_code:
@@ -10235,11 +10235,12 @@ class DoQRuntimeServer:
                             log_doq_event(f"traceback: {traceback.format_stack()}")
                         return
                     if not isinstance(event, StreamDataReceived):
+                        log_doq_event(f"NON_STREAM_EVENT type={type(event).__name__}")
                         return
                     sid = event.stream_id
                     data = self._buffers.get(sid, b"") + event.data
                     peer = self._quic._network_paths[0].addr[0] if self._quic._network_paths else ""
-                    log_doq_event(f"stream data received sid={sid} len={len(data)} end_stream={event.end_stream} peer={peer}")
+                    log_doq_event(f"STREAM_DATA sid={sid} len={len(event.data)} total={len(data)} end_stream={event.end_stream} peer={peer}")
                     if not event.end_stream:
                         self._buffers[sid] = data
                         return
@@ -10281,10 +10282,10 @@ class DoQRuntimeServer:
             cert_path, key_path = write_temp_pem_files(cert, key)
             try:
                 config = QuicConfiguration(
-                    alpn_protocols=["doq", "doq-i00", "doq-i02", "doq-i10", "doq-i11"],
+                    alpn_protocols=["doq", "doq-i00", "doq-i02", "doq-i04", "doq-i05", "doq-i07", "doq-i10", "doq-i11", "doq-i12", "doq-i13", "doq-i14"],
                     is_client=False,
                     max_datagram_frame_size=65536,
-                    idle_timeout=30.0
+                    idle_timeout=60.0
                 )
                 config.load_cert_chain(cert_path, key_path)
             finally:
