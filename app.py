@@ -10224,17 +10224,22 @@ class DoQRuntimeServer:
                         peer = self._quic._network_paths[0].addr[0] if self._quic._network_paths else ""
                         update_doq_metric("handshakes")
                         update_doq_metric("last_peer", peer)
-                        log_doq_event(f"handshake completed peer={peer}")
+                        log_doq_event(f"handshake completed peer={peer} alpn={self._quic.alpn_protocol}")
                         return
                     if isinstance(event, ConnectionTerminated):
                         if event.error_code:
-                            update_doq_metric("last_error", f"connection terminated code={event.error_code} reason={event.reason_phrase}")
-                            log_doq_event(f"connection terminated code={event.error_code} reason={event.reason_phrase}")
+                            error_msg = f"code={event.error_code} (0x{event.error_code:x}) reason={event.reason_phrase}"
+                            update_doq_metric("last_error", f"connection terminated {error_msg}")
+                            log_doq_event(f"connection terminated {error_msg}")
+                            import traceback
+                            log_doq_event(f"traceback: {traceback.format_stack()}")
                         return
                     if not isinstance(event, StreamDataReceived):
                         return
                     sid = event.stream_id
                     data = self._buffers.get(sid, b"") + event.data
+                    peer = self._quic._network_paths[0].addr[0] if self._quic._network_paths else ""
+                    log_doq_event(f"stream data received sid={sid} len={len(data)} end_stream={event.end_stream} peer={peer}")
                     if not event.end_stream:
                         self._buffers[sid] = data
                         return
@@ -10275,7 +10280,12 @@ class DoQRuntimeServer:
             validate_certificate_pair(cert, key, get_setting("encrypted_dns_domain", ""))
             cert_path, key_path = write_temp_pem_files(cert, key)
             try:
-                config = QuicConfiguration(alpn_protocols=["doq", "doq-i11", "doq-i10", "doq-i02"], is_client=False)
+                config = QuicConfiguration(
+                    alpn_protocols=["doq", "doq-i00", "doq-i02", "doq-i10", "doq-i11"],
+                    is_client=False,
+                    max_datagram_frame_size=65536,
+                    idle_timeout=30.0
+                )
                 config.load_cert_chain(cert_path, key_path)
             finally:
                 for path in (cert_path, key_path):
