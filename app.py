@@ -3756,15 +3756,8 @@ def restart_server():
                 f.write('del "%~f0"\n')
             os.execl("cmd.exe", "cmd.exe", "/c", restart_script)
         else:
-            restart_script = os.path.join(tempfile.gettempdir(), "pyguarddns_restart.sh")
-            with open(restart_script, "w") as f:
-                f.write("#!/bin/sh\n")
-                f.write("sleep 2\n")
-                f.write(f'cd "{script_dir}"\n')
-                f.write(f'clear\n')
-                f.write(f'exec "{python}" "{script_path}"\n')
-            os.chmod(restart_script, 0o755)
-            os.execl(restart_script, restart_script)
+            os.chdir(script_dir)
+            os.execl(python, python, script_path)
     
     threading.Thread(target=delayed_restart, daemon=True).start()
     return {"ok": True, "message": "DNS Server Update..."}
