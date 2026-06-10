@@ -3703,6 +3703,11 @@ def perform_update():
                     shutil.copytree(src_path, dst_path, ignore=shutil.ignore_patterns(*skip_items))
                 else:
                     shutil.copy2(src_path, dst_path)
+                    if item.endswith(".sh"):
+                        try:
+                            os.chmod(dst_path, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+                        except Exception:
+                            pass
             
             for root, dirs, files in os.walk(project_dir):
                 skip_dirs = {".git", "db", "logs", "__pycache__"}
@@ -3736,7 +3741,30 @@ def restart_server():
     def delayed_restart():
         time.sleep(1)
         python = sys.executable
-        os.execl(python, python, *sys.argv)
+        script_path = os.path.abspath(__file__)
+        script_dir = os.path.dirname(script_path)
+        
+        if sys.platform == "win32":
+            restart_script = os.path.join(tempfile.gettempdir(), "pyguarddns_restart.bat")
+            with open(restart_script, "w") as f:
+                f.write("@echo off\n")
+                f.write("timeout /t 2 /nobreak >nul\n")
+                f.write(f'cd /d "{script_dir}"\n')
+                f.write(f'cls\n')
+                f.write(f'title PyGuardDNS\n')
+                f.write(f'"{python}" "{script_path}"\n')
+                f.write('del "%~f0"\n')
+            os.execl("cmd.exe", "cmd.exe", "/c", restart_script)
+        else:
+            restart_script = os.path.join(tempfile.gettempdir(), "pyguarddns_restart.sh")
+            with open(restart_script, "w") as f:
+                f.write("#!/bin/sh\n")
+                f.write("sleep 2\n")
+                f.write(f'cd "{script_dir}"\n')
+                f.write(f'clear\n')
+                f.write(f'exec "{python}" "{script_path}"\n')
+            os.chmod(restart_script, 0o755)
+            os.execl(restart_script, restart_script)
     
     threading.Thread(target=delayed_restart, daemon=True).start()
     return {"ok": True, "message": "DNS Server Update..."}
@@ -7615,14 +7643,16 @@ async function settingsCheckUpdate() {{
         const commitList = d.commits.slice(0, 5).map(c => `<li>${{c}}</li>`).join('');
         const moreText = d.count > 5 ? `<li>...and ${{d.count - 5}} more</li>` : '';
         result.innerHTML = `
-          <div class="alert alert-warning" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem">
-            <div>
+          <div class="alert alert-warning">
+            <div style="margin-bottom:.5rem">
               <strong>Update available: ${{d.count}} new commit${{d.count > 1 ? 's' : ''}}</strong>
               <ul style="margin:.5rem 0 0 0;padding-left:1.5rem;font-size:.85rem">${{commitList}}${{moreText}}</ul>
             </div>
-            <button type="button" class="btn btn-warning" onclick="settingsApplyUpdate()">Update Now</button>
+            <div style="font-size:.9rem;color:var(--muted2)">Applying update and restarting server...</div>
           </div>
         `;
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        await settingsApplyUpdate();
       }} else {{
         result.innerHTML = '<div class="alert alert-success">You are up to date!</div>';
       }}
@@ -7638,8 +7668,6 @@ async function settingsCheckUpdate() {{
 }}
 
 async function settingsApplyUpdate() {{
-  if (!confirm('Apply update and restart server?')) return;
-  
   const result = document.getElementById('settings-update-result');
   if (result) {{
     result.innerHTML = `
