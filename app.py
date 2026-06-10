@@ -7254,6 +7254,14 @@ def settings_page(message="", is_error=False, values=None):
 .settings-toggle{{margin-left:auto}}
 .settings-actions{{display:flex;justify-content:flex-end;gap:.65rem;margin-top:.1rem}}
 .settings-textarea{{min-height:150px;font-family:ui-monospace,SFMono-Regular,Consolas,Liberation Mono,monospace;font-size:.8rem;line-height:1.35;resize:vertical}}
+.settings-pem-field{{background:#0a1018;border:1px solid rgba(30,45,61,.7);border-radius:.5rem;padding:1rem;transition:all .2s}}
+.settings-pem-field:hover{{border-color:#2f455e;background:#0d1626}}
+.settings-pem-field:focus-within{{border-color:var(--accent);box-shadow:0 0 0 3px rgba(124,58,237,.1)}}
+.settings-pem-label{{display:flex;align-items:center;gap:.5rem;font-size:.85rem;font-weight:700;color:var(--text);margin-bottom:.65rem}}
+.settings-pem-label svg{{opacity:.7}}
+.settings-pem-textarea{{width:100%;min-height:180px;font-family:ui-monospace,SFMono-Regular,Consolas,Liberation Mono,monospace;font-size:.78rem;line-height:1.5;resize:vertical;background:#050810;border:1px solid rgba(30,45,61,.5);border-radius:.4rem;padding:.85rem;color:#e2e8f0;transition:all .2s;tab-size:2}}
+.settings-pem-textarea:focus{{outline:none;border-color:var(--accent);background:#060a12;box-shadow:0 0 0 3px rgba(124,58,237,.08)}}
+.settings-pem-textarea::placeholder{{color:rgba(100,116,139,.5)}}
 @media(max-width:980px){{.settings-grid,.settings-field-grid,.settings-field-grid.two{{grid-template-columns:1fr}}}}
 @media(max-width:640px){{
 .settings-header,.settings-section-head,.settings-switch{{align-items:flex-start;flex-direction:column}}
@@ -7334,13 +7342,19 @@ def settings_page(message="", is_error=False, values=None):
           <div><label class="form-label">DNS-over-QUIC Port</label><input class="form-control" name="dns_over_quic_port" type="number" min="0" max="65535" value="{html_escape(value('dns_over_quic_port', '853'))}"></div>
         </div>
         <div class="settings-field-grid two">
-          <div>
-            <label class="form-label">Certificate PEM</label>
-            <textarea class="form-control settings-textarea" name="encrypted_dns_certificate_pem" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----">{html_escape(value('encrypted_dns_certificate_pem', ''))}</textarea>
+          <div class="settings-pem-field">
+            <label class="settings-pem-label">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+              Certificate PEM
+            </label>
+            <textarea class="settings-pem-textarea" name="encrypted_dns_certificate_pem" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----&#10;MIIDXTCCAkWgAwIBAgIJAJC1HiIAZAiUMA0Gc...&#10;-----END CERTIFICATE-----">{html_escape(value('encrypted_dns_certificate_pem', ''))}</textarea>
           </div>
-          <div>
-            <label class="form-label">RSA Private Key PEM</label>
-            <textarea class="form-control settings-textarea" name="encrypted_dns_private_key_pem" spellcheck="false" placeholder="-----BEGIN RSA PRIVATE KEY-----">{html_escape(value('encrypted_dns_private_key_pem', ''))}</textarea>
+          <div class="settings-pem-field">
+            <label class="settings-pem-label">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+              RSA Private Key PEM
+            </label>
+            <textarea class="settings-pem-textarea" name="encrypted_dns_private_key_pem" spellcheck="false" placeholder="-----BEGIN RSA PRIVATE KEY-----&#10;MIIEpAIBAAKCAQEA0Z3VS5JJcds3xfn/ygWeF...&#10;-----END RSA PRIVATE KEY-----">{html_escape(value('encrypted_dns_private_key_pem', ''))}</textarea>
           </div>
         </div>
         <div class="settings-help">Clients connect with <code>tls://{html_escape(value('encrypted_dns_domain', 'panel.ts3x.cc') or 'panel.ts3x.cc')}</code> for DNS-over-TLS and <code>https://{html_escape(value('encrypted_dns_domain', 'panel.ts3x.cc') or 'panel.ts3x.cc')}/dns-query</code> for DNS-over-HTTPS. The listen host is the local bind address, usually <code>0.0.0.0</code>. Public DNS Domain must be the exact hostname clients use, and the certificate must include that hostname.</div>
