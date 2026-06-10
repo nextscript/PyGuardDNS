@@ -3657,6 +3657,7 @@ def perform_update():
     import zipfile
     import shutil
     import tempfile
+    import stat
     
     project_dir = os.path.dirname(os.path.abspath(__file__))
     temp_dir = None
@@ -3702,6 +3703,18 @@ def perform_update():
                     shutil.copytree(src_path, dst_path, ignore=shutil.ignore_patterns(*skip_items))
                 else:
                     shutil.copy2(src_path, dst_path)
+            
+            for root, dirs, files in os.walk(project_dir):
+                skip_dirs = {".git", "db", "logs", "__pycache__"}
+                dirs[:] = [d for d in dirs if d not in skip_dirs]
+                
+                for file in files:
+                    if file.endswith(".sh"):
+                        file_path = os.path.join(root, file)
+                        try:
+                            os.chmod(file_path, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+                        except Exception:
+                            pass
             
             _save_local_commit_hash(latest_hash)
             _update_check_cache["result"] = {"ok": True, "available": False, "count": 0, "commits": []}
