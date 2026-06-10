@@ -7653,7 +7653,7 @@ async function settingsCheckUpdate() {{
                 <ul style="margin:.5rem 0 0 0;padding-left:1.5rem;font-size:.85rem">${{commitList}}${{moreText}}</ul>
                 <div style="margin-top:.5rem;font-size:.85rem;color:var(--muted2)">Use "Apply Update" to install and restart</div>
               </div>
-              <button type="button" class="btn btn-warning" onclick="settingsApplyUpdate()">Apply Update</button>
+              <button type="button" class="btn btn-dark" onclick="settingsApplyUpdate()">Apply Update</button>
             </div>
           </div>
         `;
