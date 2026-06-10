@@ -7638,7 +7638,7 @@ async function settingsCheckUpdate() {{
   result.innerHTML = '';
   
   try {{
-    const r = await fetch('/api/update/check', {{cache:'no-store'}});
+    const r = await fetch('/api/update/check?force=1', {{cache:'no-store'}});
     const d = await r.json();
     
     if (d.ok) {{
@@ -9856,7 +9856,8 @@ class WebHandler(BaseHTTPRequestHandler):
                 })
             self.send_json(all_health)
         elif path == "/api/update/check":
-            self.send_json(check_for_updates())
+            force = params.get("force", ["0"])[0] == "1"
+            self.send_json(check_for_updates(force=force))
         elif path == "/api/audit-log":
             limit = int(params.get("limit", ["100"])[0])
             offset = int(params.get("offset", ["0"])[0])
