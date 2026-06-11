@@ -194,6 +194,7 @@ def test_query_dot_upstream_pooled_creates_pool():
     with app.dot_pools_lock:
         if key in app.dot_pools:
             del app.dot_pools[key]
+        app.dot_pool_counters.pop(key, None)
 
     with patch.object(app.DotConnection, "query", return_value=b"\x00" * 12):
         result = app.query_dot_upstream_pooled(upstream, b"\x00" * 16, timeout=3.0)
@@ -202,7 +203,36 @@ def test_query_dot_upstream_pooled_creates_pool():
     with app.dot_pools_lock:
         assert key in app.dot_pools
         pool = app.dot_pools[key]
-        assert isinstance(pool, app.DotConnection)
+        assert isinstance(pool, list)
+        assert len(pool) == app.DOT_POOL_SIZE
+        assert all(isinstance(conn, app.DotConnection) for conn in pool)
+
+
+def test_query_dot_upstream_pooled_round_robins_connections():
+    upstream = _make_dot_upstream(id=98)
+    key = app._dot_pool_key(upstream)
+
+    with app.dot_pools_lock:
+        if key in app.dot_pools:
+            del app.dot_pools[key]
+        app.dot_pool_counters.pop(key, None)
+
+    seen = []
+
+    def fake_query(self, request, timeout=4.0):
+        seen.append(id(self))
+        return b"\x00" * 12
+
+    with patch.object(app.DotConnection, "query", fake_query):
+        for _ in range(app.DOT_POOL_SIZE * 2):
+            app.query_dot_upstream_pooled(upstream, b"\x00" * 16, timeout=3.0)
+
+    with app.dot_pools_lock:
+        pool = app.dot_pools[key]
+
+    # Round robin spreads requests across the whole pool, not one connection.
+    assert len(set(seen)) == app.DOT_POOL_SIZE
+    assert seen == [id(conn) for conn in pool] * 2
 
 
 def test_query_dot_upstream_delegates_to_pooled():

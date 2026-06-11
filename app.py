@@ -193,7 +193,9 @@ db_write_lock = threading.Lock()
 upstream_metric_last_write = {}
 upstream_queue_wait_samples = []
 upstream_queue_wait_lock = threading.Lock()
+DOT_POOL_SIZE = max(1, int(os.environ.get("LOCALDNSGUARD_DOT_POOL_SIZE", "4")))
 dot_pools = {}
+dot_pool_counters = {}
 dot_pools_lock = threading.RLock()
 doh_pools = {}
 doh_pools_lock = threading.RLock()
@@ -1457,10 +1459,10 @@ def _ensure_upstream_health(upstream_id):
 
 def update_upstream_health(upstream_id, success, latency_ms=0, error=""):
     try:
-        paused = um.update_health(upstream_id, success, latency_ms, error)
-        if paused:
+        newly_paused = um.update_health(upstream_id, success, latency_ms, error)
+        if newly_paused:
             log_admin_action("system", "upstream_auto_paused",
-                             f"Upstream {upstream_id} auto-paused after 5 consecutive failures", "")
+                             f"Upstream {upstream_id} auto-paused after repeated failures", "")
     except Exception:
         pass
 
@@ -2633,9 +2635,13 @@ def query_dot_upstream_pooled(upstream, request, timeout=4.0):
     with dot_pools_lock:
         pool = dot_pools.get(key)
         if pool is None:
-            pool = DotConnection(upstream)
+            pool = [DotConnection(upstream) for _ in range(DOT_POOL_SIZE)]
             dot_pools[key] = pool
-    return pool.query(request, timeout=timeout)
+            dot_pool_counters[key] = 0
+        idx = dot_pool_counters[key] % len(pool)
+        dot_pool_counters[key] = idx + 1
+        conn = pool[idx]
+    return conn.query(request, timeout=timeout)
 
 
 def dot_pool_metrics():
@@ -2647,11 +2653,11 @@ def dot_pool_metrics():
         "dot_pool_size": 0,
     }
     with dot_pools_lock:
-        totals["dot_pool_size"] = len(dot_pools)
-        pools = list(dot_pools.values())
-    for pool in pools:
-        with pool.lock:
-            metrics = pool.metrics()
+        totals["dot_pool_size"] = sum(len(pool) for pool in dot_pools.values())
+        connections = [conn for pool in dot_pools.values() for conn in pool]
+    for conn in connections:
+        with conn.lock:
+            metrics = conn.metrics()
         for key, value in metrics.items():
             totals[key] += value
     return totals

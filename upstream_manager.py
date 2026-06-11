@@ -202,6 +202,7 @@ def update_health(upstream_id: int, success: bool, latency_ms: float = 0.0, erro
         h["servfail_count"] = h.get("servfail_count", 0) + 1
     total = h["total_queries"]
     h["success_rate"] = h["successful_queries"] / total if total > 0 else 1.0
+    was_paused = h.get("paused", False)
     h["consecutive_failures"] = (h.get("consecutive_failures", 0) + 1) if not success else 0
     h["last_checked"] = time.time()
     if success:
@@ -210,9 +211,9 @@ def update_health(upstream_id: int, success: bool, latency_ms: float = 0.0, erro
         if h["consecutive_failures"] == 0:
             h["paused"] = False
             h["backoff_level"] = 0
+            h["backoff_until"] = 0
     else:
         h["last_error"] = (error or "")[:500]
-        backoff_level = h.get("backoff_level", 0)
         cf = h["consecutive_failures"]
         if cf == 1:
             h["backoff_level"] = 0
@@ -222,21 +223,18 @@ def update_health(upstream_id: int, success: bool, latency_ms: float = 0.0, erro
             h["backoff_level"] = 3
         elif cf >= 4:
             h["backoff_level"] = 2
-        if h.get("backoff_level", 0) >= 4:
+        backoff_seconds = {0: 0, 1: 30, 2: 60, 3: 300, 4: 900}.get(h.get("backoff_level", 0), 0)
+        if backoff_seconds:
+            h["backoff_until"] = h["last_checked"] + backoff_seconds
             h["paused"] = True
-        elif h.get("backoff_level", 0) >= 2:
-            backoff_seconds = {0: 0, 1: 30, 2: 60, 3: 300, 4: 900}.get(h.get("backoff_level", 0), 0)
-            if backoff_seconds and h.get("last_checked", 0) > 0:
-                backoff_until = h.get("backoff_until", 0)
-                if backoff_until > time.time():
-                    h["paused"] = True
-                else:
-                    h["paused"] = False
+        else:
+            h["backoff_until"] = 0
+            h["paused"] = False
     data["latency_ms"] = h["latency_ms"] if success else data.get("latency_ms")
     data["last_error"] = h["last_error"]
     _save_file(data)
     _update_cache(data)
-    return h.get("paused", False)
+    return h.get("paused", False) and not was_paused
 
 
 def get_health(upstream_id: int) -> dict:
