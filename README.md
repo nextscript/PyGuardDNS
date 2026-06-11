@@ -133,73 +133,73 @@ Many settings can also be changed directly in the web interface.
 
 ## DNS Filter Rules
 
-PyGuardDNS uses zwei Formate für Filterregeln: das **pgrules-Format** für benutzerdefinierte Regeln in `data/rules/user_rules.pgrules` und das **Adblock/uBlock-Format** für Blocklisten-Importe, die automatisch konvertiert werden.
+PyGuardDNS uses two rule formats: the **pgrules format** for custom rules in `data/rules/user_rules.pgrules` and the **Adblock/uBlock format** for blocklist imports, which are automatically converted.
 
-### pgrules-Format (Benutzerdefinierte Regeln)
+### pgrules Format (Custom Rules)
 
-| Prefix | Typ | Bedeutung | Beispiel |
-|--------|-----|-----------|----------|
-| `bd::` | Block | Exakte Domain blockieren | `bd::doubleclick.net` |
-| `bs::` | Block | Domain + alle Subdomains blockieren | `bs::example.com` |
-| `br::` | Block | Regex-basiert blockieren | `br::/ads\..*\.com/` |
-| `ad::` | Allow | Exakte Domain erlauben | `ad::trusted.com` |
-| `as::` | Allow | Domain + alle Subdomains erlauben | `as::trusted.com` |
-| `ar::` | Allow | Regex-basiert erlauben | `ar::/.*\.trusted\.com/` |
+| Prefix | Type | Description | Example |
+|--------|------|-------------|---------|
+| `bd::` | Block | Block exact domain | `bd::doubleclick.net` |
+| `bs::` | Block | Block domain + all subdomains | `bs::example.com` |
+| `br::` | Block | Block by regex | `br::/ads\..*\.com/` |
+| `ad::` | Allow | Allow exact domain | `ad::trusted.com` |
+| `as::` | Allow | Allow domain + all subdomains | `as::trusted.com` |
+| `ar::` | Allow | Allow by regex | `ar::/.*\.trusted\.com/` |
 
-### Adblock/uBlock-Format (Blocklisten-Importe)
+### Adblock/uBlock Format (Blocklist Imports)
 
-Diese Formate werden in `blocklist_manager.py` und `rules_engine.py` konvertiert. Der Import speichert sie als pgrules im Cache:
+These formats are converted in `blocklist_manager.py` and `rules_engine.py`. The import stores them as pgrules in the cache:
 
-| Syntax | Bedeutung | Beispiel |
-|--------|-----------|----------|
-| `\|\|domain^` | Block Subdomains + Domain | `\|\|doubleclick.net^` |
-| `@@\|\|domain^` | Allow Subdomains + Domain | `@@\|\|trusted.com^` |
-| `/regex/` | Regex-Regel | `/ads\..*/` |
-| `domain` | Exakte Domain | `example.com` |
-| `\|domain` | Exakter Anfang | `\|example.com` |
-| `0.0.0.0 domain` | Hosts-Datei | `0.0.0.0 example.com` |
-| `127.0.0.1 domain` | Hosts-Datei | `127.0.0.1 example.com` |
-| `::1 domain` | Hosts-Datei (IPv6) | `::1 example.com` |
-| `address=/domain/` | Dnsmasq-Format | `address=/example.com/` |
-| `server=/domain/` | Dnsmasq-Format | `server=/example.com/` |
-| `domain^$badfilter` | Regel deaktivieren | `\|\|example.com^$badfilter` |
-| `##.selector` | Kosmetische Regel (ignoriert) | `##.ad-banner` |
-| `domain##.selector` | Kosmetische Regel (ignoriert) | `example.com##.ad` |
+| Syntax | Description | Example |
+|--------|-------------|---------|
+| `\|\|domain^` | Block subdomains + domain | `\|\|doubleclick.net^` |
+| `@@\|\|domain^` | Allow subdomains + domain | `@@\|\|trusted.com^` |
+| `/regex/` | Regex rule | `/ads\..*/` |
+| `domain` | Exact domain | `example.com` |
+| `\|domain` | Exact prefix | `\|example.com` |
+| `0.0.0.0 domain` | Hosts file | `0.0.0.0 example.com` |
+| `127.0.0.1 domain` | Hosts file | `127.0.0.1 example.com` |
+| `::1 domain` | Hosts file (IPv6) | `::1 example.com` |
+| `address=/domain/` | Dnsmasq format | `address=/example.com/` |
+| `server=/domain/` | Dnsmasq format | `server=/example.com/` |
+| `domain^$badfilter` | Disable rule | `\|\|example.com^$badfilter` |
+| `##.selector` | Cosmetic rule (ignored) | `##.ad-banner` |
+| `domain##.selector` | Cosmetic rule (ignored) | `example.com##.ad` |
 
-### Rewrite-Regeln
+### Rewrite Rules
 
-Domain-Umleitungen auf eine beliebige IP oder einen anderen Domain-Namen:
+Domain redirections to an arbitrary IP address or another domain name:
 
 ```
-meinserver.local -> 192.168.1.100
+myserver.local -> 192.168.1.100
 *.local -> 10.0.0.1
 ```
 
-### Verhalten und Priorität
+### Behavior and Priority
 
-Die Prüfreihenfolge (nach Normalisierung der Domain):
+The evaluation order (after domain normalization):
 
-1. **Profile Allow** (profil-spezifische Allow-Regeln)
-2. **Global Allow** (globale Allow-Regeln)
-3. **Profile Rewrite** (profil-spezifische Rewrites)
-4. **Global Rewrite** (globale Rewrites)
-5. **Profile Block** (profil-spezifische Block-Regeln)
-6. **Global Block** (globale Block-Regeln)
-7. **SafeSearch** (profil-spezifische SafeSearch-Erzwingung)
-8. **YouTube Restricted** (profil-spezifische YouTube-Einschränkung)
-9. **Service Block** (profil-spezifische Dienst-Sperren)
+1. **Profile Allow** (profile-specific allow rules)
+2. **Global Allow** (global allow rules)
+3. **Profile Rewrite** (profile-specific rewrites)
+4. **Global Rewrite** (global rewrites)
+5. **Profile Block** (profile-specific block rules)
+6. **Global Block** (global block rules)
+7. **SafeSearch** (profile-specific SafeSearch enforcement)
+8. **YouTube Restricted** (profile-specific YouTube restriction)
+9. **Service Block** (profile-specific service blocks)
 
-Allow-Regeln gewinnen immer vor Block-Regeln. Sobald eine Regel matched, wird die Prüfung abgebrochen. Das bedeutet, ein Allow auf einer höheren Stufe verhindert einen Block auf einer niedrigeren Stufe.
+Allow rules always take precedence over block rules. Once a rule matches, evaluation stops. This means an allow at a higher level prevents a block at a lower level.
 
-**Match-Verhalten:**
-- `bd::` / `ad::` (exact) matcht **nur** die exakte Domain, nicht Subdomains
-- `bs::` / `as::` (suffix) matcht die angegebene Domain **und** alle Subdomains – `bs::example.com` blockiert `example.com`, `sub.example.com`, `deep.sub.example.com`
-- `*.example.com` wird wie `bs::example.com` behandelt
-- `br::` / `ar::` (regex) werden case-insensitive kompiliert und über die gesamte Domain geprüft
+**Matching behavior:**
+- `bd::` / `ad::` (exact) matches **only** the exact domain, not subdomains
+- `bs::` / `as::` (suffix) matches the given domain **and** all subdomains – `bs::example.com` blocks `example.com`, `sub.example.com`, `deep.sub.example.com`
+- `*.example.com` is treated like `bs::example.com`
+- `br::` / `ar::` (regex) are compiled case-insensitively and tested against the entire domain
 
-**Regex-Optimierung:** Regex-Regeln durchlaufen einen Literal-Index. Nur Regexes, deren erforderliche Literale in der angefragten Domain vorkommen, werden tatsächlich ausgeführt. Regexes mit Alternation (`|`) oder optionalen Gruppen (`?`) landen im Fallback-Pfad und werden bei jeder Anfrage geprüft.
+**Regex optimization:** Regex rules go through a literal index. Only regexes whose required literals appear in the queried domain are actually executed. Regexes with alternation (`|`) or optional groups (`?`) fall through to the fallback path and are tested on every query.
 
-**Negative Cache:** Sobald eine Domain als `ALLOW/no_match` eingestuft wurde, wird dieses Ergebnis für bis zu 50.000 Einträge zwischengespeichert und bei erneuter Anfrage sofort zurückgegeben.
+**Negative cache:** Once a domain is classified as `ALLOW/no_match`, the result is cached for up to 50,000 entries and returned immediately on subsequent queries.
 
 ### Decision Explanation
 
@@ -478,6 +478,3 @@ requirements.txt          Runtime Python dependencies
 start-pyguarddns.bat      Windows start script
 start-pyguarddns.sh       Linux/macOS start script
 ```
-
-
-
