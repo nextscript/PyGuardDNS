@@ -70,6 +70,8 @@ class RegexIndex:
             self.literal_buckets.setdefault(lit, []).append(idx)
 
     def candidates(self, domain: str):
+        if not self.rules:
+            return
         labels = set(domain.split("."))
         tokens = labels | self._domain_ngrams(domain)
 

@@ -160,13 +160,20 @@ CSRF_COOKIE = "csrf_token"
 API_TOKEN_SETTING = "api_token"
 
 db_lock = threading.RLock()
-cache_lock = threading.RLock()
 rules_lock = threading.RLock()
 runtime_restart_lock = threading.RLock()
-dns_cache = {}
-negative_cache = {}
-negative_cache_lock = threading.RLock()
+
+# DNS response cache and negative-response cache are sharded across N
+# independent dict+lock pairs (shard = hash(cache_key) % CACHE_SHARDS), so
+# concurrent lookups for different domains don't serialize on one global
+# lock. Each dns_cache shard tracks its own byte usage.
+CACHE_SHARDS = 32
+dns_cache_shards = [{} for _ in range(CACHE_SHARDS)]
+cache_locks = [threading.RLock() for _ in range(CACHE_SHARDS)]
+negative_cache_shards = [{} for _ in range(CACHE_SHARDS)]
+negative_cache_locks = [threading.RLock() for _ in range(CACHE_SHARDS)]
 NEGATIVE_CACHE_MAX_ENTRIES = 10000
+NEGATIVE_CACHE_SHARD_MAX = max(1, NEGATIVE_CACHE_MAX_ENTRIES // CACHE_SHARDS)
 prefetch_hits = {}
 prefetch_hits_lock = threading.RLock()
 prefetch_in_progress = set()
@@ -199,7 +206,7 @@ QUIC_IDLE_TIMEOUT = 45.0
 MAX_QUIC_FAILURES_BEFORE_PENALTY = 3
 QUIC_PENALTY_COOLDOWN_SECONDS = 120.0
 instance_lock_file = None
-cache_bytes_used = 0
+cache_bytes_used = [0] * CACHE_SHARDS
 _upstream_rr_index = 0
 _upstream_rr_lock = threading.Lock()
 
@@ -440,8 +447,12 @@ def reload_filter_engine():
 
 
 def get_filter_engine():
-    with _active_engine_lock:
-        return _active_engine
+    # Lock-free read: reading a module global is a single, GIL-atomic
+    # name lookup, and reload_filter_engine() always swaps in a fully
+    # built engine - readers see either the old or the new engine, never
+    # a half-built one. The lock is only needed by the writer to keep the
+    # engine swap and generation-counter bump consistent.
+    return _active_engine
 
 
 def build_client_snapshot():
@@ -494,13 +505,12 @@ def reload_client_snapshot():
 
 
 def get_client_snapshot():
-    with _client_snapshot_lock:
-        return _client_snapshot
+    # Lock-free read - see get_filter_engine() for the rationale.
+    return _client_snapshot
 
 
 def client_snapshot_generation():
-    with _client_snapshot_lock:
-        return _client_snapshot_generation
+    return _client_snapshot_generation
 
 
 def lookup_client_snapshot(client_ip):
@@ -1162,8 +1172,11 @@ def _invalidate_settings_cache(key=None):
 
 
 def get_setting(key, default=""):
-    with _settings_cache_lock:
-        cached = _settings_cache.get(key, _SETTING_MISSING)
+    # Lock-free read: dict.get() is GIL-atomic, and concurrent writers
+    # (set_setting/_invalidate_settings_cache) only ever replace/remove a
+    # key, never leave the dict in a torn state. The lock is only needed
+    # for the write-back below and for actual writes.
+    cached = _settings_cache.get(key, _SETTING_MISSING)
     if cached is not _SETTING_MISSING:
         return cached
     with db_lock:
@@ -1504,6 +1517,11 @@ def normalize_domain(domain):
     domain = domain.rstrip(".").lower()
     if not domain:
         return ""
+    if domain.isascii():
+        # IDNA encoding of an already-ASCII domain is a no-op (and on
+        # UnicodeError we'd fall back to `domain` anyway) - skip the
+        # stringprep-based codec entirely for the common case.
+        return domain
     try:
         return domain.encode("idna").decode("ascii")
     except UnicodeError:
@@ -1625,8 +1643,9 @@ def dns_response_truncated(response):
     return bool(response[2] & 0x02)
 
 
-def build_ip_response(request, ip_text, ttl=60):
-    question = parse_dns_question(request)
+def build_ip_response(request, ip_text, ttl=60, question=None):
+    if question is None:
+        question = parse_dns_question(request)
     qtype = question["qtype"]
     if ":" in ip_text and qtype != 28:
         return build_empty_response(request)
@@ -1646,7 +1665,7 @@ def block_response_ttl():
         return 60
 
 
-def build_block_response(request, qtype_name=None):
+def build_block_response(request, qtype_name=None, question=None):
     mode = get_setting("block_mode", "zero_ip")
     if mode == "refused":
         return build_error_response(request, 5)
@@ -1662,7 +1681,7 @@ def build_block_response(request, qtype_name=None):
         ip = get_setting("custom_block_ipv6", "::") if qtype_name == "AAAA" else get_setting("custom_block_ipv4", "0.0.0.0")
     else:
         ip = "::" if qtype_name == "AAAA" else "0.0.0.0"
-    return build_ip_response(request, ip, ttl=block_response_ttl())
+    return build_ip_response(request, ip, ttl=block_response_ttl(), question=question)
 
 
 def strip_svcb_ipv6hint_rdata(packet, rdata):
@@ -3994,6 +4013,10 @@ def cache_key(domain, qtype_name):
     return f"{normalize_domain(domain)}|{qtype_name}"
 
 
+def _shard_for(key):
+    return hash(key) % CACHE_SHARDS
+
+
 def extract_negative_ttl(response):
     try:
         import dns.message
@@ -4015,7 +4038,9 @@ def get_negative_cached(domain, qtype_name):
     if get_setting("negative_cache_enabled", "1") != "1":
         return None
     key = cache_key(domain, qtype_name)
-    with negative_cache_lock:
+    shard = _shard_for(key)
+    negative_cache = negative_cache_shards[shard]
+    with negative_cache_locks[shard]:
         item = negative_cache.get(key)
         if not item:
             return None
@@ -4035,8 +4060,10 @@ def set_negative_cached(domain, qtype_name, response, neg_type="nxdomain"):
         ttl = min_ttl
     ttl = max(min_ttl, min(ttl, max_ttl))
     key = cache_key(domain, qtype_name)
-    with negative_cache_lock:
-        if len(negative_cache) >= NEGATIVE_CACHE_MAX_ENTRIES:
+    shard = _shard_for(key)
+    negative_cache = negative_cache_shards[shard]
+    with negative_cache_locks[shard]:
+        if len(negative_cache) >= NEGATIVE_CACHE_SHARD_MAX:
             oldest_key = next(iter(negative_cache))
             negative_cache.pop(oldest_key, None)
         negative_cache[key] = {"expires": time.time() + ttl, "response": response, "type": neg_type}
@@ -4097,11 +4124,12 @@ def _prefetch_refresh(domain, qtype_name, key):
 
 
 def get_cached(domain, qtype_name):
-    global cache_bytes_used
     if get_setting("cache_enabled", "1") != "1":
         return None
     key = cache_key(domain, qtype_name)
-    with cache_lock:
+    shard = _shard_for(key)
+    dns_cache = dns_cache_shards[shard]
+    with cache_locks[shard]:
         item = dns_cache.get(key)
         if not item:
             return None
@@ -4119,7 +4147,7 @@ def get_cached(domain, qtype_name):
             if age > max_stale:
                 evicted = dns_cache.pop(key, None)
                 if evicted:
-                    cache_bytes_used -= len(evicted.get("response", b""))
+                    cache_bytes_used[shard] -= len(evicted.get("response", b""))
                 return None
         if get_setting("cache_optimistic", "0") == "1" and not item.get("stale_refresh"):
             item["stale_refresh"] = True
@@ -4127,12 +4155,11 @@ def get_cached(domain, qtype_name):
             return item["response"]
         evicted = dns_cache.pop(key, None)
         if evicted:
-            cache_bytes_used -= len(evicted.get("response", b""))
+            cache_bytes_used[shard] -= len(evicted.get("response", b""))
     return None
 
 
 def _refresh_stale_cache_entry(domain, qtype_name, key):
-    global cache_bytes_used
     try:
         qtype_code = QTYPE_CODE.get(qtype_name)
         if not qtype_code:
@@ -4141,14 +4168,14 @@ def _refresh_stale_cache_entry(domain, qtype_name, key):
         response, _ = forward_query(request)
         set_cached(domain, qtype_name, response)
     except Exception:
-        with cache_lock:
-            item = dns_cache.get(key)
+        shard = _shard_for(key)
+        with cache_locks[shard]:
+            item = dns_cache_shards[shard].get(key)
             if item:
                 item.pop("stale_refresh", None)
 
 
 def set_cached(domain, qtype_name, response):
-    global cache_bytes_used
     if get_setting("cache_enabled", "1") != "1":
         return
     ttl = int(get_setting("cache_ttl", "300") or "300")
@@ -4159,29 +4186,45 @@ def set_cached(domain, qtype_name, response):
     if max_ttl_v > 0:
         ttl = min(ttl, max_ttl_v)
     max_bytes = int(get_setting("cache_size", "4194304") or "4194304")
+    max_bytes_per_shard = max(1, max_bytes // CACHE_SHARDS)
     key = cache_key(domain, qtype_name)
+    shard = _shard_for(key)
+    dns_cache = dns_cache_shards[shard]
     entry_size = len(response)
-    with cache_lock:
+    with cache_locks[shard]:
         old = dns_cache.pop(key, None)
         if old:
-            cache_bytes_used -= len(old.get("response", b""))
-        while cache_bytes_used + entry_size > max_bytes and dns_cache:
+            cache_bytes_used[shard] -= len(old.get("response", b""))
+        while cache_bytes_used[shard] + entry_size > max_bytes_per_shard and dns_cache:
             oldest_key = next(iter(dns_cache))
             evicted = dns_cache.pop(oldest_key, None)
             if evicted:
-                cache_bytes_used -= len(evicted.get("response", b""))
+                cache_bytes_used[shard] -= len(evicted.get("response", b""))
         dns_cache[key] = {"expires": time.time() + ttl, "response": response, "fresh": True, "inserted_at": time.time()}
-        cache_bytes_used += entry_size
+        cache_bytes_used[shard] += entry_size
 
 
 def cache_stats():
     now = time.time()
-    with cache_lock:
-        entries = len(dns_cache)
-        expired = sum(1 for item in dns_cache.values() if item.get("expires", 0) <= now)
-        stale = sum(1 for item in dns_cache.values() if item.get("expires", 0) <= now and item.get("stale_refresh"))
-        bytes_used = cache_bytes_used
-        soonest_expiry = min((item.get("expires", 0) for item in dns_cache.values()), default=0)
+    entries = 0
+    expired = 0
+    stale = 0
+    bytes_used = 0
+    soonest_expiry = None
+    for shard in range(CACHE_SHARDS):
+        with cache_locks[shard]:
+            shard_cache = dns_cache_shards[shard]
+            entries += len(shard_cache)
+            bytes_used += cache_bytes_used[shard]
+            for item in shard_cache.values():
+                exp = item.get("expires", 0)
+                if exp <= now:
+                    expired += 1
+                    if item.get("stale_refresh"):
+                        stale += 1
+                if soonest_expiry is None or exp < soonest_expiry:
+                    soonest_expiry = exp
+    soonest_expiry = soonest_expiry or 0
     row = one("""
         SELECT
           COUNT(*) total,
@@ -4215,12 +4258,12 @@ def cache_stats():
 
 
 def clear_dns_cache():
-    global cache_bytes_used
-    with cache_lock:
-        dns_cache.clear()
-        cache_bytes_used = 0
-    with negative_cache_lock:
-        negative_cache.clear()
+    for shard in range(CACHE_SHARDS):
+        with cache_locks[shard]:
+            dns_cache_shards[shard].clear()
+            cache_bytes_used[shard] = 0
+        with negative_cache_locks[shard]:
+            negative_cache_shards[shard].clear()
     with prefetch_hits_lock:
         prefetch_hits.clear()
     return {"ok": True, "entries": 0, "bytes_used": 0}
@@ -4638,10 +4681,10 @@ def db_writer_loop():
         batch = []
         with db_write_lock:
             if db_write_queue:
-                batch = db_write_queue[:500]
-                del db_write_queue[:500]
+                batch = db_write_queue[:2000]
+                del db_write_queue[:2000]
         if not batch:
-            time.sleep(0.1)
+            time.sleep(0.05)
             continue
         try:
             with db_lock:
@@ -4750,11 +4793,11 @@ def handle_dns_request(request, client_ip, connection_type=""):
             return response
         if decision["action"] == "block":
             bump_runtime_metric("dns_filter_blocks_total")
-            response = build_block_response(request, qtype_name)
+            response = build_block_response(request, qtype_name, question)
             log_query(client_ip, domain, normalized, qtype_name, "blocked", matched_rule=decision["rule"], blocked=1, reason=decision["reason"], duration_ms=(time.perf_counter() - started) * 1000, matched_list=decision.get("filter_list", ""), client_name=dc, profile_name=dp, connection_type=connection_type, resolver_mode=resolver_mode)
             return response
         if decision["action"] == "rewrite":
-            response = build_ip_response(request, decision["target"])
+            response = build_ip_response(request, decision["target"], question=question)
             log_query(client_ip, domain, normalized, qtype_name, "rewritten", response_ips=decision["target"], matched_rule=decision["rule"], reason=decision["reason"], duration_ms=(time.perf_counter() - started) * 1000, matched_list=decision.get("filter_list", ""), client_name=dc, profile_name=dp, connection_type=connection_type, resolver_mode=resolver_mode)
             return response
 
@@ -4842,7 +4885,7 @@ def handle_dns_request(request, client_ip, connection_type=""):
             cname_result = engine.check(cname, filtering_enabled=filtering_on, profile_id=profile_id)
             if cname_result.action == "BLOCK":
                 bump_runtime_metric("dns_filter_blocks_total")
-                blocked_response = build_block_response(request, qtype_name)
+                blocked_response = build_block_response(request, qtype_name, question)
                 matched = cname_result.matched_rule or cname_result.matched_domain or cname
                 log_query(client_ip, domain, normalized, qtype_name, "blocked", upstream=upstream,
                           matched_rule=matched, blocked=1, reason="cname_blocked",
