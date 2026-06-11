@@ -28,19 +28,19 @@ By default, the application listens on DNS port `53` for UDP/TCP and serves the 
 - YouTube Restricted Mode through DNS rewrites
 - DNS rewrites for local or custom target addresses, including wildcard rewrites (`*.local -> 10.0.0.1`)
 - Block response modes: zero IP, custom IP, NXDOMAIN, REFUSED, and NODATA
-- DNS cache with configurable TTL, min/max TTL bounds, cache size, and optimistic stale refresh
+- DNS cache with configurable TTL, min/max TTL bounds, cache size, optimistic stale refresh, negative cache (NXDOMAIN/NODATA), and prefetch for frequently used domains
 - RAM-snapshot request path: settings, client/profile data, and filter rules are read from atomically-swapped in-memory snapshots, so answering a DNS query needs no SQLite access, global locks, or synchronous query-log writes
 - Asynchronous unknown-client registration with TTL-based deduplication and batched background inserts, keeping per-query database writes off the DNS hot path
 - Runtime metrics for the DNS request hot path (cache hits/misses, filter decisions, upstream errors, query-log drops, queue sizes, unknown client drops) exposed via `/metrics` and `/api/runtime_metrics`
 - Upstream resolver management with health checks, latency measurement, automatic pause on consecutive failures, and manual testing
 - Support for multiple upstream resolver types: plain DNS (UDP/TCP), DNS-over-TLS (with connection pooling), DNS-over-HTTPS, DNS-over-HTTPS with HTTP/3 (with fallback to DoH), DNS-over-QUIC (with fallback to DoT), DNSCrypt stamps, and plain DNS stamps
 - DNSCrypt with Anonymized DNSCrypt relay support and XChaCha20-Poly1305 encryption (es_version=2)
-- Upstream forwarding modes: sequential, parallel fastest, and load balancing with round-robin
+- Upstream forwarding modes: sequential, parallel fastest, parallel race, fastest address, strict order, and load balancing with round-robin
 - Automatic fallback to hardcoded DoT resolvers (Cloudflare, Google) when all upstreams fail
 - Bootstrap DNS resolution via hardcoded DoH providers to avoid recursive deadlock
 - Optional encrypted DNS server for DNS-over-TLS, DNS-over-HTTPS, and DNS-over-QUIC on port `853`
 - Certificate/key validation for encrypted DNS server (checks matching and server name)
-- Persistent DoT/DoQ connection reuse with idle timeout and automatic reconnect
+- Persistent DoT/DoH/DoQ connection reuse with idle timeout and automatic reconnect
 - QUIC session pooling with penalty tracking, latency recording, and idle sweep
 - Admin login with password, sessions, CSRF protection, and login rate limiting
 - API tokens for external automation
@@ -53,7 +53,7 @@ By default, the application listens on DNS port `53` for UDP/TCP and serves the 
 - Start scripts for Windows and Linux/macOS
 - CLI commands for status, backup, restore, blocklist updates, and domain testing
 - Interactive console command completion with Tab
-- DNSSEC self-validation with local root trust anchor, RFC 5011 automatic key rollover, embedded IANA root trust anchor, NSEC/NSEC3 denial proof validation, and SERVFAIL on bogus responses
+- DNSSEC self-validation with local root trust anchor, RFC 5011 automatic key rollover, embedded IANA root trust anchor, NSEC/NSEC3 denial proof validation, validation result caching, and SERVFAIL on bogus responses
 - Automatic missing dependency detection at startup
 
 ## Requirements
@@ -251,9 +251,13 @@ Invalid modes fall back to `zero_ip`.
 
 Unknown clients are registered asynchronously: new IPs are deduplicated with a TTL-based set, queued, and inserted in batches by a background worker, which then triggers a snapshot rebuild. If the queue fills up, registrations are dropped and counted in `unknown_client_dropped_total` instead of blocking DNS responses.
 
-DNS-over-TLS connections are pooled (`DotConnection`) and reused instead of performing a new TCP/TLS handshake for every query. DNS-over-QUIC sessions are pooled with idle timeout, penalty tracking after repeated failures, and automatic reconnect.
+DNS-over-TLS and DNS-over-HTTPS connections are pooled (`DotConnection`, `DohConnection`) and reused instead of performing a new TCP/TLS handshake for every query. DNS-over-QUIC sessions are pooled with idle timeout, penalty tracking after repeated failures, and automatic reconnect.
 
-Hot-path counters (cache hits/misses, filter decisions, upstream errors, query-log drops, queue sizes, dropped client registrations) are available through `/metrics` and `/api/runtime_metrics`, and `benchmark_request_path.py` can reproduce cache-hit, clean-miss, blocked, and mixed traffic patterns, optionally with a simulated slow disk, to measure the effect of changes on this path.
+The DNS cache supports negative caching (NXDOMAIN and NODATA responses) with configurable TTL derived from SOA records, and prefetch caching that refreshes frequently used domains before their TTL expires. Upstream health is tracked with states: healthy, slow, degraded, and down.
+
+Hot-path counters (cache hits/misses, filter decisions, upstream errors, query-log drops, queue sizes, dropped client registrations) are available through `/metrics` and `/api/runtime_metrics`. The query log includes detailed timing metrics: upstream protocol, response time, connect time, handshake time, upstream query time, DNSSEC status, pool reuse, stale serving, and prefetch triggers.
+
+`benchmark_request_path.py` can reproduce cache-hit, clean-miss, blocked, and mixed traffic patterns, optionally with a simulated slow disk, to measure the effect of changes on this path. `benchmark_resolver.py` measures cold cache, warm cache, negative cache, NXDOMAIN cache, and parallel race resolver performance.
 
 ## Blocklist Updates
 
@@ -297,7 +301,10 @@ Supported upstream formats include:
 Upstream forwarding modes:
 
 - **sequential**: try upstreams in order until one succeeds
-- **parallel fastest**: query all upstreams concurrently and return the first successful response
+- **parallel fastest**: query top N upstreams concurrently and return the first successful response
+- **parallel race**: query all upstreams concurrently and return the first valid response
+- **fastest address**: sort upstreams by average latency and try the fastest first
+- **strict order**: use only the first upstream, fallback to others on failure
 - **load balance**: round-robin across upstreams
 
 When all upstreams fail, PyGuardDNS falls back to hardcoded DoT resolvers (Cloudflare, Google).
@@ -436,6 +443,14 @@ python benchmark_request_path.py --mode mixed --per-thread 300 --levels 1,2,4,8,
 
 `--mode` selects the traffic pattern (`cache-hit`, `clean-miss`, `blocked`, `mixed`), and `--simulate-slow-db`/`--slow-db-delay` simulate a slow disk to verify that DNS latency stays decoupled from query-log persistence speed. The output includes p50/latency, cache-hit-ratio, and queue-size columns sourced from the runtime metrics.
 
+Benchmark resolver performance with cache and upstream optimizations:
+
+```sh
+python benchmark_resolver.py --queries 100
+```
+
+Tests cold cache, warm cache, NXDOMAIN cache hits, negative cache misses, and parallel race resolver. Use `--json` for machine-readable output.
+
 ## Security Notes
 
 - Do not expose the web interface to the public internet without additional protection.
@@ -455,6 +470,7 @@ rules_engine.py           User rule format (pgrules), blocklist conversion, and 
 upstream_manager.py       Upstream resolver configuration stored as JSON files
 benchmark_filter_engine.py Synthetic filter-engine benchmark
 benchmark_request_path.py Synthetic benchmark for the DNS request hot path
+benchmark_resolver.py     Benchmark for cache, negative cache, and resolver modes
 data/root-anchors.xml     IANA root trust anchor (KSK key digests and public keys)
 data/root.key             Root DNSKEYs in BIND format (optional override)
 data/trust_anchors.json   RFC 5011 trust anchor state
