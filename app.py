@@ -164,6 +164,13 @@ cache_lock = threading.RLock()
 rules_lock = threading.RLock()
 runtime_restart_lock = threading.RLock()
 dns_cache = {}
+negative_cache = {}
+negative_cache_lock = threading.RLock()
+NEGATIVE_CACHE_MAX_ENTRIES = 10000
+prefetch_hits = {}
+prefetch_hits_lock = threading.RLock()
+prefetch_in_progress = set()
+prefetch_in_progress_lock = threading.Lock()
 dash_cache = {"data": None, "ts": 0.0}
 DASH_CACHE_TTL = 5
 sessions = {}
@@ -181,6 +188,8 @@ upstream_queue_wait_samples = []
 upstream_queue_wait_lock = threading.Lock()
 dot_pools = {}
 dot_pools_lock = threading.RLock()
+doh_pools = {}
+doh_pools_lock = threading.RLock()
 quic_sessions = {}
 quic_sessions_lock = threading.RLock()
 _quic_loop = None
@@ -872,6 +881,17 @@ def init_db():
             "cache_min_ttl": "0",
             "cache_max_ttl": "0",
             "cache_optimistic": "0",
+            "negative_cache_enabled": "1",
+            "negative_cache_max_ttl": "300",
+            "negative_cache_min_ttl": "30",
+            "prefetch_enabled": "1",
+            "prefetch_min_hits": "3",
+            "prefetch_ttl_percentage": "20",
+            "serve_stale_enabled": "0",
+            "serve_stale_max_age": "86400",
+            "optimistic_cache_enabled": "0",
+            "dnssec_cache_enabled": "1",
+            "dnssec_cache_max_ttl": "86400",
             "disable_ipv6": "0",
             "upstream_mode": "sequential",
             "upstream_timeout": "2.5",
@@ -1041,6 +1061,18 @@ MIGRATIONS = [
     (13, "drop legacy blocklist_entries table", lambda: db.executescript("""
         DROP TABLE IF EXISTS blocklist_entries;
     """)),
+    (14, "add performance metrics to query_log", lambda: (
+        _ensure_column("query_log", "upstream_protocol", "TEXT NOT NULL DEFAULT ''"),
+        _ensure_column("query_log", "response_time_ms", "REAL NOT NULL DEFAULT 0"),
+        _ensure_column("query_log", "connect_time_ms", "REAL NOT NULL DEFAULT 0"),
+        _ensure_column("query_log", "handshake_time_ms", "REAL NOT NULL DEFAULT 0"),
+        _ensure_column("query_log", "upstream_query_time_ms", "REAL NOT NULL DEFAULT 0"),
+        _ensure_column("query_log", "dnssec_status", "TEXT NOT NULL DEFAULT ''"),
+        _ensure_column("query_log", "pool_reused", "INTEGER NOT NULL DEFAULT 0"),
+        _ensure_column("query_log", "served_stale", "INTEGER NOT NULL DEFAULT 0"),
+        _ensure_column("query_log", "prefetch_triggered", "INTEGER NOT NULL DEFAULT 0"),
+        _ensure_column("query_log", "resolver_mode", "TEXT NOT NULL DEFAULT ''"),
+    )),
 ]
 
 
@@ -2078,6 +2110,10 @@ def resolve_upstream_host(host):
 
 
 def query_doh_upstream(upstream, request, timeout=4.0):
+    return query_doh_upstream_pooled(upstream, request, timeout=timeout)
+
+
+def query_doh_upstream_once(upstream, request, timeout=4.0):
     connect_timeout = get_timeout_setting("tcp_connect_timeout", timeout)
     tls_timeout = get_timeout_setting("tls_handshake_timeout", timeout)
     query_timeout = get_timeout_setting("dns_query_timeout", timeout)
@@ -2594,6 +2630,148 @@ def dot_pool_metrics():
     with dot_pools_lock:
         totals["dot_pool_size"] = len(dot_pools)
         pools = list(dot_pools.values())
+    for pool in pools:
+        with pool.lock:
+            metrics = pool.metrics()
+        for key, value in metrics.items():
+            totals[key] += value
+    return totals
+
+
+class DohConnection:
+    def __init__(self, upstream, idle_timeout=60.0):
+        self.upstream = dict(upstream)
+        self.idle_timeout = idle_timeout
+        self.conn = None
+        self.lock = threading.Lock()
+        self.last_used = 0.0
+        self.handshake_count = 0
+        self.reuse_count = 0
+        self.reconnect_count = 0
+        self.error_count = 0
+        self._ip_index = 0
+
+    def close(self):
+        try:
+            if self.conn is not None:
+                self.conn.close()
+        except Exception:
+            pass
+        self.conn = None
+
+    def _candidate_ips(self):
+        host, port, path = doh_request_parts(self.upstream["resolver"])
+        ips = resolve_upstream_host(host)
+        if not ips:
+            raise OSError("DoH resolver host did not resolve")
+        return ips[:4]
+
+    def connect(self, timeout=4.0):
+        connect_timeout = get_timeout_setting("tcp_connect_timeout", timeout)
+        tls_timeout = get_timeout_setting("tls_handshake_timeout", timeout)
+        query_timeout = get_timeout_setting("dns_query_timeout", timeout)
+        host, port, path = doh_request_parts(self.upstream["resolver"])
+        ips = self._candidate_ips()
+        last_error = None
+        start_index = self._ip_index % len(ips)
+        ordered_ips = ips[start_index:] + ips[:start_index]
+        for ip in ordered_ips:
+            raw = None
+            try:
+                raw = socket.create_connection((ip, port), timeout=connect_timeout)
+                raw.settimeout(tls_timeout)
+                context = ssl.create_default_context()
+                conn = context.wrap_socket(raw, server_hostname=host)
+                conn.settimeout(query_timeout)
+                self.conn = conn
+                self.last_used = time.time()
+                self.handshake_count += 1
+                self._ip_index = (ips.index(ip) + 1) % len(ips)
+                return
+            except Exception as exc:
+                last_error = exc
+                try:
+                    if raw is not None:
+                        raw.close()
+                except Exception:
+                    pass
+        raise OSError(str(last_error) if last_error else "DoH connect failed")
+
+    def query(self, request: bytes, timeout=4.0) -> bytes:
+        with self.lock:
+            try:
+                self._ensure_connected(timeout)
+                return self._send_and_receive(request, timeout)
+            except Exception:
+                self.error_count += 1
+                self.reconnect_count += 1
+                self.close()
+                self.connect(timeout=timeout)
+                return self._send_and_receive(request, timeout)
+
+    def _ensure_connected(self, timeout):
+        if self.conn is None or time.time() - self.last_used > self.idle_timeout:
+            self.close()
+            self.connect(timeout=timeout)
+        else:
+            self.reuse_count += 1
+
+    def _send_and_receive(self, request: bytes, timeout=4.0) -> bytes:
+        host, port, path = doh_request_parts(self.upstream["resolver"])
+        authority = doh_authority(host, port)
+        query_timeout = get_timeout_setting("dns_query_timeout", timeout)
+        self.conn.settimeout(query_timeout)
+        http_request = (
+            f"POST {path} HTTP/1.1\r\n"
+            f"Host: {authority}\r\n"
+            "User-Agent: PyGuardDNS/0.1\r\n"
+            "Accept: application/dns-message\r\n"
+            "Content-Type: application/dns-message\r\n"
+            f"Content-Length: {len(request)}\r\n"
+            "Connection: keep-alive\r\n\r\n"
+        ).encode("ascii") + request
+        self.conn.sendall(http_request)
+        response = read_http_response(self.conn)
+        if len(response) < 12:
+            raise OSError("short DoH DNS response")
+        self.last_used = time.time()
+        return response
+
+    def metrics(self):
+        return {
+            "tls_handshake_count": self.handshake_count,
+            "doh_reuse_count": self.reuse_count,
+            "doh_reconnect_count": self.reconnect_count,
+            "doh_error_count": self.error_count,
+        }
+
+
+def _doh_pool_key(upstream):
+    resolver = upstream.get("resolver") or ""
+    return f"{upstream.get('id', '')}:{resolver}:{upstream['address']}:{int(upstream.get('port', 443))}"
+
+
+def query_doh_upstream_pooled(upstream, request, timeout=4.0):
+    key = _doh_pool_key(upstream)
+    with doh_pools_lock:
+        pool = doh_pools.get(key)
+        if pool is None:
+            pool = DohConnection(upstream)
+            doh_pools[key] = pool
+    return pool.query(request, timeout=timeout)
+
+
+def doh_pool_metrics():
+    totals = {
+        "tls_handshake_count": 0,
+        "doh_reuse_count": 0,
+        "doh_reconnect_count": 0,
+        "doh_error_count": 0,
+        "doh_pool_size": 0,
+    }
+    with doh_pools_lock:
+        totals["doh_pool_size"] = len(doh_pools)
+        pools = list(doh_pools.values())
     for pool in pools:
         with pool.lock:
             metrics = pool.metrics()
@@ -3816,6 +3994,108 @@ def cache_key(domain, qtype_name):
     return f"{normalize_domain(domain)}|{qtype_name}"
 
 
+def extract_negative_ttl(response):
+    try:
+        import dns.message
+        msg = dns.message.from_wire(response)
+        for rrset in msg.authority:
+            if rrset.rdtype == dns.rdatatype.SOA:
+                soa_ttl = rrset.ttl
+                if rrset.items:
+                    soa = rrset.items[0]
+                    soa_minimum = soa.minimum
+                    return min(soa_ttl, soa_minimum) if soa_minimum > 0 else soa_ttl
+                return soa_ttl
+    except Exception:
+        pass
+    return None
+
+
+def get_negative_cached(domain, qtype_name):
+    if get_setting("negative_cache_enabled", "1") != "1":
+        return None
+    key = cache_key(domain, qtype_name)
+    with negative_cache_lock:
+        item = negative_cache.get(key)
+        if not item:
+            return None
+        if item["expires"] > time.time():
+            return item["response"], item["type"]
+        negative_cache.pop(key, None)
+    return None
+
+
+def set_negative_cached(domain, qtype_name, response, neg_type="nxdomain"):
+    if get_setting("negative_cache_enabled", "1") != "1":
+        return
+    max_ttl = int(get_setting("negative_cache_max_ttl", "300") or "300")
+    min_ttl = int(get_setting("negative_cache_min_ttl", "30") or "30")
+    ttl = extract_negative_ttl(response)
+    if ttl is None:
+        ttl = min_ttl
+    ttl = max(min_ttl, min(ttl, max_ttl))
+    key = cache_key(domain, qtype_name)
+    with negative_cache_lock:
+        if len(negative_cache) >= NEGATIVE_CACHE_MAX_ENTRIES:
+            oldest_key = next(iter(negative_cache))
+            negative_cache.pop(oldest_key, None)
+        negative_cache[key] = {"expires": time.time() + ttl, "response": response, "type": neg_type}
+
+
+def is_negative_response(response):
+    try:
+        flags = struct.unpack("!H", response[2:4])[0]
+        rcode = flags & 0x000F
+        ancount = struct.unpack("!H", response[6:8])[0]
+        if rcode == 3:
+            return "nxdomain"
+        if rcode == 0 and ancount == 0:
+            return "nodata"
+    except Exception:
+        pass
+    return None
+
+
+def _maybe_prefetch(domain, qtype_name, key, item):
+    if get_setting("prefetch_enabled", "1") != "1":
+        return
+    min_hits = int(get_setting("prefetch_min_hits", "3") or "3")
+    ttl_pct = int(get_setting("prefetch_ttl_percentage", "20") or "20")
+    inserted_at = item.get("inserted_at", item.get("expires", 0) - 300)
+    ttl_total = item["expires"] - inserted_at
+    if ttl_total <= 0:
+        return
+    ttl_remaining = item["expires"] - time.time()
+    if ttl_remaining > ttl_total * (ttl_pct / 100.0):
+        return
+    with prefetch_hits_lock:
+        hits = prefetch_hits.get(key, 0) + 1
+        prefetch_hits[key] = hits
+    if hits < min_hits:
+        return
+    with prefetch_in_progress_lock:
+        if key in prefetch_in_progress:
+            return
+        prefetch_in_progress.add(key)
+    threading.Thread(target=_prefetch_refresh, args=(domain, qtype_name, key), daemon=True).start()
+
+
+def _prefetch_refresh(domain, qtype_name, key):
+    global cache_bytes_used
+    try:
+        qtype_code = QTYPE_CODE.get(qtype_name)
+        if not qtype_code:
+            return
+        _, request = build_query(domain, qtype_code)
+        response, _ = forward_query(request)
+        set_cached(domain, qtype_name, response)
+    except Exception:
+        pass
+    finally:
+        with prefetch_in_progress_lock:
+            prefetch_in_progress.discard(key)
+
+
 def get_cached(domain, qtype_name):
     global cache_bytes_used
     if get_setting("cache_enabled", "1") != "1":
@@ -3826,6 +4106,7 @@ def get_cached(domain, qtype_name):
         if not item:
             return None
         if item["expires"] > time.time():
+            _maybe_prefetch(domain, qtype_name, key, item)
             return item["response"]
         stale_enabled = get_setting("serve_stale_enabled", "0") == "1"
         if stale_enabled:
@@ -3889,7 +4170,7 @@ def set_cached(domain, qtype_name, response):
             evicted = dns_cache.pop(oldest_key, None)
             if evicted:
                 cache_bytes_used -= len(evicted.get("response", b""))
-        dns_cache[key] = {"expires": time.time() + ttl, "response": response, "fresh": True}
+        dns_cache[key] = {"expires": time.time() + ttl, "response": response, "fresh": True, "inserted_at": time.time()}
         cache_bytes_used += entry_size
 
 
@@ -3938,6 +4219,10 @@ def clear_dns_cache():
     with cache_lock:
         dns_cache.clear()
         cache_bytes_used = 0
+    with negative_cache_lock:
+        negative_cache.clear()
+    with prefetch_hits_lock:
+        prefetch_hits.clear()
     return {"ok": True, "entries": 0, "bytes_used": 0}
 
 
@@ -4126,6 +4411,12 @@ def _forward_query(request, timeout_override=None):
     mode = get_setting("upstream_mode", "sequential")
     if mode == "parallel_fastest":
         return _forward_query_parallel(request, timeout_override=timeout_override)
+    if mode == "parallel_race":
+        return _forward_query_race(request, timeout_override=timeout_override)
+    if mode == "fastest_addr":
+        return _forward_query_fastest(request, timeout_override=timeout_override)
+    if mode == "strict_order":
+        return _forward_query_strict(request, timeout_override=timeout_override)
     if mode == "load_balance":
         return _forward_query_loadbalance(request, timeout_override=timeout_override)
     upstreams = active_upstreams()
@@ -4141,6 +4432,79 @@ def _forward_query(request, timeout_override=None):
             maybe_update_upstream_status(upstream, latency=None, error=last_error)
     if not upstreams:
         return _query_fallback_plain(request)
+    raise OSError(last_error or "no upstream available")
+
+
+def _forward_query_race(request, timeout_override=None):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    upstreams = [u for u in active_upstreams() if upstream_supported(u)]
+    if not upstreams:
+        return _query_fallback_plain(request)
+    if len(upstreams) == 1:
+        return _query_one_upstream(upstreams[0], request, timeout_override=timeout_override)
+    first = [None]
+    errors = []
+    lock = threading.Lock()
+    done = threading.Event()
+
+    def try_one(upstream):
+        try:
+            result = _query_one_upstream(upstream, request, timeout_override=timeout_override)
+            with lock:
+                if first[0] is None:
+                    first[0] = (result, upstream)
+                    done.set()
+        except OSError as exc:
+            maybe_update_upstream_status(upstream, latency=None, error=str(exc))
+            with lock:
+                errors.append(str(exc))
+                if len(errors) >= len(upstreams):
+                    done.set()
+
+    with ThreadPoolExecutor(max_workers=len(upstreams)) as ex:
+        futures = [ex.submit(try_one, u) for u in upstreams]
+        try:
+            for f in as_completed(futures, timeout=3.5):
+                if first[0] is not None:
+                    for ff in futures:
+                        ff.cancel()
+                    break
+        except TimeoutError:
+            pass
+    if first[0] is not None:
+        return first[0][0]
+    raise OSError(errors[-1] if errors else "all upstreams timed out")
+
+
+def _forward_query_fastest(request, timeout_override=None):
+    upstreams = [u for u in active_upstreams() if upstream_supported(u)]
+    if not upstreams:
+        return _query_fallback_plain(request)
+    ordered = sorted(upstreams, key=lambda u: (
+        u.get("health", {}).get("latency_ms") or u.get("latency_ms") or 999999,
+        -(u.get("health", {}).get("success_rate", 1.0)),
+    ))
+    last_error = ""
+    for upstream in ordered:
+        try:
+            return _query_one_upstream(upstream, request, timeout_override=timeout_override)
+        except OSError as exc:
+            last_error = str(exc)
+            maybe_update_upstream_status(upstream, latency=None, error=last_error)
+    raise OSError(last_error or "no upstream available")
+
+
+def _forward_query_strict(request, timeout_override=None):
+    upstreams = [u for u in active_upstreams() if upstream_supported(u)]
+    if not upstreams:
+        return _query_fallback_plain(request)
+    last_error = ""
+    for upstream in upstreams:
+        try:
+            return _query_one_upstream(upstream, request, timeout_override=timeout_override)
+        except OSError as exc:
+            last_error = str(exc)
+            maybe_update_upstream_status(upstream, latency=None, error=last_error)
     raise OSError(last_error or "no upstream available")
 
 
@@ -4256,7 +4620,7 @@ def extract_response_ips(response):
     return ",".join(ips)
 
 
-def log_query(client_ip, domain, normalized, qtype_name, status, response_ips="", upstream="", matched_rule="", cache_status="miss", blocked=0, reason="", duration_ms=0, matched_list="", client_name="", profile_name="", connection_type=""):
+def log_query(client_ip, domain, normalized, qtype_name, status, response_ips="", upstream="", matched_rule="", cache_status="miss", blocked=0, reason="", duration_ms=0, matched_list="", client_name="", profile_name="", connection_type="", upstream_protocol="", response_time_ms=0, connect_time_ms=0, handshake_time_ms=0, upstream_query_time_ms=0, dnssec_status="", pool_reused=0, served_stale=0, prefetch_triggered=0, resolver_mode=""):
     if get_setting("query_log_enabled", "1") != "1":
         return
     with db_write_lock:
@@ -4264,7 +4628,7 @@ def log_query(client_ip, domain, normalized, qtype_name, status, response_ips=""
             full = True
         else:
             full = False
-            db_write_queue.append((now_iso(), client_ip or "", domain or "", normalized or "", qtype_name or "", status or "", response_ips or "", upstream or "", connection_type or "", matched_rule or "", cache_status or "miss", blocked or 0, reason or "", matched_list or "", duration_ms or 0, client_name or "", profile_name or ""))
+            db_write_queue.append((now_iso(), client_ip or "", domain or "", normalized or "", qtype_name or "", status or "", response_ips or "", upstream or "", connection_type or "", matched_rule or "", cache_status or "miss", blocked or 0, reason or "", matched_list or "", duration_ms or 0, client_name or "", profile_name or "", upstream_protocol or "", response_time_ms or 0, connect_time_ms or 0, handshake_time_ms or 0, upstream_query_time_ms or 0, dnssec_status or "", pool_reused or 0, served_stale or 0, prefetch_triggered or 0, resolver_mode or ""))
     if full:
         bump_runtime_metric("query_log_dropped_total")
 
@@ -4282,13 +4646,13 @@ def db_writer_loop():
         try:
             with db_lock:
                 batch = [
-                    tuple((0 if idx in (11, 14) else "") if value is None else value for idx, value in enumerate(item))
+                    tuple((0 if idx in (11, 14, 18, 19, 20, 21, 23, 24, 25) else "") if value is None else value for idx, value in enumerate(item))
                     for item in batch
                 ]
                 db.executemany(
                     """
-                    INSERT INTO query_log(timestamp,client_ip,domain,normalized_domain,query_type,status,response_ips,upstream,connection_type,matched_rule,cache_status,blocked,blocked_reason,matched_list,duration_ms,client_name,profile_name)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    INSERT INTO query_log(timestamp,client_ip,domain,normalized_domain,query_type,status,response_ips,upstream,connection_type,matched_rule,cache_status,blocked,blocked_reason,matched_list,duration_ms,client_name,profile_name,upstream_protocol,response_time_ms,connect_time_ms,handshake_time_ms,upstream_query_time_ms,dnssec_status,pool_reused,served_stale,prefetch_triggered,resolver_mode)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     batch,
                 )
@@ -4339,16 +4703,16 @@ def db_maintenance_loop():
         time.sleep(3600)
 
 
-def log_query_sync(client_ip, domain, normalized, qtype_name, status, response_ips="", upstream="", matched_rule="", cache_status="miss", blocked=0, reason="", duration_ms=0, matched_list="", client_name="", profile_name="", connection_type=""):
+def log_query_sync(client_ip, domain, normalized, qtype_name, status, response_ips="", upstream="", matched_rule="", cache_status="miss", blocked=0, reason="", duration_ms=0, matched_list="", client_name="", profile_name="", connection_type="", upstream_protocol="", response_time_ms=0, connect_time_ms=0, handshake_time_ms=0, upstream_query_time_ms=0, dnssec_status="", pool_reused=0, served_stale=0, prefetch_triggered=0, resolver_mode=""):
     if get_setting("query_log_enabled", "1") != "1":
         return
     with db_lock:
         db.execute(
             """
-            INSERT INTO query_log(timestamp,client_ip,domain,normalized_domain,query_type,status,response_ips,upstream,connection_type,matched_rule,cache_status,blocked,blocked_reason,matched_list,duration_ms,client_name,profile_name)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO query_log(timestamp,client_ip,domain,normalized_domain,query_type,status,response_ips,upstream,connection_type,matched_rule,cache_status,blocked,blocked_reason,matched_list,duration_ms,client_name,profile_name,upstream_protocol,response_time_ms,connect_time_ms,handshake_time_ms,upstream_query_time_ms,dnssec_status,pool_reused,served_stale,prefetch_triggered,resolver_mode)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
-            (now_iso(), client_ip, domain, normalized, qtype_name, status, response_ips, upstream, connection_type, matched_rule, cache_status, blocked, reason, matched_list, duration_ms, client_name, profile_name),
+            (now_iso(), client_ip, domain, normalized, qtype_name, status, response_ips, upstream, connection_type, matched_rule, cache_status, blocked, reason, matched_list, duration_ms, client_name, profile_name, upstream_protocol, response_time_ms, connect_time_ms, handshake_time_ms, upstream_query_time_ms, dnssec_status, pool_reused, served_stale, prefetch_triggered, resolver_mode),
         )
         db.commit()
 
@@ -4360,6 +4724,7 @@ def handle_dns_request(request, client_ip, connection_type=""):
     client_info = lookup_client_snapshot(client_ip)
     client_log_name = client_info.get("name", "") if client_info else ""
     client_profile_name = (client_info.get("profile_name", "") or "") if client_info else ""
+    resolver_mode = get_setting("upstream_mode", "sequential")
     try:
         question = parse_dns_question(request)
         domain = question["domain"]
@@ -4372,7 +4737,7 @@ def handle_dns_request(request, client_ip, connection_type=""):
 
         if is_local_reverse_lookup(normalized, qtype_name):
             response = build_empty_response(request)
-            log_query(client_ip, domain, normalized, qtype_name, "local", matched_rule="local reverse", cache_status="local", reason="local reverse lookup", duration_ms=(time.perf_counter() - started) * 1000, client_name=client_log_name, profile_name=client_profile_name, connection_type=connection_type)
+            log_query(client_ip, domain, normalized, qtype_name, "local", matched_rule="local reverse", cache_status="local", reason="local reverse lookup", duration_ms=(time.perf_counter() - started) * 1000, client_name=client_log_name, profile_name=client_profile_name, connection_type=connection_type, resolver_mode=resolver_mode)
             return response
 
         decision = decide(normalized, qtype_name, client_ip, client_info=client_info)
@@ -4381,23 +4746,23 @@ def handle_dns_request(request, client_ip, connection_type=""):
 
         if decision["action"] == "refuse":
             response = build_error_response(request, 5)
-            log_query(client_ip, domain, normalized, qtype_name, "refused", matched_rule=decision["rule"], blocked=1, reason=decision["reason"], duration_ms=(time.perf_counter() - started) * 1000, matched_list=decision.get("filter_list", ""), client_name=dc, profile_name=dp, connection_type=connection_type)
+            log_query(client_ip, domain, normalized, qtype_name, "refused", matched_rule=decision["rule"], blocked=1, reason=decision["reason"], duration_ms=(time.perf_counter() - started) * 1000, matched_list=decision.get("filter_list", ""), client_name=dc, profile_name=dp, connection_type=connection_type, resolver_mode=resolver_mode)
             return response
         if decision["action"] == "block":
             bump_runtime_metric("dns_filter_blocks_total")
             response = build_block_response(request, qtype_name)
-            log_query(client_ip, domain, normalized, qtype_name, "blocked", matched_rule=decision["rule"], blocked=1, reason=decision["reason"], duration_ms=(time.perf_counter() - started) * 1000, matched_list=decision.get("filter_list", ""), client_name=dc, profile_name=dp, connection_type=connection_type)
+            log_query(client_ip, domain, normalized, qtype_name, "blocked", matched_rule=decision["rule"], blocked=1, reason=decision["reason"], duration_ms=(time.perf_counter() - started) * 1000, matched_list=decision.get("filter_list", ""), client_name=dc, profile_name=dp, connection_type=connection_type, resolver_mode=resolver_mode)
             return response
         if decision["action"] == "rewrite":
             response = build_ip_response(request, decision["target"])
-            log_query(client_ip, domain, normalized, qtype_name, "rewritten", response_ips=decision["target"], matched_rule=decision["rule"], reason=decision["reason"], duration_ms=(time.perf_counter() - started) * 1000, matched_list=decision.get("filter_list", ""), client_name=dc, profile_name=dp, connection_type=connection_type)
+            log_query(client_ip, domain, normalized, qtype_name, "rewritten", response_ips=decision["target"], matched_rule=decision["rule"], reason=decision["reason"], duration_ms=(time.perf_counter() - started) * 1000, matched_list=decision.get("filter_list", ""), client_name=dc, profile_name=dp, connection_type=connection_type, resolver_mode=resolver_mode)
             return response
 
         bump_runtime_metric("dns_filter_allows_total")
 
         if is_local_nodata_query(qtype_name):
             response = build_empty_response(request)
-            log_query(client_ip, domain, normalized, qtype_name, "local", matched_rule="local nodata", cache_status="local", reason="local no data", duration_ms=(time.perf_counter() - started) * 1000, client_name=dc, profile_name=dp, connection_type=connection_type)
+            log_query(client_ip, domain, normalized, qtype_name, "local", matched_rule="local nodata", cache_status="local", reason="local no data", duration_ms=(time.perf_counter() - started) * 1000, client_name=dc, profile_name=dp, connection_type=connection_type, resolver_mode=resolver_mode)
             return response
 
         cached = get_cached(normalized, qtype_name)
@@ -4405,14 +4770,29 @@ def handle_dns_request(request, client_ip, connection_type=""):
             bump_runtime_metric("dns_cache_hits_total")
             cached = request[:2] + cached[2:]
             cached = apply_ipv6_disabled_policy(cached)
-            log_query(client_ip, domain, normalized, qtype_name, "cached", response_ips=extract_response_ips(cached), cache_status="hit", duration_ms=(time.perf_counter() - started) * 1000, client_name=dc, profile_name=dp, connection_type=connection_type)
+            cache_hit_status = "hit"
+            if isinstance(cached, tuple) and len(cached) == 2:
+                cached, cache_hit_status = cached
+            log_query(client_ip, domain, normalized, qtype_name, "cached", response_ips=extract_response_ips(cached), cache_status=cache_hit_status, duration_ms=(time.perf_counter() - started) * 1000, client_name=dc, profile_name=dp, connection_type=connection_type, resolver_mode=resolver_mode)
             return cached
+
+        neg_cached = get_negative_cached(normalized, qtype_name)
+        if neg_cached:
+            bump_runtime_metric("dns_cache_hits_total")
+            neg_response, neg_type = neg_cached
+            neg_response = request[:2] + neg_response[2:]
+            neg_response = apply_ipv6_disabled_policy(neg_response)
+            log_query(client_ip, domain, normalized, qtype_name, "cached", response_ips="", cache_status="negative_hit", duration_ms=(time.perf_counter() - started) * 1000, client_name=dc, profile_name=dp, connection_type=connection_type, resolver_mode=resolver_mode)
+            return neg_response
+
         bump_runtime_metric("dns_cache_misses_total")
 
         forwarding_request = request
         if get_setting("dnssec_validation_enabled", "0") == "1":
             forwarding_request = add_do_bit_to_query(request)
+        upstream_start = time.perf_counter()
         response, upstream = forward_query(forwarding_request)
+        upstream_query_time_ms = (time.perf_counter() - upstream_start) * 1000
         response = apply_ipv6_disabled_policy(response)
         filtering_on = get_setting("filtering_enabled", "1") == "1" and client_filtering_enabled(client_ip, client_info=client_info)
         profile_id = decision.get("profile_id")
@@ -4420,6 +4800,7 @@ def handle_dns_request(request, client_ip, connection_type=""):
 
         client_cd_flag = bool(question.get("flags", 0) & 0x0100)
 
+        dnssec_status = ""
         if _dnssec_available and get_setting("dnssec_validation_enabled", "0") == "1" and not client_cd_flag:
             try:
                 import dns.message
@@ -4429,13 +4810,16 @@ def handle_dns_request(request, client_ip, connection_type=""):
                 validator = get_dnssec_validator()
                 if validator:
                     dnssec_result = validator.validate_response(qmsg, rmsg)
+                    dnssec_status = dnssec_result.status
                     if dnssec_result.status in ("bogus", "indeterminate"):
                         servfail_response = build_error_response(request, 2)
                         log_query(client_ip, domain, normalized, qtype_name, "blocked",
                                   upstream=upstream, matched_rule="dnssec_bogus",
                                   blocked=1, reason=dnssec_result.reason,
                                   duration_ms=(time.perf_counter() - started) * 1000,
-                                  client_name=dc, profile_name=dp, connection_type=connection_type)
+                                  client_name=dc, profile_name=dp, connection_type=connection_type,
+                                  upstream_query_time_ms=upstream_query_time_ms,
+                                  dnssec_status=dnssec_status, resolver_mode=resolver_mode)
                         return servfail_response
                     response_bytes = rmsg.to_wire()
                     if dnssec_result.ad_flag_allowed:
@@ -4464,16 +4848,22 @@ def handle_dns_request(request, client_ip, connection_type=""):
                           matched_rule=matched, blocked=1, reason="cname_blocked",
                           duration_ms=(time.perf_counter() - started) * 1000,
                           matched_list=cname_result.list_name or cname_result.matched_list or "",
-                          client_name=dc, profile_name=dp, connection_type=connection_type)
+                          client_name=dc, profile_name=dp, connection_type=connection_type,
+                          upstream_query_time_ms=upstream_query_time_ms,
+                          dnssec_status=dnssec_status, resolver_mode=resolver_mode)
                 return blocked_response
-        set_cached(normalized, qtype_name, response)
-        log_query(client_ip, domain, normalized, qtype_name, "allowed", response_ips=extract_response_ips(response), upstream=upstream, duration_ms=(time.perf_counter() - started) * 1000, client_name=dc, profile_name=dp, connection_type=connection_type)
+        neg_type = is_negative_response(response)
+        if neg_type:
+            set_negative_cached(normalized, qtype_name, response, neg_type)
+        else:
+            set_cached(normalized, qtype_name, response)
+        log_query(client_ip, domain, normalized, qtype_name, "allowed", response_ips=extract_response_ips(response), upstream=upstream, duration_ms=(time.perf_counter() - started) * 1000, client_name=dc, profile_name=dp, connection_type=connection_type, upstream_query_time_ms=upstream_query_time_ms, dnssec_status=dnssec_status, resolver_mode=resolver_mode)
         return response
     except Exception as exc:
         bump_runtime_metric("dns_upstream_errors_total")
         try:
             question = parse_dns_question(request)
-            log_query(client_ip, question["domain"], question["normalized_domain"], question["qtype_name"], "upstream_error", reason=str(exc), duration_ms=(time.perf_counter() - started) * 1000, client_name=client_log_name, profile_name=client_profile_name, connection_type=connection_type)
+            log_query(client_ip, question["domain"], question["normalized_domain"], question["qtype_name"], "upstream_error", reason=str(exc), duration_ms=(time.perf_counter() - started) * 1000, client_name=client_log_name, profile_name=client_profile_name, connection_type=connection_type, resolver_mode=resolver_mode)
         except Exception:
             pass
         return build_error_response(request, 2)
@@ -7130,13 +7520,19 @@ def upstreams_page():
     table = "".join(upstream_row(r) for r in data)
     mode_options = select_options([
         ("sequential",       "Sequential - try upstreams one after another"),
-        ("load_balance",     "Load balancing - query one upstream server at a time"),
-        ("parallel_fastest", "Parallel fastest - query all upstream servers at once"),
+        ("load_balance",     "Load balancing - round-robin across upstreams"),
+        ("parallel_fastest", "Parallel fastest - race top N upstreams"),
+        ("parallel_race",    "Parallel race - race all upstreams, first valid wins"),
+        ("fastest_addr",     "Fastest address - sort by lowest latency"),
+        ("strict_order",     "Strict order - use first upstream only, fallback on failure"),
     ], current_mode)
     mode_desc = {
         "sequential":       "Upstreams are queried in order. If one fails, the next one is tried.",
         "load_balance":     "One upstream server is queried at a time. Requests are distributed across all active upstreams with round-robin.",
-        "parallel_fastest": "Parallel queries speed up resolution by querying all upstream servers at the same time. The fastest response wins.",
+        "parallel_fastest": "Parallel queries speed up resolution by racing the top N upstreams. The fastest response wins.",
+        "parallel_race":    "All upstreams are queried simultaneously. The first valid response wins. Slower upstreams do not block fast responses.",
+        "fastest_addr":     "Upstreams are sorted by average latency. The fastest upstream is tried first.",
+        "strict_order":     "Only the first upstream is used. If it fails, the next one is tried as fallback.",
     }.get(current_mode, "")
     return template(f"""
 <h1 class="h3 mb-3">Upstreams</h1>
@@ -7485,7 +7881,7 @@ def settings_page(message="", is_error=False, values=None):
       <div class="settings-section-head">
         <div>
           <div class="settings-section-title">Cache</div>
-          <div class="settings-section-subtitle">TTL limits and memory budget.</div>
+          <div class="settings-section-subtitle">TTL limits, memory budget, negative cache, prefetch, and stale serving.</div>
         </div>
       </div>
       <div class="settings-section-body settings-stack">
@@ -7498,6 +7894,20 @@ def settings_page(message="", is_error=False, values=None):
           <div><label class="form-label">Minimum TTL Override</label><input class="form-control" name="cache_min_ttl" type="number" min="0" value="{get_setting('cache_min_ttl','0')}"></div>
           <div><label class="form-label">Maximum TTL Override</label><input class="form-control" name="cache_max_ttl" type="number" min="0" value="{get_setting('cache_max_ttl','0')}"></div>
           {switch("cache_optimistic", "Optimistic Caching", "Serve expired entries while refreshing them in the background.", "0")}
+        </div>
+        <div class="settings-field-grid">
+          {switch("negative_cache_enabled", "Negative Cache", "Cache NXDOMAIN and NODATA responses to reduce upstream queries.", "1")}
+          <div><label class="form-label">Negative Cache Max TTL (sec.)</label><input class="form-control" name="negative_cache_max_ttl" type="number" min="0" value="{get_setting('negative_cache_max_ttl','300')}"></div>
+          <div><label class="form-label">Negative Cache Min TTL (sec.)</label><input class="form-control" name="negative_cache_min_ttl" type="number" min="0" value="{get_setting('negative_cache_min_ttl','30')}"></div>
+        </div>
+        <div class="settings-field-grid">
+          {switch("prefetch_enabled", "Prefetch Cache", "Refresh frequently used domains before TTL expires.", "1")}
+          <div><label class="form-label">Prefetch Min Hits</label><input class="form-control" name="prefetch_min_hits" type="number" min="1" value="{get_setting('prefetch_min_hits','3')}"></div>
+          <div><label class="form-label">Prefetch TTL Percentage</label><input class="form-control" name="prefetch_ttl_percentage" type="number" min="1" max="100" value="{get_setting('prefetch_ttl_percentage','20')}"></div>
+        </div>
+        <div class="settings-field-grid">
+          {switch("serve_stale_enabled", "Serve Stale", "Serve expired cache entries when upstream is unavailable.", "0")}
+          <div><label class="form-label">Serve Stale Max Age (sec.)</label><input class="form-control" name="serve_stale_max_age" type="number" min="0" value="{get_setting('serve_stale_max_age','86400')}"></div>
         </div>
       </div>
     </section>
@@ -9014,6 +9424,9 @@ class WebHandler(BaseHTTPRequestHandler):
             settings_keys = [
                 "filtering_enabled", "cache_enabled", "query_log_enabled", "lan_only", "dnssec_validation_enabled",
                 "block_mode", "block_response_ttl", "disable_ipv6", "cache_ttl", "cache_size", "cache_min_ttl", "cache_max_ttl", "cache_optimistic",
+                "negative_cache_enabled", "negative_cache_max_ttl", "negative_cache_min_ttl",
+                "prefetch_enabled", "prefetch_min_hits", "prefetch_ttl_percentage",
+                "serve_stale_enabled", "serve_stale_max_age",
                 "filter_update_interval_hours", "allowed_networks", "custom_block_ipv4", "custom_block_ipv6",
                 "log_retention_days", "auto_clear_query_log_hours", "localdnsguard_web_host", "localdnsguard_web_port",
                 "localdnsguard_dns_host", "localdnsguard_dns_port", "encrypted_dns_host", "encrypted_dns_domain",

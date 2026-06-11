@@ -274,6 +274,25 @@ def _health_score(data: dict) -> float:
     return max(0.0, score)
 
 
+def health_state(data: dict) -> str:
+    h = data.get("health", {})
+    if h.get("paused", False):
+        return "down"
+    cf = h.get("consecutive_failures", 0)
+    success_rate = h.get("success_rate", 1.0)
+    latency = data.get("latency_ms") or 0
+    total = h.get("total_queries", 0)
+    if total < 3:
+        return "healthy"
+    if cf >= 7 or success_rate < 0.3:
+        return "down"
+    if cf >= 4 or success_rate < 0.6:
+        return "degraded"
+    if latency > 500 or success_rate < 0.9:
+        return "slow"
+    return "healthy"
+
+
 def active_upstreams() -> list[dict]:
     _load_cache()
     result = []
@@ -296,6 +315,7 @@ def active_upstreams() -> list[dict]:
                 "total_queries": h.get("total_queries", 0),
                 "successful_queries": h.get("successful_queries", 0),
                 "health_score": _health_score(data),
+                "health_state": health_state(data),
             })
     result.sort(key=lambda x: (
         0 if not x.get("last_error") else 1,

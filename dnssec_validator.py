@@ -323,6 +323,27 @@ class DNSSECCache:
         with self._lock:
             self._data[key] = {"value": None, "expires": time.time() + min(ttl, 60)}
 
+    def set_validation(self, key, status, ttl):
+        with self._lock:
+            self._data[("validation", key)] = {"value": status, "expires": time.time() + max(30, min(ttl, 86400))}
+
+    def get_validation(self, key):
+        with self._lock:
+            entry = self._data.get(("validation", key))
+            if entry and entry["expires"] > time.time():
+                return entry["value"]
+            if entry:
+                del self._data[("validation", key)]
+            return None
+
+    def stats(self):
+        now = time.time()
+        with self._lock:
+            total = len(self._data)
+            expired = sum(1 for e in self._data.values() if e.get("expires", 0) <= now)
+            validations = sum(1 for k in self._data if isinstance(k, tuple) and k[0] == "validation")
+        return {"total": total, "expired": expired, "validations": validations}
+
 
 class TrustAnchorStore:
     def __init__(self, xml_path=None, key_path=None, json_path=None):
@@ -1046,7 +1067,15 @@ class DNSSECValidator:
     def validate_response(self, query_message, response_message):
         start = time.perf_counter()
         try:
+            question = query_message.question[0] if query_message and query_message.question else None
+            if question:
+                cache_key = f"{question.name.to_text().lower()}:{question.rdtype}"
+                cached = self._cache.get_validation(cache_key)
+                if cached is not None:
+                    return cached
             result = self._validate_impl(query_message, response_message)
+            if question and result.status in (DNSSECValidationStatus.SECURE, DNSSECValidationStatus.INSECURE):
+                self._cache.set_validation(cache_key, result, 3600)
             return result
         finally:
             _add_validation_time(time.perf_counter() - start)
