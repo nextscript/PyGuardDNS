@@ -4316,24 +4316,43 @@ def probe_upstream(upstream):
             pass
         return round((time.perf_counter() - start) * 1000, 2)
     _, request = build_query("example.com", QTYPE_CODE["A"])
+    resolver_type = upstream.get("resolver_type")
+    if resolver_type == "doh_stamp":
+        parsed = parse_doh_stamp(upstream["resolver"])
+        upstream = dict(upstream)
+        upstream.update({"resolver": parsed["resolver"], "address": parsed["address"],
+                          "port": parsed["port"], "resolver_type": "doh", "transport": "https"})
+        resolver_type = "doh"
+    elif resolver_type == "dot_stamp":
+        parsed = parse_dot_stamp(upstream["resolver"])
+        upstream = dict(upstream)
+        upstream.update({"resolver": f"tls://{parsed['address']}", "address": parsed["address"],
+                          "port": parsed["port"], "resolver_type": "dot", "transport": "tls"})
+        resolver_type = "dot"
+    if resolver_type in ("dot", "doh"):
+        # Measure only the query/response round trip on a freshly established,
+        # one-off connection - not the shared pool used for live traffic. The
+        # shared DoT pool round-robins across several sockets, so timing
+        # through it mixes in a cold TCP/TLS handshake depending on which
+        # slot is hit, which inflates the result unpredictably.
+        conn = DotConnection(upstream) if resolver_type == "dot" else DohConnection(upstream)
+        try:
+            conn.connect(timeout=4.0)
+            start = time.perf_counter()
+            conn._send_and_receive(request, timeout=4.0)
+            return round((time.perf_counter() - start) * 1000, 2)
+        finally:
+            conn.close()
     start = time.perf_counter()
-    if upstream.get("resolver_type") == "doh":
-        query_doh_upstream(upstream, request, timeout=4.0)
-    elif upstream.get("resolver_type") == "doh_stamp":
-        query_doh_stamp_upstream(upstream, request, timeout=4.0)
-    elif upstream.get("resolver_type") == "doh_http3":
+    if resolver_type == "doh_http3":
         query_doh_http3_upstream(upstream, request, timeout=4.0)
-    elif upstream.get("resolver_type") == "dot":
-        query_dot_upstream(upstream, request, timeout=4.0)
-    elif upstream.get("resolver_type") == "doq":
+    elif resolver_type == "doq":
         query_doq_upstream(upstream, request, timeout=4.0)
-    elif upstream.get("resolver_type") == "dot_stamp":
-        query_dot_stamp_upstream(upstream, request, timeout=4.0)
-    elif upstream.get("resolver_type") == "doq_stamp":
+    elif resolver_type == "doq_stamp":
         query_doq_stamp_upstream(upstream, request, timeout=4.0)
-    elif upstream.get("resolver_type") == "dnscrypt_stamp":
+    elif resolver_type == "dnscrypt_stamp":
         query_dnscrypt_upstream(upstream, request, timeout=4.0)
-    elif upstream.get("resolver_type") in ("dns_stamp_unknown", "plain_dns_stamp"):
+    elif resolver_type in ("dns_stamp_unknown", "plain_dns_stamp"):
         query_dns_stamp_unknown_upstream(upstream, request, timeout=4.0)
     elif upstream.get("transport") == "tcp":
         query_plain_upstream(upstream, request, timeout=5.0)
