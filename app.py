@@ -5393,7 +5393,7 @@ def template(content, title="Dashboard"):
   {nav_item("/domain-test", "Domain Test", icon_search(), title)}
   <div class="sys-status">
     <div class="sys-row"><span class="dot-status"></span>All Systems Operational</div>
-    <div class="sys-row" style="color:var(--muted);font-size:.69rem">{APP_NAME} v0.1</div>
+    <div class="sys-row" style="color:var(--muted);font-size:.69rem">{APP_NAME} v1.0</div>
   </div>
 </aside>
 <main>{content}</main>
