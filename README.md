@@ -59,7 +59,7 @@ By default, the application listens on DNS port `53` for UDP/TCP and serves the 
 
 ## Feature Comparison: PyGuardDNS v1.0 vs AdGuard Home vs Pi-hole
 
-| Feature | PyGuardDNS v9 | AdGuard Home | Pi-hole |
+| Feature | PyGuardDNS v1.0 | AdGuard Home | Pi-hole |
 | --- | --- | --- | --- |
 | DNS resolver | Yes | Yes | Yes |
 | Web interface | Yes | Yes | Yes |
