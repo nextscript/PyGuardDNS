@@ -56,6 +56,45 @@ By default, the application listens on DNS port `53` for UDP/TCP and serves the 
 - DNSSEC self-validation with local root trust anchor, RFC 5011 automatic key rollover, embedded IANA root trust anchor, NSEC/NSEC3 denial proof validation, validation result caching, and SERVFAIL on bogus responses
 - Automatic missing dependency detection at startup
 
+
+## Feature Comparison: PyGuardDNS v1.0 vs AdGuard Home vs Pi-hole
+
+| Feature | PyGuardDNS v9 | AdGuard Home | Pi-hole |
+| --- | --- | --- | --- |
+| DNS resolver | Yes | Yes | Yes |
+| Web interface | Yes | Yes | Yes |
+| DNS-over-HTTPS (DoH) | Yes | Yes | No native support |
+| DNS-over-HTTPS/3 (DoH3) | Yes | No / limited | No |
+| DNS-over-TLS (DoT) | Yes | Yes | No native support |
+| DNS-over-QUIC (DoQ) | Yes | Yes | No native support |
+| DNSCrypt | Yes | No | No |
+| Anonymized DNSCrypt | Yes | No | No |
+| DNSSEC | Yes | Yes | Yes |
+| SafeSearch enforcement | Yes | Yes | No native support |
+| YouTube Restricted Mode | Yes | Yes | No native support |
+| Client profile system | Yes | Limited | Limited |
+| Profile-specific blocklists | Yes | Limited | No native support |
+| Regex rules | Yes | Yes | Yes |
+| Wildcards | Yes | Yes | Limited |
+| Rewrite rules | Yes | Yes | Limited |
+| Service blocking | Yes | Limited | No native support |
+| CNAME blocking | Yes | Limited | No native support |
+| Negative cache | Yes | Yes | Yes, via dnsmasq/FTL behavior |
+| Cache prefetch | Yes | Yes | Limited |
+| Serve stale | Yes | Yes | Limited |
+| DoT connection pooling | Yes | Yes | No native support |
+| Upstream health monitoring | Yes | Yes | Limited |
+| Parallel resolver race | Yes | Similar behavior available | No native support |
+| Load-balancing resolver | Yes | Yes | Limited |
+| Bootstrap resolver | Yes | Yes | No native support |
+| Runtime metrics API | Yes | Yes | Limited |
+
+### Summary
+
+PyGuardDNS v1.0 is functionally closer to AdGuard Home than to Pi-hole. It provides modern encrypted upstream support, advanced caching, DNSCrypt support, client profiles, service blocking, CNAME blocking, and detailed runtime metrics. Pi-hole remains very stable and simple, but it relies heavily on external components for encrypted DNS protocols and advanced resolver behavior.
+
+AdGuard Home is still stronger in production maturity, long-term stability, and broad community testing. PyGuardDNS v9 is stronger in DNSCrypt support, Anonymized DNSCrypt, DoH3 support, and flexible profile-based filtering.
+
 ## Requirements
 
 - Python 3.11 or newer
