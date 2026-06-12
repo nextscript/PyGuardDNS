@@ -4347,8 +4347,14 @@ def test_upstream(upstream_id):
     if not upstream:
         raise ValueError("upstream not found")
     try:
-        if upstream.get("resolver_type") == "doh":
+        # Warm up the connection pool / cached certificate first. Otherwise the
+        # measured latency includes the one-time TCP/TLS/QUIC handshake cost,
+        # which inflates the result on the first test (subsequent tests reuse
+        # the now-pooled connection and look "normal").
+        try:
             probe_upstream(upstream)
+        except Exception:
+            pass
         latency = probe_upstream(upstream)
         um.update(upstream_id, latency_ms=latency, last_error="")
         return {"ok": True, "latency_ms": latency}
