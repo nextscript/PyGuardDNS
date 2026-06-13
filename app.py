@@ -6373,7 +6373,6 @@ WindowsSpyBlocker: https://raw.githubusercontent.com/crazy-max/WindowsSpyBlocker
 First-party trackers host list: https://hostfiles.frogeye.fr/firstparty-trackers-hosts.txt
 Prigent-Crypto: https://v.firebog.net/hosts/Prigent-Crypto.txt
 add.Risk: https://raw.githubusercontent.com/FadeMind/hosts.extras/master/add.Risk/hosts
-NoTrack Malware Blocklist: https://gitlab.com/quidsup/notrack-blocklists/raw/master/notrack-malware.txt
 Spam404: https://raw.githubusercontent.com/Spam404/lists/master/main-blacklist.txt
 abuse.ch URLhaus Host file: https://urlhaus.abuse.ch/downloads/hostfile/
 CyberHost.uk Malware and Phishing Blocklist: https://lists.cyberhost.uk/malware.txt
