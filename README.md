@@ -93,7 +93,7 @@ By default, the application listens on DNS port `53` for UDP/TCP and serves the 
 
 PyGuardDNS v1.0 is functionally closer to AdGuard Home than to Pi-hole. It provides modern encrypted upstream support, advanced caching, DNSCrypt support, client profiles, service blocking, CNAME blocking, and detailed runtime metrics. Pi-hole remains very stable and simple, but it relies heavily on external components for encrypted DNS protocols and advanced resolver behavior.
 
-AdGuard Home is still stronger in production maturity, long-term stability, and broad community testing. PyGuardDNS v9 is stronger in DNSCrypt support, Anonymized DNSCrypt, DoH3 support, and flexible profile-based filtering.
+AdGuard Home is still stronger in production maturity, long-term stability, and broad community testing. PyGuardDNS v1.0 is stronger in DNSCrypt support, Anonymized DNSCrypt, DoH3 support, and flexible profile-based filtering.
 
 ## Requirements
 
