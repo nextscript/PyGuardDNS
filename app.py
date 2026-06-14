@@ -5433,8 +5433,8 @@ async function waitForServerRestart() {{
   await new Promise(r => setTimeout(r, 2000));
   for (let i = 0; i < 60; i++) {{
     try {{
-      const r = await fetch('/api/status', {{cache: 'no-store'}});
-      if (r.ok) break;
+      await fetch('/api/status', {{cache: 'no-store'}});
+      break;
     }} catch(e) {{}}
     await new Promise(r => setTimeout(r, 2000));
   }}
