@@ -5429,6 +5429,17 @@ window.fetch = (resource, init = {{}}) => {{
 function toggleMobileNav(open) {{
   document.body.classList.toggle('nav-open', !!open);
 }}
+async function waitForServerRestart() {{
+  await new Promise(r => setTimeout(r, 2000));
+  for (let i = 0; i < 60; i++) {{
+    try {{
+      const r = await fetch('/api/status', {{cache: 'no-store'}});
+      if (r.ok) break;
+    }} catch(e) {{}}
+    await new Promise(r => setTimeout(r, 2000));
+  }}
+  location.reload();
+}}
 document.addEventListener('keydown', (event) => {{
   if (event.key === 'Escape') toggleMobileNav(false);
 }});
@@ -6083,7 +6094,9 @@ async function applyUpdate() {{
   try {{
     const r = await fetch('/api/update/apply', {{method:'POST'}});
     const d = await r.json();
-    if (!d.ok) {{
+    if (d.ok) {{
+      waitForServerRestart();
+    }} else {{
       alert('Update failed: ' + (d.error || 'Unknown error'));
       location.reload();
     }}
@@ -8168,7 +8181,9 @@ async function settingsApplyUpdate() {{
   try {{
     const r = await fetch('/api/update/apply', {{method:'POST'}});
     const d = await r.json();
-    if (!d.ok) {{
+    if (d.ok) {{
+      waitForServerRestart();
+    }} else {{
       result.innerHTML = `<div class="alert alert-danger">Update failed: ${{d.error || 'Unknown error'}}</div>`;
     }}
   }} catch(e) {{
