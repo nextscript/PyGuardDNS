@@ -5626,6 +5626,18 @@ def stats_summary():
     }
 
 
+def stats_breakdown():
+    def counts(where=""):
+        row = one(f"SELECT COUNT(*) total, COALESCE(SUM(blocked),0) blocked FROM query_log {where}")
+        return {"total": row["total"], "blocked": row["blocked"]}
+    return {
+        "24h": counts("WHERE timestamp >= datetime('now','localtime','-24 hours')"),
+        "7d": counts("WHERE timestamp >= datetime('now','localtime','-7 days')"),
+        "30d": counts("WHERE timestamp >= datetime('now','localtime','-30 days')"),
+        "all": counts(),
+    }
+
+
 def dashboard_data():
     return {
         "summary": stats_summary(),
@@ -8226,6 +8238,9 @@ def api_docs_page():
             ("GET", "/api/stats/summary", "Short statistics: total requests, blocked requests, cache rate, clients, uptime.",
              None,
              '{\n  "total": 1024, "blocked": 312, "block_rate": 30.5,\n  "avg_ms": 14.2, "cache_rate": 18.3,\n  "clients": 5, "rules": 87432, "upstreams": 2, "uptime": 3600\n}'),
+            ("GET", "/api/stats/breakdown", "Total vs. blocked requests for the last 24 h, 7 days, 30 days, and all-time.",
+             None,
+             '{\n  "24h": {"total": 1024, "blocked": 312},\n  "7d": {"total": 6800, "blocked": 1900},\n  "30d": {"total": 29000, "blocked": 8100},\n  "all": {"total": 120000, "blocked": 34000}\n}'),
         ]),
         ("Query Log", [
             ("GET", "/api/querylog", "All retained DNS requests as a JSON array. Supports q, client, and status filters.",
@@ -10281,6 +10296,8 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_json(extended_dashboard_data())
         elif path == "/api/stats/summary":
             self.send_json(stats_summary())
+        elif path == "/api/stats/breakdown":
+            self.send_json(stats_breakdown())
         elif path == "/api/stats/cache":
             self.send_json(cache_stats())
         elif path == "/api/querylog":
