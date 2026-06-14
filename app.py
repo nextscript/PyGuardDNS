@@ -3771,6 +3771,7 @@ _update_check_cache = {
 GITHUB_API_URL = "https://api.github.com/repos/nextscript/PyGuardDNS/commits"
 GITHUB_ZIP_URL = "https://github.com/nextscript/PyGuardDNS/archive/refs/heads/main.zip"
 COMMIT_HASH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_commit")
+ICON_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
 
 
 def _get_local_commit_hash():
@@ -5129,6 +5130,7 @@ def template(content, title="Dashboard"):
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{APP_NAME} - {title}</title>
+  <link rel="icon" type="image/png" href="/favicon.ico">
   <style>
     *,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
     :root{{
@@ -5429,14 +5431,34 @@ window.fetch = (resource, init = {{}}) => {{
 function toggleMobileNav(open) {{
   document.body.classList.toggle('nav-open', !!open);
 }}
+function showStartupPage() {{
+  document.body.innerHTML = `
+    <style>
+      body{{margin:0;min-height:100vh;background:#070b10;color:#e8eef7;font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}}
+      .startup-shell{{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1.5rem}}
+      .startup-panel{{display:flex;flex-direction:column;align-items:center;gap:.9rem;text-align:center}}
+      .startup-spinner{{width:2.2rem;height:2.2rem;border-radius:50%;border:3px solid #26364e;border-top-color:#20c997;animation:spin .8s linear infinite}}
+      .startup-title{{font-size:1.15rem;font-weight:800;letter-spacing:0}}
+      .startup-subtitle{{color:#8d9bae;font-size:.9rem}}
+      @keyframes spin{{to{{transform:rotate(360deg)}}}}
+    </style>
+    <main class="startup-shell">
+      <section class="startup-panel" aria-live="polite">
+        <div class="startup-spinner" aria-hidden="true"></div>
+        <div class="startup-title">DNS server starting ...</div>
+        <div class="startup-subtitle">The WebGUI will continue automatically.</div>
+      </section>
+    </main>
+  `;
+}}
 async function waitForServerRestart() {{
-  await new Promise(r => setTimeout(r, 2000));
-  for (let i = 0; i < 60; i++) {{
+  showStartupPage();
+  for (let i = 0; i < 90; i++) {{
     try {{
-      await fetch('/api/status', {{cache: 'no-store'}});
+      await fetch('/', {{cache: 'no-store'}});
       break;
     }} catch(e) {{}}
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise(r => setTimeout(r, 1000));
   }}
   location.reload();
 }}
@@ -5539,6 +5561,7 @@ def login_page(error=""):
     return f"""<!doctype html><html lang="en" data-bs-theme="dark"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{APP_NAME} - Login</title>
+<link rel="icon" type="image/png" href="/favicon.ico">
 <style>
 *,*::before,*::after{{box-sizing:border-box}} body{{margin:0;background:#070b10;color:#e8eef7;font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}}
 .min-vh-100{{min-height:100vh}} .d-flex{{display:flex}} .align-items-center{{align-items:center}} .justify-content-center{{justify-content:center}} .p-4{{padding:1.5rem}} .mb-1{{margin-bottom:.25rem}} .mb-3{{margin-bottom:1rem}} .w-100{{width:100%}} .h3{{font-size:1.55rem}} .text-secondary{{color:#8d9bae}}
@@ -8889,6 +8912,7 @@ def startup_page(message=None):
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="2">
 <title>{APP_NAME} - Starting</title>
+<link rel="icon" type="image/png" href="/favicon.ico">
 <style>
 *,*::before,*::after{{box-sizing:border-box}}
 body{{margin:0;min-height:100vh;background:#070b10;color:#e8eef7;font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}}
@@ -8940,6 +8964,9 @@ class WebHandler(BaseHTTPRequestHandler):
             return
         if path == "/metrics":
             self.send_prometheus_metrics()
+            return
+        if path == "/favicon.ico":
+            self.send_favicon()
             return
         if path.startswith("/api/"):
             if not self.api_auth_mode():
@@ -9944,6 +9971,20 @@ class WebHandler(BaseHTTPRequestHandler):
         csrf = self.csrf_token()
         if csrf:
             self.send_header("Set-Cookie", f"{CSRF_COOKIE}={csrf}; Max-Age={SESSION_TTL_SECONDS}; SameSite=Lax; Path=/")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_favicon(self):
+        try:
+            with open(ICON_FILE, "rb") as f:
+                body = f.read()
+        except OSError:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "public, max-age=86400")
         self.end_headers()
         self.wfile.write(body)
 
