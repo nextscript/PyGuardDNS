@@ -8148,9 +8148,9 @@ async function settingsCheckUpdate() {{
               <div>
                 <strong>Update available: ${{d.count}} new commit${{d.count > 1 ? 's' : ''}}</strong>
                 <ul style="margin:.5rem 0 0 0;padding-left:1.5rem;font-size:.85rem">${{commitList}}${{moreText}}</ul>
-                <div style="margin-top:.5rem;font-size:.85rem;color:var(--muted2)">Use "Apply Update" to install and restart</div>
+                <div style="margin-top:.5rem;font-size:.85rem;color:var(--muted2)">Go to the Dashboard to install and restart</div>
               </div>
-              <button type="button" style="background: white; color: rgb(245, 158, 11); border-width: medium; border-style: none; border-color: currentcolor; border-image: initial; padding: 0.75rem 1.5rem; border-radius: 0.5rem; font-weight: 600; cursor: pointer; font-size: 0.95rem; white-space: nowrap; box-shadow: rgba(0, 0, 0, 0.15) 0px 2px 8px; transition: 0.2s;" onclick="settingsApplyUpdate()">Apply Update</button>
+              <a href="/" style="background: white; color: rgb(245, 158, 11); border-width: medium; border-style: none; border-color: currentcolor; border-image: initial; padding: 0.75rem 1.5rem; border-radius: 0.5rem; font-weight: 600; cursor: pointer; font-size: 0.95rem; white-space: nowrap; box-shadow: rgba(0, 0, 0, 0.15) 0px 2px 8px; transition: 0.2s; text-decoration: none; display: inline-block;">Go to Dashboard</a>
             </div>
           </div>
         `;
@@ -8165,31 +8165,6 @@ async function settingsCheckUpdate() {{
   }} finally {{
     btn.disabled = false;
     btn.innerHTML = '<svg style="vertical-align:middle;margin-right:.35rem" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>Check for Updates';
-  }}
-}}
-
-async function settingsApplyUpdate() {{
-  const result = document.getElementById('settings-update-result');
-  if (result) {{
-    result.innerHTML = `
-      <div class="alert alert-info text-center">
-        <span class="spinner-border spinner-border-sm me-2"></span>
-        <strong>Applying update...</strong> Server will restart.
-      </div>
-    `;
-  }}
-  
-  try {{
-    const r = await fetch('/api/update/apply', {{method:'POST'}});
-    const d = await r.json();
-    if (d.ok) {{
-      if (result) result.innerHTML = '';
-      waitForServerRestart();
-    }} else {{
-      result.innerHTML = `<div class="alert alert-danger">Update failed: ${{d.error || 'Unknown error'}}</div>`;
-    }}
-  }} catch(e) {{
-    result.innerHTML = `<div class="alert alert-danger">Update failed: ${{e.message}}</div>`;
   }}
 }}
 </script>""", "Settings")
