@@ -3961,7 +3961,8 @@ def restart_server():
                 f.write("set PYGUARDDNS_SKIP_REQ_CHECK=1\n")
                 f.write(f'"{python}" "{script_path}"\n')
                 f.write('del "%~f0"\n')
-            os.execl("cmd.exe", "cmd.exe", "/c", restart_script)
+            cmd_exe = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
+            os.execl(cmd_exe, "cmd.exe", "/c", restart_script)
         else:
             restart_script = os.path.join(tempfile.gettempdir(), "pyguarddns_restart.sh")
             with open(restart_script, "w") as f:
