@@ -36,7 +36,7 @@ import bcrypt
 
 from dns_engine import FilterEngine, FilterResult
 from blocklist_manager import BlocklistManager, fetch_url_text as fetch_blocklist_url_text, parse_filter_list, set_dns_resolver as _set_blocklist_dns_resolver
-from client_manager import ClientManager, SERVICE_DOMAINS, SAFESEARCH_REWRITES, YOUTUBE_SAFESEARCH_REWRITES, SAFESEARCH_PROFILE_COLUMNS
+from client_manager import ClientManager, SERVICE_DOMAINS, SERVICE_CATEGORIES, SAFESEARCH_REWRITES, YOUTUBE_SAFESEARCH_REWRITES, SAFESEARCH_PROFILE_COLUMNS
 try:
     from dnssec_validator import DNSSECValidator, DNSSECValidationStatus, ensure_root_trust_anchor, get_dnssec_metrics
     import dns.message
@@ -5247,7 +5247,7 @@ def template(content, title="Dashboard"):
     .metric .fs-3{{line-height:1.1}}
     .row{{display:flex;flex-wrap:wrap;gap:1rem}}
     [class^="col-"],[class*=" col-"]{{width:100%;min-width:0}}
-    .col-6{{flex:0 0 calc(50% - .5rem)}} .col-12{{flex:0 0 100%}}
+    .col-6{{flex:0 0 calc(50% - .5rem)}} .col-3{{flex:0 0 calc(25% - .75rem)}} .col-12{{flex:0 0 100%}}
     @media(min-width:768px){{.col-md-1{{flex:0 0 calc(8.33% - .92rem)}}.col-md-3{{flex:0 0 calc(25% - .75rem)}}.col-md-4{{flex:0 0 calc(33.33% - .67rem)}}.col-md-5{{flex:0 0 calc(41.67% - .58rem)}}.col-md-6{{flex:0 0 calc(50% - .5rem)}}}}
     @media(min-width:992px){{.col-lg-2{{flex:0 0 calc(16.67% - .83rem)}}.col-lg-10{{flex:0 0 calc(83.33% - .17rem)}}}}
     @media(min-width:1200px){{.col-xl-3{{flex:0 0 calc(25% - .75rem)}}.col-xl-4{{flex:0 0 calc(33.33% - .67rem)}}.col-xl-8{{flex:0 0 calc(66.67% - .33rem)}}}}
@@ -5273,6 +5273,7 @@ def template(content, title="Dashboard"):
     .modal-overlay{{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:1000;display:flex;align-items:center;justify-content:center;opacity:0;visibility:hidden;transition:.2s}}
     .modal-overlay.show{{opacity:1;visibility:visible}}
     .modal-box{{background:#101721;border:1px solid #223044;border-radius:.6rem;width:calc(100% - 2rem);max-width:520px;padding:1.5rem;max-height:90vh;overflow-y:auto}}
+    .modal-box-lg{{max-width:900px}}
     @media(max-width:1100px){{.card-grid{{grid-template-columns:repeat(2,1fr)}}.three-col,.two-col{{grid-template-columns:1fr}}}}
     @media(max-width:768px){{
       html,body{{height:auto;min-height:100%;font-size:14px}}
@@ -5339,6 +5340,7 @@ def template(content, title="Dashboard"):
       .card-grid{{grid-template-columns:1fr;gap:.75rem;margin-bottom:1rem}}
       .row{{gap:.75rem}}
       .col-6{{flex:0 0 100%}}
+      .col-3{{flex:0 0 calc(50% - .5rem)}}
       .table-responsive>.table,.table-responsive>table{{min-width:640px}}
       .table-responsive>.mobile-card-table{{min-width:0!important}}
       .three-col .td-num,.two-col .td-num{{width:70px}}
@@ -7322,16 +7324,21 @@ def profiles_page():
     data = client_manager.get_profiles() if client_manager else []
     blists = (blocklist_manager.get_all() if blocklist_manager else [])
     blist_opts = "".join(f"<option value='{b['id']}'>{b['name']}</option>" for b in blists)
-    services = client_manager.get_services() if client_manager else []
     cards = ""
     for p in data:
         rules = client_manager.get_profile_rules(p["id"]) if client_manager else []
         pbl = client_manager.get_profile_blocklists(p["id"]) if client_manager else []
         pservices = client_manager.get_profile_services(p["id"]) if client_manager else []
-        service_opts = "".join(
-            f"<option value='{html_escape(s)}'>{html_escape(s)}</option>"
-            for s in services
-            if s not in pservices
+        service_toggle_rows = "".join(
+            f"<div class='col-12 mt-3 mb-1'><div class='text-muted small fw-bold text-uppercase' style='letter-spacing:.05em'>{html_escape(cat)}</div></div>" + "".join(
+                f"<div class='col-3'><label class='d-flex align-items-center justify-content-between gap-2 px-2 py-1 rounded border border-secondary-subtle'>"
+                f"<span class='small'>{html_escape(svc)}</span>"
+                f"<span class='toggle'><input type='checkbox' name='service_name' value='{html_escape(svc)}' {'checked' if svc in pservices else ''}>"
+                f"<span class='toggle-track'></span><span class='toggle-thumb'></span></span>"
+                f"</label></div>"
+                for svc in svcs
+            )
+            for cat, svcs in SERVICE_CATEGORIES.items()
         )
         rule_rows = "".join(
             f"<tr><td data-label='Action'>{r['action']}</td><td data-label='Type'>{r['pattern_type']}</td><td data-label='Pattern' class='td-domain'><code>{r['pattern']}</code></td>"
@@ -7432,18 +7439,18 @@ def profiles_page():
 </div>
 <!-- Service modal -->
 <div id="{sid}" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('show')">
-<div class="modal-box">
+<div class="modal-box modal-box-lg">
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
-<h2 class="h5" style="margin:0">Add Service Block to {p['name']}</h2>
+<h2 class="h5" style="margin:0">Service Blocks for {p['name']}</h2>
 <button class="btn btn-sm btn-outline-light" onclick="document.getElementById('{sid}').classList.remove('show')" style="border:none;font-size:1.2rem">&times;</button>
 </div>
-<form method="post" action="/profiles/service-add">
+<p class="text-muted small mb-2">Toggle the services this profile should block.</p>
+<form method="post" action="/profiles/services-save">
 <input type="hidden" name="profile_id" value="{p['id']}">
-<label class="form-label">Service</label>
-<select class="form-select mb-2" name="service_name" required>
-{service_opts or '<option value="">All services are already blocked</option>'}
-</select>
-<button class="btn btn-success w-100 mt-3" type="submit" {"disabled" if not service_opts else ""}>Add</button>
+<div class="row g-2 mb-2">
+{service_toggle_rows}
+</div>
+<button class="btn btn-success w-100 mt-3" type="submit">Save</button>
 </form>
 </div>
 </div>
@@ -9445,17 +9452,6 @@ class WebHandler(BaseHTTPRequestHandler):
                     bname = bl["name"] if bl else f"ID {bl_id}"
                     console_event("info", "Profile blocklist removed", f"{pname}: {bname}")
             self.redirect("/profiles")
-        elif path == "/profiles/service-add":
-            if client_manager is not None:
-                pid = int(form.get("profile_id"))
-                profile = client_manager.get_profile(pid)
-                svc = form.get("service_name", "").strip()
-                if svc:
-                    if client_manager.add_profile_service(pid, svc):
-                        pname = profile["name"] if profile else f"ID {pid}"
-                        console_event("info", "Profile service block added", f"{pname}: {svc}")
-                    invalidate_rules_cache()
-            self.redirect("/profiles")
         elif path == "/profiles/service-remove":
             if client_manager is not None:
                 pid = int(form.get("profile_id"))
@@ -9466,6 +9462,16 @@ class WebHandler(BaseHTTPRequestHandler):
                         pname = profile["name"] if profile else f"ID {pid}"
                         console_event("info", "Profile service block removed", f"{pname}: {svc}")
                     invalidate_rules_cache()
+            self.redirect("/profiles")
+        elif path == "/profiles/services-save":
+            if client_manager is not None:
+                pid = int(form.get("profile_id"))
+                profile = client_manager.get_profile(pid)
+                selected = set(form.get_all("service_name"))
+                if client_manager.set_profile_services(pid, selected):
+                    pname = profile["name"] if profile else f"ID {pid}"
+                    console_event("info", "Profile service blocks updated", f"{pname}: {', '.join(sorted(selected)) or 'none'}")
+                invalidate_rules_cache()
             self.redirect("/profiles")
         elif path == "/profiles/edit":
             if client_manager is not None:

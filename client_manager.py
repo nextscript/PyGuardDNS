@@ -3,6 +3,8 @@ import threading
 from datetime import datetime
 from typing import Optional
 
+from service_catalog import SERVICE_CATEGORIES, SERVICE_DOMAINS
+
 PROFILE_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS profiles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -55,76 +57,6 @@ CREATE INDEX IF NOT EXISTS idx_clients_profile ON clients(profile_id);
 CREATE INDEX IF NOT EXISTS idx_profile_rules_profile ON profile_custom_rules(profile_id);
 """
 
-
-SERVICE_DOMAINS = {
-    "YouTube": [
-        "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
-        "ytimg.com", "googlevideo.com", "youtubei.googleapis.com",
-        "youtube.googleapis.com", "youtube-nocookie.com",
-    ],
-    "TikTok": [
-        "tiktok.com", "www.tiktok.com", "m.tiktok.com", "tiktokcdn.com",
-        "tiktokv.com", "musical.ly",
-    ],
-    "Instagram": [
-        "instagram.com", "www.instagram.com", "cdninstagram.com",
-        "instagram.fotp1-1.fna.fbcdn.net",
-    ],
-    "Facebook": [
-        "facebook.com", "www.facebook.com", "m.facebook.com",
-        "fbcdn.net", "fb.com", "fbsbx.com",
-    ],
-    "X/Twitter": [
-        "twitter.com", "www.twitter.com", "x.com", "www.x.com",
-        "twimg.com", "t.co",
-    ],
-    "Discord": [
-        "discord.com", "www.discord.com", "discordapp.com",
-        "cdn.discordapp.com", "discord.gg",
-    ],
-    "Twitch": [
-        "twitch.tv", "www.twitch.tv", "ttvnw.net", "jtvnw.net",
-    ],
-    "Netflix": [
-        "netflix.com", "www.netflix.com", "nflxvideo.net",
-        "nflximg.net", "nflxext.com",
-    ],
-    "Spotify": [
-        "spotify.com", "www.spotify.com", "open.spotify.com",
-        "scdn.co", "spotifycdn.com",
-    ],
-    "Steam": [
-        "steampowered.com", "steamcommunity.com", "steamcdn.com",
-        "steamstore.com", "steamstatic.com",
-    ],
-    "Epic Games": [
-        "epicgames.com", "www.epicgames.com", "unrealengine.com",
-        "easistent.com",
-    ],
-    "Roblox": [
-        "roblox.com", "www.roblox.com", "rbxcdn.com",
-    ],
-    "Snapchat": [
-        "snapchat.com", "www.snapchat.com", "sc-cdn.net",
-    ],
-    "WhatsApp": [
-        "whatsapp.com", "www.whatsapp.com", "whatsapp.net",
-        "cdn.whatsapp.net",
-    ],
-    "Telegram": [
-        "telegram.org", "t.me", "cdn-telegram.org",
-    ],
-    "Reddit": [
-        "reddit.com", "www.reddit.com", "redditmedia.com",
-        "redditstatic.com", "redd.it",
-    ],
-    "Pornhub": [
-        "pornhub.com", "www.pornhub.com", "phncdn.com",
-    ],
-    "OnlyFans": [
-        "onlyfans.com", "www.onlyfans.com",
-    ],
-}
 
 SAFESEARCH_REWRITES = {
     "google.com": {"force": "forcesafesearch.google.com", "qtype": "CNAME"},
@@ -304,6 +236,21 @@ class ClientManager:
                 "DELETE FROM profile_service_blocks WHERE profile_id=? AND service_name=?",
                 (profile_id, service_name.strip()),
             )
+            self.db.commit()
+        self._notify()
+        return True
+
+    def set_profile_services(self, profile_id: int, service_names) -> bool:
+        if not self.get_profile(profile_id):
+            return False
+        valid = sorted({s for s in service_names if s in SERVICE_DOMAINS})
+        with self._lock:
+            self.db.execute("DELETE FROM profile_service_blocks WHERE profile_id=?", (profile_id,))
+            if valid:
+                self.db.executemany(
+                    "INSERT INTO profile_service_blocks(profile_id,service_name) VALUES(?,?)",
+                    [(profile_id, s) for s in valid],
+                )
             self.db.commit()
         self._notify()
         return True
