@@ -6095,6 +6095,7 @@ async function applyUpdate() {{
     const r = await fetch('/api/update/apply', {{method:'POST'}});
     const d = await r.json();
     if (d.ok) {{
+      if (container) container.innerHTML = '';
       waitForServerRestart();
     }} else {{
       alert('Update failed: ' + (d.error || 'Unknown error'));
@@ -8182,6 +8183,7 @@ async function settingsApplyUpdate() {{
     const r = await fetch('/api/update/apply', {{method:'POST'}});
     const d = await r.json();
     if (d.ok) {{
+      if (result) result.innerHTML = '';
       waitForServerRestart();
     }} else {{
       result.innerHTML = `<div class="alert alert-danger">Update failed: ${{d.error || 'Unknown error'}}</div>`;
