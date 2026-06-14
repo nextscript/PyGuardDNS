@@ -3943,19 +3943,20 @@ def perform_update():
 
 def restart_server():
     def delayed_restart():
-        time.sleep(1)
+        time.sleep(0.3)
         python = sys.executable
         script_path = os.path.abspath(__file__)
         script_dir = os.path.dirname(script_path)
-        
+
         if sys.platform == "win32":
             restart_script = os.path.join(tempfile.gettempdir(), "pyguarddns_restart.bat")
             with open(restart_script, "w") as f:
                 f.write("@echo off\n")
-                f.write("timeout /t 2 /nobreak >nul\n")
+                f.write("timeout /t 1 /nobreak >nul\n")
                 f.write(f'cd /d "{script_dir}"\n')
                 f.write(f'cls\n')
                 f.write(f'title PyGuardDNS\n')
+                f.write("set PYGUARDDNS_SKIP_REQ_CHECK=1\n")
                 f.write(f'"{python}" "{script_path}"\n')
                 f.write('del "%~f0"\n')
             os.execl("cmd.exe", "cmd.exe", "/c", restart_script)
@@ -3963,11 +3964,12 @@ def restart_server():
             restart_script = os.path.join(tempfile.gettempdir(), "pyguarddns_restart.sh")
             with open(restart_script, "w") as f:
                 f.write("#!/bin/bash\n")
-                f.write("sleep 2\n")
+                f.write("sleep 1\n")
                 f.write(f'cd "{script_dir}"\n')
                 f.write("clear\n")
                 f.write("stty sane\n")
                 f.write("stty echo\n")
+                f.write("export PYGUARDDNS_SKIP_REQ_CHECK=1\n")
                 f.write(f'"{python}" "{script_path}"\n')
                 f.write('rm -f "$0"\n')
             os.chmod(restart_script, 0o755)
@@ -11514,6 +11516,8 @@ def console_loop():
 
 
 def ensure_requirements():
+    if os.environ.pop("PYGUARDDNS_SKIP_REQ_CHECK", None) == "1":
+        return
     try:
         import subprocess, json, sys
         req_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
