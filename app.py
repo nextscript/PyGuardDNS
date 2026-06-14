@@ -5882,6 +5882,19 @@ def dashboard_page():
   <span style="font-size:.72rem;color:var(--muted)">Live &bull; updated <span id="last-refresh">—</span></span>
 </div>
 <div id="update-alert-container"></div>
+<div id="update-confirm-modal" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="modal-box">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+      <h2 class="h5" style="margin:0">Apply Update</h2>
+      <button class="btn btn-sm btn-outline-light" onclick="document.getElementById('update-confirm-modal').classList.remove('show')" style="border:none;font-size:1.2rem">&times;</button>
+    </div>
+    <p class="mb-3">Apply update and restart server?</p>
+    <div style="display:flex;gap:.65rem">
+      <button class="btn btn-outline-light w-100" type="button" onclick="document.getElementById('update-confirm-modal').classList.remove('show')">Cancel</button>
+      <button class="btn btn-success w-100" type="button" onclick="applyUpdate()">Update Now</button>
+    </div>
+  </div>
+</div>
 <div class="card-grid">{cards_html}</div>
 <div class="three-col">
   <div class="panel">
@@ -6062,7 +6075,7 @@ async function checkForUpdates() {{
               <ul style="margin:.5rem 0 0 0;padding-left:1.5rem">${{commitList}}${{moreText}}</ul>
             </div>
           </div>
-          <button onclick="applyUpdate()" style="background:white;color:#f59e0b;border:none;padding:.75rem 1.5rem;border-radius:.5rem;font-weight:600;cursor:pointer;font-size:.95rem;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,0.15);transition:all .2s" onmouseover="this.style.transform='translateY(-2px)';this.style.boxShadow='0 4px 12px rgba(0,0,0,0.2)'" onmouseout="this.style.transform='';this.style.boxShadow='0 2px 8px rgba(0,0,0,0.15)'">
+          <button onclick="document.getElementById('update-confirm-modal').classList.add('show')" style="background:white;color:#f59e0b;border:none;padding:.75rem 1.5rem;border-radius:.5rem;font-weight:600;cursor:pointer;font-size:.95rem;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,0.15);transition:all .2s" onmouseover="this.style.transform='translateY(-2px)';this.style.boxShadow='0 4px 12px rgba(0,0,0,0.2)'" onmouseout="this.style.transform='';this.style.boxShadow='0 2px 8px rgba(0,0,0,0.15)'">
             <svg style="vertical-align:middle;margin-right:.5rem" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
             Update Now
           </button>
@@ -6075,8 +6088,8 @@ async function checkForUpdates() {{
 }}
 
 async function applyUpdate() {{
-  if (!confirm('Apply update and restart server?')) return;
-  
+  document.getElementById('update-confirm-modal').classList.remove('show');
+
   const container = document.getElementById('update-alert-container');
   if (container) {{
     container.innerHTML = `
