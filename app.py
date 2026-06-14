@@ -3942,6 +3942,8 @@ def perform_update():
 
 
 def restart_server():
+    set_runtime_status("DNS Server Update...", ready=False)
+
     def delayed_restart():
         time.sleep(0.3)
         python = sys.executable
@@ -5459,8 +5461,9 @@ async function waitForServerRestart() {{
   showStartupPage();
   for (let i = 0; i < 90; i++) {{
     try {{
-      await fetch('/', {{cache: 'no-store'}});
-      break;
+      const r = await fetch('/', {{cache: 'no-store'}});
+      const text = await r.text();
+      if (!text.includes('startup-shell')) break;
     }} catch(e) {{}}
     await new Promise(r => setTimeout(r, 1000));
   }}
