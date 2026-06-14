@@ -1,13 +1,18 @@
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
 import tempfile
 import threading
 import time
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Optional
+
+logger = logging.getLogger("pyguarddns.blocklist")
 
 RULES_DIR = os.path.join("data", "rules")
 RULES_FILE = os.path.join(RULES_DIR, "user_rules.pgrules")
@@ -45,6 +50,245 @@ def is_dangerous_regex(pattern: str) -> bool:
         return True
 
     return False
+
+
+# --- Blocklist import primitives (fix_unsupported_rules.md) ----------------
+
+BOM = "﻿"
+MAX_LINE_LENGTH = 2000
+
+HEADER_RE = re.compile(r"^\[.*\]$")
+MERGE_MARKERS = ("<<<<<<<", "=======", ">>>>>>>")
+DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9-]+$")
+
+COSMETIC_MARKERS = ("##", "#@#", "#?#", "#$#", "#@$#")
+
+UMATRIX_RESOURCE_TYPES = frozenset({
+    "*", "doc", "css", "image", "media", "script", "xhr", "frame", "other", "cookie", "csp",
+})
+UMATRIX_ACTIONS = frozenset({"allow", "block", "noop"})
+
+DNS_SUPPORTED_OPTIONS = frozenset({"badfilter", "important"})
+DNS_PARAMETER_OPTIONS = frozenset({"dnstype", "client"})
+BROWSER_ONLY_OPTIONS = frozenset({
+    "script", "image", "stylesheet", "object", "object-subrequest", "xmlhttprequest",
+    "subdocument", "ping", "websocket", "webrtc", "document", "elemhide", "generichide",
+    "genericblock", "specifichide", "popup", "popunder", "media", "font", "other",
+    "third-party", "first-party", "1p", "3p", "match-case", "csp", "redirect",
+    "redirect-rule", "removeparam", "queryprune", "replace", "rewrite", "empty",
+    "mp4", "doc", "frame", "inline-script", "inline-font", "all", "header",
+    "permissions", "to", "uritransform", "cname",
+})
+
+DNS_RECORD_TYPES = frozenset({
+    "A", "AAAA", "CNAME", "MX", "TXT", "NS", "SOA", "SRV", "PTR", "CAA",
+    "HTTPS", "SVCB", "NAPTR", "DNSKEY", "DS", "RRSIG", "NSEC", "NSEC3",
+    "TLSA", "ANY",
+})
+
+BLOCK_HOST_IPS = frozenset({"0.0.0.0", "127.0.0.1", "255.255.255.255", "::", "::1"})
+SKIP_HOST_DOMAINS = frozenset({"localhost", "localhost.localdomain", "local", "broadcasthost"})
+
+
+def normalize_domain(value: str) -> Optional[str]:
+    if not value:
+        return None
+    value = value.strip().lower().rstrip(".")
+    if not value:
+        return None
+    try:
+        encoded = value.encode("idna").decode("ascii")
+    except UnicodeError:
+        return None
+    if not encoded or len(encoded) > 253:
+        return None
+    labels = encoded.split(".")
+    if len(labels) < 2:
+        return None
+    for label in labels:
+        if not (1 <= len(label) <= 63):
+            return None
+        if label.startswith("-") or label.endswith("-"):
+            return None
+        if not DOMAIN_LABEL_RE.fullmatch(label):
+            return None
+    return encoded
+
+
+@lru_cache(maxsize=100_000)
+def normalize_domain_cached(value: str) -> Optional[str]:
+    return normalize_domain(value)
+
+
+def is_cosmetic_rule(line: str) -> bool:
+    return any(marker in line for marker in COSMETIC_MARKERS)
+
+
+def strip_inline_comment(line: str) -> str:
+    idx = line.find(" #")
+    if idx == -1:
+        return line
+    return line[:idx].rstrip()
+
+
+def preprocess_rule_line(raw_line: str) -> tuple:
+    line = raw_line.lstrip(BOM).strip()
+    if not line:
+        return None, "empty_line"
+    if len(line) > MAX_LINE_LENGTH:
+        return None, "line_too_long"
+    if line.startswith("!"):
+        return None, "comment"
+    if line.startswith("#") and not is_cosmetic_rule(line):
+        return None, "comment"
+    if HEADER_RE.match(line):
+        return None, "header"
+    if line.startswith(MERGE_MARKERS):
+        return None, "merge_marker"
+    if not is_cosmetic_rule(line):
+        line = strip_inline_comment(line)
+    return line, None
+
+
+def parse_hosts_line(line: str) -> Optional[list]:
+    parts = line.split()
+    if len(parts) < 2:
+        return None
+    ip = parts[0].strip().lower()
+    if ip not in BLOCK_HOST_IPS:
+        return None
+    domains = []
+    for candidate in parts[1:]:
+        candidate = candidate.strip().lower()
+        if candidate in SKIP_HOST_DOMAINS:
+            continue
+        normalized = normalize_domain_cached(candidate)
+        if normalized:
+            domains.append(normalized)
+    return domains or None
+
+
+def is_umatrix_rule(line: str) -> bool:
+    parts = line.split()
+    if len(parts) != 4:
+        return False
+    source, destination, resource_type, action = parts
+    if resource_type.lower() not in UMATRIX_RESOURCE_TYPES:
+        return False
+    if action.lower() not in UMATRIX_ACTIONS:
+        return False
+    for value in (source, destination):
+        if value == "*":
+            continue
+        if normalize_domain_cached(value.lower()) is None:
+            return False
+    return True
+
+
+def classify_options(options: list) -> tuple:
+    dns_supported = set()
+    browser_only = set()
+    unknown = set()
+    for opt in options:
+        name = opt.split("=", 1)[0].lstrip("~").lower()
+        if name in DNS_SUPPORTED_OPTIONS or name in DNS_PARAMETER_OPTIONS:
+            dns_supported.add(opt)
+        elif name in BROWSER_ONLY_OPTIONS:
+            browser_only.add(opt)
+        else:
+            unknown.add(opt)
+    return dns_supported, browser_only, unknown
+
+
+def _find_option_value(options: list, name: str) -> Optional[str]:
+    for opt in options:
+        key, sep, value = opt.partition("=")
+        if key.lstrip("~").lower() == name:
+            return value
+    return None
+
+
+def canonicalize_badfilter_target(line: str) -> str:
+    is_allow = line.startswith("@@")
+    body = line[2:] if is_allow else line
+    if "$" in body:
+        rule_part, _, options_part = body.partition("$")
+        options = [o.strip() for o in options_part.split(",") if o.strip()]
+    else:
+        rule_part, options = body, []
+    remaining = sorted(o for o in options if o.lower() != "badfilter")
+    canonical = rule_part
+    if remaining:
+        canonical += "$" + ",".join(remaining)
+    if is_allow:
+        canonical = "@@" + canonical
+    return canonical
+
+
+def deduplicate_preserve_order(values: list) -> tuple:
+    seen = set()
+    unique = []
+    duplicates = []
+    for value in values:
+        if value in seen:
+            duplicates.append(value)
+        else:
+            seen.add(value)
+            unique.append(value)
+    return unique, duplicates
+
+
+def parse_adblock_domain_rule(line: str) -> Optional[tuple]:
+    is_allow = line.startswith("@@")
+    body = line[2:] if is_allow else line
+    if not body.startswith("||"):
+        return None
+    body = body[2:]
+    if "$" in body:
+        domain_part, _, options_part = body.partition("$")
+        options = [o.strip() for o in options_part.split(",") if o.strip()]
+    else:
+        domain_part, options = body, []
+    domain_part = domain_part.rstrip("^")
+    if "/" in domain_part or "*" in domain_part:
+        return None
+    domain = normalize_domain_cached(domain_part)
+    if domain is None:
+        return None
+    return is_allow, domain, options
+
+
+def parse_partial_domain_rule(line: str) -> Optional[tuple]:
+    is_allow = line.startswith("@@")
+    body = line[2:] if is_allow else line
+    if body.startswith("://"):
+        body = body[3:]
+    body = body.lstrip(".")
+    body = body.rstrip("^|")
+    domain = normalize_domain_cached(body)
+    if domain is None:
+        return None
+    return is_allow, domain
+
+
+def wildcard_domain_to_regex(value: str) -> Optional[str]:
+    if value.startswith("://"):
+        value = value[3:]
+    value = value.rstrip("^|")
+    value = value.lower().rstrip(".")
+    if "." not in value or "*" not in value:
+        return None
+    labels = value.split(".")
+    pattern_parts = []
+    for label in labels:
+        if not label:
+            return None
+        escaped = re.escape(label)
+        escaped = escaped.replace(r"\*", "[a-z0-9-]*")
+        escaped = escaped.replace(r"\-", "-")
+        pattern_parts.append(escaped)
+    return "^" + r"\.".join(pattern_parts) + "$"
+
 
 _write_lock = threading.Lock()
 
@@ -239,91 +483,169 @@ def load_rules_into_engine(engine) -> dict:
     return {"valid": valid, "invalid": invalid, "errors": errors}
 
 
-def convert_adguard_rule(line: str) -> Optional[str]:
-    if not line or line.startswith("!") or line.startswith("#") or line.startswith("["):
-        return None
-    line = line.strip()
-    if not line:
-        return None
-    is_allow = line.startswith("@@")
-    if is_allow:
-        line = line[2:].strip()
-    if line.startswith("||") and line.endswith("^"):
-        domain = line[2:-1]
-        prefix = "as::" if is_allow else "bs::"
-        return f"{prefix}{domain}"
-    if line.startswith("||"):
-        domain = line[2:].split("^")[0].split("/")[0]
-        prefix = "as::" if is_allow else "bs::"
-        return f"{prefix}{domain}"
-    if line.startswith("/") and line.endswith("/"):
-        pattern = line[1:-1]
-        prefix = "ar::" if is_allow else "br::"
-        return f"{prefix}{pattern}"
-    if line.startswith("|"):
-        domain = line[1:].split("^")[0].split("/")[0]
-        prefix = "ad::" if is_allow else "bd::"
-        return f"{prefix}{domain}"
-    if re.match(r"^\d+\.\d+\.\d+\.\d+\s+", line) or line.startswith("0.0.0.0") or line.startswith("127.0.0.1") or line.startswith("::1"):
-        parts = line.split()
-        if len(parts) >= 2:
-            domain = parts[1].strip()
-            return f"bd::{domain}"
-    if re.match(r"^[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}$", line):
-        prefix = "ad::" if is_allow else "bd::"
-        return f"{prefix}{line}"
-    if line.startswith("@@") and line.endswith("/"):
-        domain = line[2:-1]
-        return f"as::{domain}"
-    return None
+NATIVE_PREFIXES = tuple(PREFIXES)
 
 
-def convert_hosts_line(line: str) -> Optional[str]:
-    if not line or line.startswith("#") or line.startswith("!"):
-        return None
-    line = line.strip()
-    if not line:
-        return None
-    parts = line.split()
-    if len(parts) < 2:
-        return None
-    ip = parts[0].strip()
-    if ip not in ("0.0.0.0", "127.0.0.1", "::1", "255.255.255.255"):
-        return None
-    domain = parts[1].strip().lower()
-    if domain in ("localhost", "localhost.localdomain", "local", "broadcasthost"):
-        return None
-    return f"bd::{domain}"
+@dataclass
+class ParsedImportLine:
+    raw: str
+    normalized: Optional[str] = None
+    category: str = "unsupported"
+    reason: Optional[str] = None
+    generated_rules: list = field(default_factory=list)
+    options: list = field(default_factory=list)
+    line_number: Optional[int] = None
 
 
-def is_cosmetic_rule(line: str) -> bool:
-    return "##" in line or "#@#" in line
+@dataclass
+class ImportResult:
+    converted: list = field(default_factory=list)
+    cosmetic: list = field(default_factory=list)
+    browser_only: list = field(default_factory=list)
+    ignored: list = field(default_factory=list)
+    invalid: list = field(default_factory=list)
+    unsupported: list = field(default_factory=list)
+    disabled: list = field(default_factory=list)
+    duplicates: list = field(default_factory=list)
+    lines: list = field(default_factory=list)
+
+
+def parse_line(raw_line: str, line_number: Optional[int] = None) -> ParsedImportLine:
+    try:
+        line, ignored_reason = preprocess_rule_line(raw_line)
+        if line is None:
+            category = "invalid" if ignored_reason == "line_too_long" else "ignored"
+            return ParsedImportLine(raw=raw_line, category=category, reason=ignored_reason, line_number=line_number)
+
+        if is_cosmetic_rule(line):
+            return ParsedImportLine(raw=line, category="cosmetic", reason="cosmetic_rule", line_number=line_number)
+
+        if is_umatrix_rule(line):
+            return ParsedImportLine(raw=line, category="browser_only", reason="umatrix_rule", line_number=line_number)
+
+        if line.startswith(NATIVE_PREFIXES):
+            result = parse_rule_line(line)
+            if result and "error" not in result:
+                return ParsedImportLine(raw=line, category="converted", generated_rules=[line], line_number=line_number)
+            return ParsedImportLine(raw=line, category="invalid", reason="invalid_native_rule", line_number=line_number)
+
+        if "$badfilter" in line.lower():
+            return ParsedImportLine(raw=line, category="disabled", reason="badfilter", line_number=line_number)
+
+        is_allow = line.startswith("@@")
+        candidate = line[2:] if is_allow else line
+
+        adblock = parse_adblock_domain_rule(line)
+        if adblock is not None:
+            allow, domain, options = adblock
+            dnstype_value = _find_option_value(options, "dnstype")
+            client_value = _find_option_value(options, "client")
+            if dnstype_value is not None:
+                types = [t.lstrip("~") for t in dnstype_value.upper().split("|") if t.lstrip("~")]
+                if not types or not all(t in DNS_RECORD_TYPES for t in types):
+                    return ParsedImportLine(raw=line, normalized=domain, category="invalid", reason="invalid_dnstype", options=options, line_number=line_number)
+                return ParsedImportLine(raw=line, normalized=domain, category="unsupported", reason="dnstype_unsupported", options=options, line_number=line_number)
+            if client_value is not None:
+                return ParsedImportLine(raw=line, normalized=domain, category="unsupported", reason="client_unsupported", options=options, line_number=line_number)
+            _, browser_only_opts, _ = classify_options(options)
+            if browser_only_opts:
+                return ParsedImportLine(raw=line, normalized=domain, category="browser_only", reason="resource_type_option", options=options, line_number=line_number)
+            prefix = "as::" if allow else "bs::"
+            return ParsedImportLine(raw=line, normalized=domain, category="converted", generated_rules=[prefix + domain], options=options, line_number=line_number)
+
+        hosts_domains = parse_hosts_line(line)
+        if hosts_domains is not None:
+            return ParsedImportLine(raw=line, category="converted", generated_rules=[f"bd::{d}" for d in hosts_domains], line_number=line_number)
+
+        plain_domain = normalize_domain_cached(candidate.rstrip("^|"))
+        if plain_domain is not None and "*" not in candidate and "$" not in line:
+            prefix = "ad::" if is_allow else "bd::"
+            return ParsedImportLine(raw=line, normalized=plain_domain, category="converted", generated_rules=[prefix + plain_domain], line_number=line_number)
+
+        if "*" in candidate:
+            pattern = wildcard_domain_to_regex(candidate)
+            if pattern is not None and not is_dangerous_regex(pattern):
+                prefix = "ar::" if is_allow else "br::"
+                return ParsedImportLine(raw=line, category="converted", generated_rules=[prefix + pattern], line_number=line_number)
+
+        partial = parse_partial_domain_rule(line)
+        if partial is not None:
+            allow, domain = partial
+            prefix = "as::" if allow else "bs::"
+            return ParsedImportLine(raw=line, normalized=domain, category="converted", generated_rules=[prefix + domain], line_number=line_number)
+
+        if "$dnstype=" in line.lower():
+            return ParsedImportLine(raw=line, category="unsupported", reason="dnstype_unsupported", line_number=line_number)
+        if "$client=" in line.lower():
+            return ParsedImportLine(raw=line, category="unsupported", reason="client_unsupported", line_number=line_number)
+
+        return ParsedImportLine(raw=line, category="unsupported", reason="no_domain_found", line_number=line_number)
+    except Exception:
+        return ParsedImportLine(raw=raw_line, category="invalid", reason="parse_error", line_number=line_number)
+
+
+def import_lines(lines: list) -> ImportResult:
+    parsed = [parse_line(raw, idx) for idx, raw in enumerate(lines, 1)]
+
+    badfilter_targets = set()
+    for item in parsed:
+        if item.category == "disabled" and item.reason == "badfilter":
+            badfilter_targets.add(canonicalize_badfilter_target(item.raw))
+
+    if badfilter_targets:
+        for item in parsed:
+            if item.category == "disabled":
+                continue
+            if canonicalize_badfilter_target(item.raw) in badfilter_targets:
+                item.category = "disabled"
+                item.reason = "badfilter_target"
+                item.generated_rules = []
+
+    seen_rules = set()
+    for item in parsed:
+        if item.category != "converted":
+            continue
+        kept = [r for r in item.generated_rules if r not in seen_rules]
+        seen_rules.update(kept)
+        if not kept:
+            item.category = "duplicates"
+            item.reason = "duplicate_rule"
+            item.generated_rules = []
+        else:
+            item.generated_rules = kept
+
+    result = ImportResult(lines=parsed)
+    bucket_map = {
+        "converted": None,
+        "cosmetic": result.cosmetic,
+        "browser_only": result.browser_only,
+        "ignored": result.ignored,
+        "invalid": result.invalid,
+        "unsupported": result.unsupported,
+        "disabled": result.disabled,
+        "duplicates": result.duplicates,
+    }
+    for item in parsed:
+        if item.category == "converted":
+            result.converted.extend(item.generated_rules)
+        else:
+            bucket = bucket_map.get(item.category)
+            if bucket is not None:
+                bucket.append(item.raw)
+
+    logger.info(
+        "Imported blocklist: total=%d converted=%d cosmetic=%d browser_only=%d ignored=%d "
+        "invalid=%d unsupported=%d disabled=%d duplicates=%d",
+        len(lines), len(result.converted), len(result.cosmetic), len(result.browser_only),
+        len(result.ignored), len(result.invalid), len(result.unsupported), len(result.disabled),
+        len(result.duplicates),
+    )
+    return result
 
 
 def convert_blocklist_text(text: str, list_id: str, source_url: str = "") -> dict:
-    converted = []
-    cosmetic = []
-    unsupported = []
-    raw_count = 0
-    for raw_line in text.splitlines():
-        raw_count += 1
-        line = raw_line.strip()
-        if not line:
-            continue
-        if line.startswith("!") or line.startswith("#"):
-            continue
-        if is_cosmetic_rule(line):
-            cosmetic.append(line)
-            continue
-        pg_rule = convert_adguard_rule(line)
-        if pg_rule:
-            converted.append(pg_rule)
-            continue
-        pg_hosts = convert_hosts_line(line)
-        if pg_hosts:
-            converted.append(pg_hosts)
-            continue
-        unsupported.append(line)
+    lines = text.splitlines()
+    result = import_lines(lines)
     sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
     cache = {
         "version": 1,
@@ -332,19 +654,30 @@ def convert_blocklist_text(text: str, list_id: str, source_url: str = "") -> dic
         "source_sha256": sha256,
         "converted_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "counts": {
-            "raw": raw_count,
-            "converted": len(converted),
-            "cosmetic": len(cosmetic),
-            "unsupported": len(unsupported),
+            "raw": len(lines),
+            "converted": len(result.converted),
+            "cosmetic": len(result.cosmetic),
+            "browser_only": len(result.browser_only),
+            "ignored": len(result.ignored),
+            "invalid": len(result.invalid),
+            "unsupported": len(result.unsupported),
+            "disabled": len(result.disabled),
+            "duplicates": len(result.duplicates),
         },
-        "rules": converted,
+        "rules": result.converted,
     }
     return {
         "cache": cache,
-        "converted": converted,
-        "cosmetic": cosmetic,
-        "unsupported": unsupported,
+        "converted": result.converted,
+        "cosmetic": result.cosmetic,
+        "browser_only": result.browser_only,
+        "ignored": result.ignored,
+        "invalid": result.invalid,
+        "unsupported": result.unsupported,
+        "disabled": result.disabled,
+        "duplicates": result.duplicates,
         "sha256": sha256,
+        "report": [asdict(item) for item in result.lines],
     }
 
 
@@ -367,6 +700,27 @@ def load_blocklist_cache(list_id: str) -> Optional[dict]:
             return json.load(f)
     except Exception:
         return None
+
+
+def save_import_report(list_id: str, report: list):
+    d = os.path.join("data", "blocklists", "reports")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"{list_id}.json")
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=d, prefix=".tmp_", suffix=".json", delete=False) as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+        tmp_path = f.name
+    os.replace(tmp_path, path)
+
+
+def load_import_report(list_id: str) -> list:
+    path = os.path.join("data", "blocklists", "reports", f"{list_id}.json")
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
 
 
 def save_cosmetic_rules(list_id: str, rules: list):

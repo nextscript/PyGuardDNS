@@ -21,6 +21,8 @@ from rules_engine import (
     save_blocklist_cache,
     save_cosmetic_rules,
     save_unsupported_rules,
+    save_import_report,
+    load_import_report,
     save_original_text,
     load_original_text,
     load_blocklist_cache,
@@ -555,6 +557,7 @@ class BlocklistManager:
         save_blocklist_cache(list_id_str, result["cache"])
         save_cosmetic_rules(list_id_str, result["cosmetic"])
         save_unsupported_rules(list_id_str, result["unsupported"])
+        save_import_report(list_id_str, result["report"])
         if not source:
             save_original_text(list_id_str, text)
         if notify_reload:
@@ -655,6 +658,7 @@ class BlocklistManager:
                 save_blocklist_cache(list_id_str, result["cache"])
                 save_cosmetic_rules(list_id_str, result["cosmetic"])
                 save_unsupported_rules(list_id_str, result["unsupported"])
+                save_import_report(list_id_str, result["report"])
                 self._notify_reload()
             except Exception as exc:
                 with self._update_lock:
@@ -809,7 +813,7 @@ class BlocklistManager:
             self.db.execute("DELETE FROM blocklists WHERE id=?", (list_id,))
             self.db.commit()
         list_id_str = str(list_id)
-        for subdir in ("cache", "cosmetic", "unsupported", "original"):
+        for subdir in ("cache", "cosmetic", "unsupported", "original", "reports"):
             path = os.path.join("data", "blocklists", subdir, f"{list_id_str}.json")
             try:
                 if os.path.isfile(path):
@@ -911,6 +915,7 @@ class BlocklistManager:
         save_blocklist_cache(list_id_str, result["cache"])
         save_cosmetic_rules(list_id_str, result["cosmetic"])
         save_unsupported_rules(list_id_str, result["unsupported"])
+        save_import_report(list_id_str, result["report"])
         with self._update_lock:
             self.db.execute(
                 "UPDATE blocklists SET last_sha256=? WHERE id=?",
@@ -925,15 +930,22 @@ class BlocklistManager:
         cache = load_blocklist_cache(list_id_str)
         if not cache:
             return {}
+        counts = cache["counts"]
         return {
-            "converted_count": cache["counts"]["converted"],
-            "cosmetic_count": cache["counts"]["cosmetic"],
-            "unsupported_count": cache["counts"]["unsupported"],
-            "raw_count": cache["counts"]["raw"],
+            "converted_count": counts["converted"],
+            "cosmetic_count": counts["cosmetic"],
+            "unsupported_count": counts["unsupported"],
+            "raw_count": counts["raw"],
+            "browser_only_count": counts.get("browser_only", 0),
+            "ignored_count": counts.get("ignored", 0),
+            "invalid_count": counts.get("invalid", 0),
+            "disabled_count": counts.get("disabled", 0),
+            "duplicates_count": counts.get("duplicates", 0),
             "converted_at": cache["converted_at"],
             "source_sha256": cache["source_sha256"],
             "cosmetic_rules": read_cosmetic_rules(list_id_str),
             "unsupported_rules": read_unsupported_rules(list_id_str),
+            "report": load_import_report(list_id_str),
         }
 
     def get_cache_rules(self, list_id: int) -> list:

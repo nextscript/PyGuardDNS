@@ -66,6 +66,7 @@ from rules_engine import (
     convert_blocklist_text,
     save_cosmetic_rules,
     save_unsupported_rules,
+    save_import_report,
     save_original_text,
 )
 import upstream_manager as um
@@ -6983,9 +6984,10 @@ def blocklists_page(error="", selected_type="block", success=""):
         )
     deleting_ids = queued_blocklist_delete_ids()
     bl_edit_modals = ""
+    bl_report_modals = ""
 
     def bl_table(rows):
-        nonlocal bl_edit_modals
+        nonlocal bl_edit_modals, bl_report_modals
         if not rows:
             return '<div style="color:var(--muted);padding:1rem;text-align:center">No entries</div>'
         rows_html = ""
@@ -7004,6 +7006,7 @@ def blocklists_page(error="", selected_type="block", success=""):
             )
         for bl in rows:
             eid = f"blEdit-{bl['id']}"
+            rid = f"blReport-{bl['id']}"
             deleting = bl["id"] in deleting_ids
             delete_action = (
                 "<button class='btn btn-sm btn-outline-danger ms-2' disabled>Deleting</button>"
@@ -7016,10 +7019,21 @@ def blocklists_page(error="", selected_type="block", success=""):
                 f"<td data-label='Rules'>{bl['rule_count']}</td><td data-label='Updated'>{bl['last_update'] or '—'}</td>"
                 f"<td data-label='Error' style='color:var(--danger)'>{html_escape(bl['last_error'] or '')}</td>"
                 f"<td data-label='Actions'><button class='btn btn-sm btn-outline-light' onclick=\"document.getElementById('{eid}').classList.add('show')\">&#x270E;</button>"
+                f"<button class='btn btn-sm btn-outline-light ms-2' title='Import Report' onclick=\"openBlReport({bl['id']})\">&#x2139;</button>"
                 f"<form method='post' action='/blocklists/update' class='d-inline ms-2'><input type='hidden' name='id' value='{bl['id']}'>"
                 f"<button class='btn btn-sm btn-outline-light' title='Update'>&#x21bb;</button></form>"
                 f"{delete_action}</td></tr>"
             )
+            bl_report_modals += f"""
+<div id="{rid}" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="modal-box modal-box-lg">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+      <h2 class="h5" style="margin:0">Import Report: {html_escape(bl['name'])}</h2>
+      <button class="btn btn-sm btn-outline-light" onclick="document.getElementById('{rid}').classList.remove('show')" style="border:none;font-size:1.2rem">&times;</button>
+    </div>
+    <div id="{rid}-body"><div class="text-secondary small py-2">Loading…</div></div>
+  </div>
+</div>"""
             bl_edit_modals += f"""
 <div id="{eid}" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('show')">
   <div class="modal-box">
@@ -7059,6 +7073,7 @@ def blocklists_page(error="", selected_type="block", success=""):
   <div id="bl-allow" style="{allow_style}">{allow_html}</div>
 </div>
 {bl_edit_modals}
+{bl_report_modals}
 <script>
 function blSwitch() {{
   var t = document.getElementById('bl-type').value;
@@ -7162,6 +7177,73 @@ async function refreshBlocklistJobStatus() {{
     }}
     blJobWasActive = true;
   }} catch (e) {{}}
+}}
+const BL_REPORT_CATEGORIES = [
+  ['converted', 'Converted'],
+  ['cosmetic', 'Cosmetic (browser-only)'],
+  ['browser_only', 'Browser-only'],
+  ['ignored', 'Ignored'],
+  ['invalid', 'Invalid'],
+  ['unsupported', 'Unsupported'],
+  ['disabled', 'Disabled ($badfilter)'],
+  ['duplicates', 'Duplicates'],
+];
+function blReportEsc(s) {{
+  const d = document.createElement('div');
+  d.textContent = (s === null || s === undefined) ? '' : String(s);
+  return d.innerHTML;
+}}
+function blReportRender(data) {{
+  const counts = [
+    ['Raw lines', data.raw_count],
+    ['Converted', data.converted_count],
+    ['Cosmetic', data.cosmetic_count],
+    ['Browser-only', data.browser_only_count],
+    ['Ignored', data.ignored_count],
+    ['Invalid', data.invalid_count],
+    ['Unsupported', data.unsupported_count],
+    ['Disabled ($badfilter)', data.disabled_count],
+    ['Duplicates', data.duplicates_count],
+  ];
+  let html = '<div class="table-responsive"><table class="table table-dark table-sm mb-3"><tbody>';
+  for (const [label, value] of counts) {{
+    html += '<tr><td>' + blReportEsc(label) + '</td><td>' + blReportEsc(value || 0) + '</td></tr>';
+  }}
+  html += '</tbody></table></div>';
+
+  const report = data.report || [];
+  if (!report.length) {{
+    html += '<div class="text-secondary small">No detailed report available. Update this blocklist to generate one.</div>';
+    return html;
+  }}
+  const byCategory = {{}};
+  for (const item of report) {{
+    (byCategory[item.category] = byCategory[item.category] || []).push(item);
+  }}
+  for (const [cat, label] of BL_REPORT_CATEGORIES) {{
+    const items = byCategory[cat] || [];
+    if (!items.length) continue;
+    html += '<details class="mb-2"><summary>' + blReportEsc(label) + ' (' + items.length + ')</summary>';
+    html += '<div class="table-responsive"><table class="table table-dark table-sm"><thead><tr><th>Line</th><th>Raw</th><th>' + (cat === 'converted' ? 'Generated rules' : 'Reason') + '</th></tr></thead><tbody>';
+    for (const item of items) {{
+      const extra = cat === 'converted' ? (item.generated_rules || []).join(', ') : (item.reason || '');
+      html += '<tr><td>' + blReportEsc(item.line_number) + '</td><td class="text-break">' + blReportEsc(item.raw) + '</td><td class="text-break">' + blReportEsc(extra) + '</td></tr>';
+    }}
+    html += '</tbody></table></div></details>';
+  }}
+  return html;
+}}
+async function openBlReport(id) {{
+  document.getElementById('blReport-' + id).classList.add('show');
+  const body = document.getElementById('blReport-' + id + '-body');
+  body.innerHTML = '<div class="text-secondary small py-2">Loading…</div>';
+  try {{
+    const r = await fetch('/api/blocklists/' + id + '/report', {{cache: 'no-store'}});
+    const data = await r.json();
+    body.innerHTML = blReportRender(data);
+  }} catch (e) {{
+    body.innerHTML = '<div class="text-danger small py-2">Failed to load report.</div>';
+  }}
 }}
 setTimeout(function() {{
   var n = document.getElementById('bl-notification');
@@ -8647,6 +8729,7 @@ def handle_restore_data(data):
                 save_blocklist_cache(list_id_str, result["cache"])
                 save_cosmetic_rules(list_id_str, result["cosmetic"])
                 save_unsupported_rules(list_id_str, result["unsupported"])
+                save_import_report(list_id_str, result["report"])
                 if not url:
                     save_original_text(list_id_str, content)
             restored_blocklists += 1
@@ -9871,6 +9954,7 @@ class WebHandler(BaseHTTPRequestHandler):
                     save_blocklist_cache(list_id_str, result["cache"])
                     save_cosmetic_rules(list_id_str, result["cosmetic"])
                     save_unsupported_rules(list_id_str, result["unsupported"])
+                    save_import_report(list_id_str, result["report"])
                     if not url:
                         save_original_text(list_id_str, content)
                 restored_blocklists += 1
@@ -10365,6 +10449,9 @@ class WebHandler(BaseHTTPRequestHandler):
                 "delete": current_blocklist_delete_status(),
                 "toggle": current_blocklist_toggle_status(),
             })
+        elif re.search(r"/api/blocklists/\d+/report$", path):
+            bl_id = int(path.strip("/").split("/")[2])
+            self.send_json(blocklist_manager.get_cache_info(bl_id) if blocklist_manager else {})
         elif path == "/api/clients":
             if client_manager is not None:
                 self.send_json(client_manager.get_clients())
