@@ -3796,7 +3796,7 @@ def check_for_updates(force=False):
     
     if not force and _update_check_cache["result"] is not None:
         time_since_check = time.time() - _update_check_cache["last_check"]
-        if time_since_check < 21600:
+        if time_since_check < 3600:
             return _update_check_cache["result"]
     
     try:
@@ -3848,7 +3848,7 @@ def _update_checker_thread():
             check_for_updates(force=True)
         except Exception:
             pass
-        time.sleep(21600)
+        time.sleep(3600)
 
 
 def start_update_checker():
@@ -6093,7 +6093,7 @@ async function applyUpdate() {{
 }}
 
 checkForUpdates();
-setInterval(checkForUpdates, 21600000);
+setInterval(checkForUpdates, 3600000);
 </script>
 """)
 
@@ -11523,7 +11523,7 @@ def main():
         log.write(f"{now_iso()} healthcheck worker ready\n")
         log.flush()
         start_update_checker()
-        log.write(f"{now_iso()} update checker ready (checks every 6 hours)\n")
+        log.write(f"{now_iso()} update checker ready (checks every 1 hour)\n")
         log.flush()
         try:
             eng = build_filter_engine()
