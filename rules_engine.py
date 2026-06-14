@@ -157,14 +157,16 @@ def read_rules() -> str:
     if not os.path.isfile(RULES_FILE):
         return ""
     try:
-        with open(RULES_FILE, "r", encoding="utf-8") as f:
-            return f.read()
+        with open(RULES_FILE, "r", encoding="utf-8", newline="") as f:
+            text = f.read()
     except Exception:
         return ""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def write_rules(text: str) -> dict:
     ensure_dirs()
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = text.strip() + "\n" if text and not text.endswith("\n") else text
     checksum = hashlib.sha256(text.encode("utf-8")).hexdigest()
     with _write_lock:
@@ -178,7 +180,7 @@ def write_rules(text: str) -> dict:
         tmp = None
         try:
             fd, tmp = tempfile.mkstemp(dir=RULES_DIR, prefix=".tmp_", suffix=".pgrules")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
                 f.write(text)
             os.replace(tmp, RULES_FILE)
         finally:
