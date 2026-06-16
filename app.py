@@ -5923,7 +5923,6 @@ def dashboard_page():
     <span class="page-title" style="margin-bottom:0">Dashboard</span>
     <button class="btn btn-outline-light btn-sm" type="button" id="dash-refresh-btn" onclick="manualRefreshDash()">Refresh stats</button>
   </div>
-  <span style="font-size:.72rem;color:var(--muted)">Live &bull; updated <span id="last-refresh">—</span></span>
 </div>
 <div id="update-alert-container"></div>
 <div id="update-confirm-modal" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('show')">
