@@ -3964,10 +3964,12 @@ def restart_server():
                 f.write('del "%~f0"\n')
             cmd_exe = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
             os.execl(cmd_exe, "cmd.exe", "/c", restart_script)
+        elif os.path.exists("/.dockerenv") or os.environ.get("PYGUARDDNS_DOCKER") == "1":
+            os._exit(0)
         else:
             restart_script = os.path.join(tempfile.gettempdir(), "pyguarddns_restart.sh")
             with open(restart_script, "w") as f:
-                f.write("#!/bin/bash\n")
+                f.write("#!/bin/sh\n")
                 f.write("sleep 1\n")
                 f.write(f'cd "{script_dir}"\n')
                 f.write("clear\n")
@@ -3977,7 +3979,7 @@ def restart_server():
                 f.write(f'"{python}" "{script_path}"\n')
                 f.write('rm -f "$0"\n')
             os.chmod(restart_script, 0o755)
-            os.execl("/bin/bash", "/bin/bash", restart_script)
+            os.execl("/bin/sh", "/bin/sh", restart_script)
     
     threading.Thread(target=delayed_restart, daemon=True).start()
     return {"ok": True, "message": "DNS Server Update..."}
