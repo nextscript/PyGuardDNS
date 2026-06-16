@@ -7777,7 +7777,7 @@ def upstreams_page():
 <div class="col-xl-4"><form class="panel rounded-2 border border-secondary-subtle p-3" method="post" action="/upstreams/add">
 <h2 class="h5">Add Upstream</h2>
 <label class="form-label">Name</label><input class="form-control mb-2" name="name" placeholder="Cloudflare" required>
-<label class="form-label">Resolver</label><input class="form-control mb-2" id="resolver-input" name="resolver" placeholder="https://dns.google/dns-query" required>
+<label class="form-label">Resolver</label><input class="form-control mb-2" id="resolver-input" name="resolver" placeholder="tls://cloudflare-dns.com" required>
 <label class="form-label">DNSCrypt Relay (optional)</label><input class="form-control mb-2" id="relay-input" name="dnscrypt_relay" placeholder="sdns://gQ04OS4xMDYuNzguMTA2">
 <div class="alert alert-secondary py-2" id="relay-detect">Relay is used only for DNSCrypt upstream stamps.</div>
 <div class="alert alert-secondary py-2" id="resolver-detect">Type is detected automatically.</div>
