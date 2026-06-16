@@ -180,7 +180,7 @@ prefetch_hits_lock = threading.RLock()
 prefetch_in_progress = set()
 prefetch_in_progress_lock = threading.Lock()
 dash_cache = {"data": None, "ts": 0.0}
-DASH_CACHE_TTL = 5
+DASH_CACHE_TTL = 15
 sessions = {}
 doh_host_cache = {}
 doh_connection_cache = {}
@@ -6093,8 +6093,7 @@ async function manualRefreshDash() {{
     btn.textContent = 'Refresh stats';
   }}
 }}
-setInterval(refreshDash, 3000);
-refreshDash();
+setInterval(refreshDash, 15000);
 
 async function checkForUpdates() {{
   try {{
