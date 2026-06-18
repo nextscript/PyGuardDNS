@@ -6389,7 +6389,6 @@ OISD Blocklist Small: https://raw.githubusercontent.com/sjhgvr/oisd/main/domains
 OISD Blocklist Big: https://big.oisd.nl
 OISD Blocklist NSFW: https://raw.githubusercontent.com/sjhgvr/oisd/main/domainswild2_nsfw.txt
 Peter Lowe's Blocklist: https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0&mimetype=plaintext
-ShadowWhisperer Tracking List: https://adguardteam.github.io/HostlistsRegistry/assets/filter_69.txt
 Steven Black's List: https://adguardteam.github.io/HostlistsRegistry/assets/filter_33.txt
 Dandelion Sprout's Anti Push Notifications: https://adguardteam.github.io/HostlistsRegistry/assets/filter_39.txt
 Dandelion Sprout's Game Console Adblock List: https://adguardteam.github.io/HostlistsRegistry/assets/filter_6.txt
