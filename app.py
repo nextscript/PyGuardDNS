@@ -4921,20 +4921,22 @@ def handle_dns_request(request, client_ip, connection_type=""):
             except Exception as e:
                 logger.warning("DNSSEC validation error for %s: %s", normalized, e)
 
-        for cname in extract_cname_targets(response):
-            cname_result = engine.check(cname, filtering_enabled=filtering_on, profile_id=profile_id)
-            if cname_result.action == "BLOCK":
-                bump_runtime_metric("dns_filter_blocks_total")
-                blocked_response = build_block_response(request, qtype_name, question)
-                matched = cname_result.matched_rule or cname_result.matched_domain or cname
-                log_query(client_ip, domain, normalized, qtype_name, "blocked", upstream=upstream,
-                          matched_rule=matched, blocked=1, reason="cname_blocked",
-                          duration_ms=(time.perf_counter() - started) * 1000,
-                          matched_list=cname_result.list_name or cname_result.matched_list or "",
-                          client_name=dc, profile_name=dp, connection_type=connection_type,
-                          upstream_query_time_ms=upstream_query_time_ms,
-                          dnssec_status=dnssec_status, resolver_mode=resolver_mode)
-                return blocked_response
+        explicit_allow = "allow" in decision.get("reason", "")
+        if not explicit_allow:
+            for cname in extract_cname_targets(response):
+                cname_result = engine.check(cname, filtering_enabled=filtering_on, profile_id=profile_id)
+                if cname_result.action == "BLOCK":
+                    bump_runtime_metric("dns_filter_blocks_total")
+                    blocked_response = build_block_response(request, qtype_name, question)
+                    matched = cname_result.matched_rule or cname_result.matched_domain or cname
+                    log_query(client_ip, domain, normalized, qtype_name, "blocked", upstream=upstream,
+                              matched_rule=matched, blocked=1, reason="cname_blocked",
+                              duration_ms=(time.perf_counter() - started) * 1000,
+                              matched_list=cname_result.list_name or cname_result.matched_list or "",
+                              client_name=dc, profile_name=dp, connection_type=connection_type,
+                              upstream_query_time_ms=upstream_query_time_ms,
+                              dnssec_status=dnssec_status, resolver_mode=resolver_mode)
+                    return blocked_response
         neg_type = is_negative_response(response)
         if neg_type:
             set_negative_cached(normalized, qtype_name, response, neg_type)
