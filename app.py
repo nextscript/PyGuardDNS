@@ -6367,11 +6367,11 @@ def rules_page(kind=None):
 <div class="panel rounded-2 border border-secondary-subtle p-3">
 <form method="post" action="/rules/save">
 <div class="mb-2 d-flex justify-content-between align-items-center">
-<span class="text-muted small">{counts["total"]} rules ({counts["block_exact"]} bd, {counts["block_suffix"]} bs, {counts["block_regex"]} br, {counts["allow_exact"]} ad, {counts["allow_suffix"]} as, {counts["allow_regex"]} ar)</span>
+<span class="text-muted small">{counts["total"]} rules ({counts["block_exact"]} bd, {counts["block_suffix"]} bs, {counts["block_regex"]} br, {counts["allow_exact"]} ad, {counts["allow_suffix"]} as, {counts["allow_regex"]} ar, {counts["cosmetic"]} cm)</span>
 </div>
 <textarea class="form-control font-monospace mb-2" name="rules" rows="20" style="font-size:13px">{h(current_rules)}</textarea>
 <div class="d-flex justify-content-between align-items-center">
-<small class="text-muted">Syntax: <code>bd::</code> block domain, <code>bs::</code> block suffix, <code>br::</code> block regex, <code>ad::</code> allow domain, <code>as::</code> allow suffix, <code>ar::</code> allow regex. One rule per line, <code>#</code> for comments.</small>
+<small class="text-muted">Syntax: <code>bd::</code> block domain, <code>bs::</code> block suffix, <code>br::</code> block regex, <code>ad::</code> allow domain, <code>as::</code> allow suffix, <code>ar::</code> allow regex, <code>cm::</code> cosmetic rule. One rule per line, <code>#</code> for comments.</small>
 <button class="btn btn-success" type="submit">Save Rules</button>
 </div>
 </form>
@@ -7530,9 +7530,13 @@ def cosmeticlists_page():
             continue
         cosmetic_data.append({"id": bl["id"], "name": bl["name"], "url": bl.get("url", ""), "list_type": bl.get("list_type", "block"), "count": len(rules)})
         total_rules += len(rules)
+    user_cm_count = count_rules(read_rules()).get("cosmetic", 0)
+    if user_cm_count:
+        cosmetic_data.append({"id": "user", "name": "User Rules (cm::)", "url": "", "list_type": "cosmetic", "count": user_cm_count})
+        total_rules += user_cm_count
 
     if not cosmetic_data:
-        table_html = '<div style="color:var(--muted);padding:2rem;text-align:center">No cosmetic rules found. Import blocklists that contain AdBlock-style cosmetic filters (##, #@#, #?#, #$#).</div>'
+        table_html = '<div style="color:var(--muted);padding:2rem;text-align:center">No cosmetic rules found. Import blocklists that contain AdBlock-style cosmetic filters (##, #@#, #?#, #$#) or add <code>cm::</code> rules in <a href="/rules">Rules</a>.</div>'
     else:
         rows_html = ""
         for cd in cosmetic_data:
@@ -7545,8 +7549,8 @@ def cosmeticlists_page():
                 f"<td data-label='URL' class='text-break' style='max-width:300px'>{html_escape(cd['url'] or '-')}</td>"
                 f"<td data-label='Cosmetic Rules'>{cd['count']}</td>"
                 f"<td data-label='Actions'>"
-                f"<button class='btn btn-sm btn-outline-light' onclick=\"clViewRules({cd['id']})\">View Rules</button>"
-                f"<button class='btn btn-sm btn-outline-light ms-2' onclick=\"clDownloadRules({cd['id']}, '{html_escape(cd['name'])}')\" title='Download'>&#x2B07;</button>"
+                f"<button class='btn btn-sm btn-outline-light' onclick=\"clViewRules('{cd['id']}')\">View Rules</button>"
+                f"<button class='btn btn-sm btn-outline-light ms-2' onclick=\"clDownloadRules('{cd['id']}', '{html_escape(cd['name'])}')\" title='Download'>&#x2B07;</button>"
                 f"</td>"
                 f"</tr>"
             )
@@ -10862,7 +10866,20 @@ class WebHandler(BaseHTTPRequestHandler):
                 if not rules:
                     continue
                 result.append({"id": bl["id"], "name": bl["name"], "url": bl.get("url", ""), "count": len(rules)})
+            user_cm_count = count_rules(read_rules()).get("cosmetic", 0)
+            if user_cm_count:
+                result.append({"id": "user", "name": "User Rules (cm::)", "url": "", "count": user_cm_count})
             self.send_json(result)
+        elif path == "/api/cosmeticlists/user":
+            user_rules_text = read_rules()
+            cm_rules = []
+            for raw_line in user_rules_text.split("\n"):
+                line = raw_line.strip()
+                if line.startswith("cm::"):
+                    pattern = line[4:].strip()
+                    if pattern:
+                        cm_rules.append(pattern)
+            self.send_json({"id": "user", "name": "User Rules (cm::)", "rules": cm_rules})
         elif re.search(r"/api/cosmeticlists/\d+$", path):
             cl_id = int(path.strip("/").split("/")[2])
             bl = blocklist_manager.get_by_id(cl_id) if blocklist_manager else None
@@ -10873,6 +10890,13 @@ class WebHandler(BaseHTTPRequestHandler):
             all_rules = []
             for bl in lists:
                 all_rules.extend(read_cosmetic_rules(str(bl["id"])))
+            user_rules_text = read_rules()
+            for raw_line in user_rules_text.split("\n"):
+                line = raw_line.strip()
+                if line.startswith("cm::"):
+                    pattern = line[4:].strip()
+                    if pattern:
+                        all_rules.append(pattern)
             self._send_cors_json({"rules": all_rules, "count": len(all_rules)})
         elif path == "/api/cosmeticlists/userscript":
             host_header = self.headers.get("Host", f"localhost:{WEB_PORT}")
