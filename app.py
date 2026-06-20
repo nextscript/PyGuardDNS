@@ -7335,7 +7335,7 @@ setInterval(refreshBlocklistJobStatus, 1000);
 </div>""", "Blocklists")
 
 
-def generate_cosmetic_userscript(api_base):
+def generate_cosmetic_userscript(api_base, api_token=""):
     base = api_base.rstrip("/")
     api_url = base + "/api/cosmeticlists/all-rules"
     log_url = base + "/api/cosmeticlists/log"
@@ -7358,6 +7358,7 @@ def generate_cosmetic_userscript(api_base):
 
   const API_URL = '{api_url}';
   const LOG_URL = '{log_url}';
+  const API_TOKEN = '{api_token}';
   const CACHE_KEY = 'pyguarddns_cosmetic_rules';
   const CACHE_TS_KEY = 'pyguarddns_cosmetic_ts';
   const CACHE_TTL = 300000;
@@ -7439,7 +7440,7 @@ def generate_cosmetic_userscript(api_base):
       GM_xmlhttpRequest({{
         method: 'POST',
         url: LOG_URL,
-        headers: {{ 'Content-Type': 'application/json' }},
+        headers: {{ 'Content-Type': 'application/json', 'X-API-Token': API_TOKEN }},
         data: JSON.stringify({{
           domain: hostname,
           url: location.href,
@@ -7463,6 +7464,7 @@ def generate_cosmetic_userscript(api_base):
     GM_xmlhttpRequest({{
       method: 'GET',
       url: API_URL,
+      headers: {{ 'X-API-Token': API_TOKEN }},
       responseType: 'json',
       timeout: 10000,
       onload: function(resp) {{
@@ -10858,7 +10860,8 @@ class WebHandler(BaseHTTPRequestHandler):
         elif path == "/api/cosmeticlists/userscript":
             host_header = self.headers.get("Host", f"localhost:{WEB_PORT}")
             api_base = f"http://{host_header}"
-            script = generate_cosmetic_userscript(api_base)
+            api_token = get_setting(API_TOKEN_SETTING, "")
+            script = generate_cosmetic_userscript(api_base, api_token)
             body = script.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/javascript; charset=utf-8")
