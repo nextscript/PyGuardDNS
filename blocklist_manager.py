@@ -523,12 +523,21 @@ class BlocklistManager:
         return self.add_from_text(name, fetched["text"], list_type, source=url, sha256=fetched.get("sha256", ""), etag=fetched.get("etag", ""), last_modified=fetched.get("last_modified", ""), notify_reload=notify_reload)
 
     def add_from_text(self, name: str, text: str, list_type: str = "block", source: str = "", sha256: str = "", etag: str = "", last_modified: str = "", replace_by_name: bool = True, notify_reload: bool = True, skip_existing_entries: bool = True) -> int:
-        list_type = "allow" if list_type == "allow" else "block"
-        entries = parse_filter_list(text, default_action=list_type)
+        if list_type not in ("allow", "cosmetic"):
+            list_type = "block"
+        entries = parse_filter_list(text, default_action="block" if list_type == "cosmetic" else list_type)
         if list_type == "allow":
             entries = [(action, pt, pattern) for action, pt, pattern in entries if action == "allow"]
-        if not entries:
-            return 0
+        result = convert_blocklist_text(text, "_tmp", source)
+        cosmetic_rules = result["cosmetic"]
+        if list_type == "cosmetic":
+            if not cosmetic_rules:
+                return 0
+            rule_count = len(cosmetic_rules)
+        else:
+            if not entries:
+                return 0
+            rule_count = None
         report = import_report(entries, total_lines=len(text.splitlines()))
         seen_entries = set()
         unique_entries = []
@@ -537,8 +546,10 @@ class BlocklistManager:
                 continue
             seen_entries.add(entry)
             unique_entries.append(entry)
-        if not unique_entries:
-            return 0
+        if rule_count is None:
+            if not unique_entries:
+                return 0
+            rule_count = len(unique_entries)
         created = now_iso()
         with self._update_lock:
             if replace_by_name:
@@ -547,22 +558,22 @@ class BlocklistManager:
                 """INSERT INTO blocklists(name,url,list_type,rule_count,last_update,last_successful_update,last_rule_count,
                    last_unique_rule_count,last_sha256,etag,last_modified,duplicate_rule_count,import_report,created_at)
                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (name, source, list_type, len(unique_entries), created, created, len(unique_entries), report["unique_rules"], sha256, etag, last_modified, report["duplicate_rules"], json.dumps(report), created),
+                (name, source, list_type, rule_count, created, created, rule_count, report["unique_rules"], sha256, etag, last_modified, report["duplicate_rules"], json.dumps(report), created),
             )
             bl_id = curs.lastrowid
             self.db.commit()
         bl_id_val = curs.lastrowid
         list_id_str = str(bl_id_val)
-        result = convert_blocklist_text(text, list_id_str, source)
-        save_blocklist_cache(list_id_str, result["cache"])
-        save_cosmetic_rules(list_id_str, result["cosmetic"])
-        save_unsupported_rules(list_id_str, result["unsupported"])
-        save_import_report(list_id_str, result["report"])
+        result_full = convert_blocklist_text(text, list_id_str, source)
+        save_blocklist_cache(list_id_str, result_full["cache"])
+        save_cosmetic_rules(list_id_str, result_full["cosmetic"])
+        save_unsupported_rules(list_id_str, result_full["unsupported"])
+        save_import_report(list_id_str, result_full["report"])
         if not source:
             save_original_text(list_id_str, text)
         if notify_reload:
             self._notify_reload()
-        return len(unique_entries)
+        return rule_count
 
     def _get_from_cache(self, list_id: int) -> Optional[dict]:
         cache = load_blocklist_cache(str(list_id))
@@ -633,14 +644,24 @@ class BlocklistManager:
                         self.db.commit()
                     return
                 text = fetched["text"]
-                list_type = "allow" if item.get("list_type") == "allow" else "block"
-                entries = parse_filter_list(text, default_action=list_type)
+                list_type = item.get("list_type", "block")
+                if list_type not in ("allow", "cosmetic"):
+                    list_type = "block"
+                entries = parse_filter_list(text, default_action="block" if list_type == "cosmetic" else list_type)
                 if list_type == "allow":
                     entries = [(action, pt, pattern) for action, pt, pattern in entries if action == "allow"]
-                if not entries:
-                    raise ValueError("Download succeeded but no valid rules found")
+                result_conv = convert_blocklist_text(text, "_tmp_upd", item.get("url", ""))
+                cosmetic_rules = result_conv["cosmetic"]
+                if list_type == "cosmetic":
+                    if not cosmetic_rules:
+                        raise ValueError("Download succeeded but no cosmetic rules found")
+                    rule_count = len(cosmetic_rules)
+                else:
+                    if not entries:
+                        raise ValueError("Download succeeded but no valid rules found")
+                    rule_count = len(entries)
                 old_count = int(item.get("last_rule_count") or item.get("rule_count") or 0)
-                if old_count > 10000 and len(entries) < old_count * 0.5:
+                if old_count > 10000 and rule_count < old_count * 0.5:
                     raise ValueError("New list is suspiciously smaller than previous version")
                 report = import_report(entries, total_lines=len(text.splitlines()))
                 created = now_iso()
@@ -649,7 +670,7 @@ class BlocklistManager:
                         """UPDATE blocklists SET rule_count=?, last_update=?, last_error='', last_successful_update=?,
                            last_rule_count=?, last_unique_rule_count=?, last_sha256=?, etag=?, last_modified=?,
                            duplicate_rule_count=?, import_report=? WHERE id=?""",
-                        (len(entries), created, created, len(entries), report["unique_rules"], fetched.get("sha256", ""),
+                        (rule_count, created, created, rule_count, report["unique_rules"], fetched.get("sha256", ""),
                          fetched.get("etag", ""), fetched.get("last_modified", ""), report["duplicate_rules"], json.dumps(report), list_id),
                     )
                     self.db.commit()
@@ -782,7 +803,8 @@ class BlocklistManager:
         item = self._get(list_id)
         if not item:
             return False
-        list_type = "allow" if list_type == "allow" else "block"
+        if list_type not in ("allow", "cosmetic"):
+            list_type = "block"
         with self._update_lock:
             self.db.execute(
                 "UPDATE blocklists SET name=?, url=?, list_type=? WHERE id=?",

@@ -65,6 +65,7 @@ from rules_engine import (
     save_blocklist_cache,
     convert_blocklist_text,
     save_cosmetic_rules,
+    read_cosmetic_rules,
     save_unsupported_rules,
     save_import_report,
     save_original_text,
@@ -5130,6 +5131,7 @@ def icon_settings(): return _svg('<circle cx="12" cy="12" r="3"/><path d="M19.4 
 def icon_search():   return _svg('<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>')
 def icon_api():      return _svg('<polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>')
 def icon_profile():  return _svg('<path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/>')
+def icon_cosmetic(): return _svg('<path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>')
 
 
 def template(content, title="Dashboard"):
@@ -5395,6 +5397,7 @@ def template(content, title="Dashboard"):
   {nav_item("/", "Dashboard", icon_home(), title)}
   {nav_item("/querylog", "Query Log", icon_list(), title)}
   {nav_item("/blocklists", "Blocklists", icon_filter(), title)}
+  {nav_item("/cosmeticlists", "Cosmetic Lists", icon_cosmetic(), title)}
   {nav_item("/rules", "Rules", icon_shield(), title)}
   {nav_item("/rewrites", "DNS Rewrites", icon_rewrite(), title)}
   {nav_item("/profiles", "Profiles", icon_profile(), title)}
@@ -5558,7 +5561,7 @@ async function importBackup(input) {{
 def nav_item(path, label, icon="", current_title=""):
     _map = {
         "Dashboard": "/", "Query Log": "/querylog",
-        "Blocklists": "/blocklists", "Rules": "/rules",
+        "Blocklists": "/blocklists", "Rules": "/rules", "Cosmetic Lists": "/cosmeticlists",
         "DNS Rewrites": "/rewrites", "Clients": "/clients", "Profiles": "/profiles", "Upstreams": "/upstreams", "Cache": "/cache",
         "Setup Wizard": "/setup-wizard", "Settings": "/settings", "API": "/api-docs", "Domain Test": "/domain-test",
     }
@@ -6177,6 +6180,8 @@ def badge(status):
         cls = "danger"
     elif status in ("cached", "rewritten"):
         cls = "info"
+    elif status == "cosmetic":
+        cls = "warning"
     return f'<span class="badge text-bg-{cls}">{status}</span>'
 
 
@@ -6299,6 +6304,7 @@ function qlFetch() {{
         let bc = 'success';
         if (r.status.includes('block') || r.status==='refused' || r.status==='upstream_error') bc='danger';
         else if (r.status==='cached' || r.status==='rewritten') bc='info';
+        else if (r.status==='cosmetic') bc='warning';
         const act = r.blocked ? 'allow' : 'block';
         const label = r.blocked ? 'Allow' : 'Block';
         const domain = esc(r.normalized_domain || r.domain || '');
@@ -6335,7 +6341,7 @@ qlRestoreAuto();
 
 
 def status_options(current):
-    options = ["allowed", "blocked", "cached", "rewritten", "refused", "upstream_error", "local"]
+    options = ["allowed", "blocked", "cached", "rewritten", "refused", "upstream_error", "local", "cosmetic"]
     return "".join(f'<option value="{o}" {"selected" if o == current else ""}>{o}</option>' for o in options)
 
 
@@ -6531,9 +6537,11 @@ def duplicate_blocklist_by_url(url, list_type):
     wanted_url = normalized_list_url(url)
     if not wanted_url or blocklist_manager is None:
         return None
-    wanted_type = "allow" if list_type == "allow" else "block"
+    wanted_type = list_type if list_type in ("allow", "cosmetic") else "block"
     for row in blocklist_manager.get_all():
-        row_type = "allow" if row.get("list_type") == "allow" else "block"
+        row_type = row.get("list_type", "block")
+        if row_type not in ("allow", "cosmetic"):
+            row_type = "block"
         if row_type == wanted_type and normalized_list_url(row.get("url")) == wanted_url:
             return row
     return None
@@ -6542,10 +6550,13 @@ def duplicate_blocklist_by_url(url, list_type):
 def duplicate_blocklist_by_entries(entry_set, list_type):
     if not entry_set:
         return None
-    wanted_type = "allow" if list_type == "allow" else "block"
+    wanted_type = list_type if list_type in ("allow", "cosmetic") else "block"
     existing = {}
     for bl in blocklist_manager.get_all():
-        if (bl.get("list_type") or "block") != wanted_type:
+        row_type = bl.get("list_type", "block")
+        if row_type not in ("allow", "cosmetic"):
+            row_type = "block"
+        if row_type != wanted_type:
             continue
         cache = load_blocklist_cache(str(bl["id"]))
         if not cache:
@@ -6614,7 +6625,9 @@ def blocklist_import_worker():
                 blocklist_import_status["queued"] = len(blocklist_import_queue)
                 blocklist_import_status["current"] = job.get("name", "")
             try:
-                list_type = "allow" if job.get("list_type") == "allow" else "block"
+                list_type = job.get("list_type", "block")
+                if list_type not in ("allow", "cosmetic"):
+                    list_type = "block"
                 if job.get("source") == "text":
                     console_event("work", "Blocklist import started", f"{job.get('name', '')} from pasted content")
                     with blocklist_import_lock:
@@ -6865,7 +6878,7 @@ def dedupe_existing_blocklist_entries():
         cache = load_blocklist_cache(bl_id)
         if not cache:
             continue
-        list_type = "allow" if bl.get("list_type") == "allow" else "block"
+        list_type = bl.get("list_type", "block")
         new_rules = []
         removed = 0
         for raw in cache.get("rules", []):
@@ -6913,9 +6926,10 @@ def blocklists_page(error="", selected_type="block", success=""):
     global blocklist_manager
     lists = blocklist_manager.get_all() if blocklist_manager else []
     adlist_presets = load_adlist_presets()
-    block_rows = [bl for bl in lists if bl.get("list_type") != "allow"]
+    block_rows = [bl for bl in lists if bl.get("list_type") not in ("allow", "cosmetic")]
     allow_rows = [bl for bl in lists if bl.get("list_type") == "allow"]
-    selected_type = "allow" if selected_type == "allow" else "block"
+    cosmetic_rows = [bl for bl in lists if bl.get("list_type") == "cosmetic"]
+    selected_type = selected_type if selected_type in ("block", "allow", "cosmetic") else "block"
 
     preset_block_options = ""
     preset_allow_options = ""
@@ -7045,7 +7059,7 @@ def blocklists_page(error="", selected_type="block", success=""):
     <form method="post" action="/blocklists/edit">
       <input type="hidden" name="id" value="{bl['id']}">
       <label class="form-label">Name</label><input class="form-control mb-2" name="name" value="{html_escape(bl['name'])}" required>
-      <label class="form-label">List Type</label><select class="form-select mb-2" name="list_type"><option value="block" {"selected" if bl.get("list_type") != "allow" else ""}>Blocklist</option><option value="allow" {"selected" if bl.get("list_type") == "allow" else ""}>Allowlist</option></select>
+      <label class="form-label">List Type</label><select class="form-select mb-2" name="list_type"><option value="block" {"selected" if bl.get("list_type") == "block" else ""}>Blocklist</option><option value="allow" {"selected" if bl.get("list_type") == "allow" else ""}>Allowlist</option><option value="cosmetic" {"selected" if bl.get("list_type") == "cosmetic" else ""}>Cosmetic</option></select>
       <label class="form-label">URL</label><input class="form-control mb-2" name="url" value="{html_escape(bl['url'] or '')}" placeholder="https://raw.githubusercontent.com/...">
       <button class="btn btn-success w-100" type="submit">Save</button>
     </form>
@@ -7055,8 +7069,10 @@ def blocklists_page(error="", selected_type="block", success=""):
 
     block_html = bl_table(block_rows)
     allow_html = bl_table(allow_rows)
-    block_style = "display:none" if selected_type == "allow" else ""
-    allow_style = "display:none" if selected_type == "block" else ""
+    cosmetic_html = bl_table(cosmetic_rows)
+    block_style = "display:none" if selected_type != "block" else ""
+    allow_style = "display:none" if selected_type != "allow" else ""
+    cosmetic_style = "display:none" if selected_type != "cosmetic" else ""
 
     return template(f"""
 <div class="page-toolbar">
@@ -7068,10 +7084,12 @@ def blocklists_page(error="", selected_type="block", success=""):
     <select id="bl-type" class="form-select" style="width:auto;min-width:160px" onchange="blSwitch()">
       <option value="block" {"selected" if selected_type == "block" else ""}>Blocklists ({len(block_rows)})</option>
       <option value="allow" {"selected" if selected_type == "allow" else ""}>Allowlists ({len(allow_rows)})</option>
+      <option value="cosmetic" {"selected" if selected_type == "cosmetic" else ""}>Cosmeticlists ({len(cosmetic_rows)})</option>
     </select>
   </div>
   <div id="bl-block" style="{block_style}">{block_html}</div>
   <div id="bl-allow" style="{allow_style}">{allow_html}</div>
+  <div id="bl-cosmetic" style="{cosmetic_style}">{cosmetic_html}</div>
 </div>
 {bl_edit_modals}
 {bl_report_modals}
@@ -7080,6 +7098,7 @@ function blSwitch() {{
   var t = document.getElementById('bl-type').value;
   document.getElementById('bl-block').style.display = t === 'block' ? '' : 'none';
   document.getElementById('bl-allow').style.display = t === 'allow' ? '' : 'none';
+  document.getElementById('bl-cosmetic').style.display = t === 'cosmetic' ? '' : 'none';
   var addType = document.getElementById('bl-add-type');
   if (addType) addType.value = t;
   blPresetTypeChanged();
@@ -7108,6 +7127,12 @@ function setBlocklistAddMode(mode) {{
 }}
 function blPresetTypeChanged() {{
   var t = document.getElementById('bl-add-type').value;
+  if (t === 'cosmetic') {{
+    setBlocklistAddMode('manual');
+    document.getElementById('bl-mode-from-list').disabled = true;
+  }} else {{
+    document.getElementById('bl-mode-from-list').disabled = false;
+  }}
   var blockPanel = document.getElementById('bl-preset-block');
   var allowPanel = document.getElementById('bl-preset-allow');
   if (blockPanel) blockPanel.style.display = t === 'block' ? '' : 'none';
@@ -7294,7 +7319,7 @@ setInterval(refreshBlocklistJobStatus, 1000);
         <button id="bl-mode-from-list" type="button" class="btn btn-outline-light active" onclick="setBlocklistAddMode('from-list')">From List</button>
         <button id="bl-mode-manual" type="button" class="btn btn-outline-light" onclick="setBlocklistAddMode('manual')">Manual</button>
       </div>
-      <label class="form-label">List Type</label><select id="bl-add-type" class="form-select mb-3" name="list_type" onchange="blPresetTypeChanged()"><option value="block" {"selected" if selected_type == "block" else ""}>Blocklist</option><option value="allow" {"selected" if selected_type == "allow" else ""}>Allowlist</option></select>
+      <label class="form-label">List Type</label><select id="bl-add-type" class="form-select mb-3" name="list_type" onchange="blPresetTypeChanged()"><option value="block" {"selected" if selected_type == "block" else ""}>Blocklist</option><option value="allow" {"selected" if selected_type == "allow" else ""}>Allowlist</option><option value="cosmetic">Cosmetic</option></select>
       <div id="bl-from-list-panel">
         <div id="bl-preset-block" class="preset-list-scroll">{preset_block_options}</div>
         <div id="bl-preset-allow" class="preset-list-scroll" style="display:none">{preset_allow_options}</div>
@@ -7308,6 +7333,294 @@ setInterval(refreshBlocklistJobStatus, 1000);
     </form>
   </div>
 </div>""", "Blocklists")
+
+
+def generate_cosmetic_userscript(api_base):
+    base = api_base.rstrip("/")
+    api_url = base + "/api/cosmeticlists/all-rules"
+    log_url = base + "/api/cosmeticlists/log"
+    return f"""// ==UserScript==
+// @name         PyGuardDNS Cosmetic Filter
+// @namespace    pyguarddns
+// @version      2.0
+// @description  Fetches cosmetic rules live from PyGuardDNS API and applies element hiding
+// @match        *://*/*
+// @run-at       document-start
+// @grant        GM_xmlhttpRequest
+// @grant        GM_addStyle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @connect      *
+// ==/UserScript==
+
+(function() {{
+  'use strict';
+
+  const API_URL = '{api_url}';
+  const LOG_URL = '{log_url}';
+  const CACHE_KEY = 'pyguarddns_cosmetic_rules';
+  const CACHE_TS_KEY = 'pyguarddns_cosmetic_ts';
+  const CACHE_TTL = 300000;
+
+  const hostname = location.hostname;
+
+  function domainMatches(pattern) {{
+    return hostname === pattern || hostname.endsWith('.' + pattern);
+  }}
+
+  function parseAndApply(rules) {{
+    const cssEntries = [];
+    const exceptions = {{}};
+
+    for (const rule of rules) {{
+      if (rule.indexOf('#@#') !== -1) {{
+        const parts = rule.split('#@#', 2);
+        const sel = (parts[1] || '').trim();
+        if (!sel) continue;
+        const domains = parts[0].trim();
+        if (domains) {{
+          for (const d of domains.split(',')) {{
+            const dt = d.trim();
+            if (dt) (exceptions[dt] = exceptions[dt] || []).push(sel);
+          }}
+        }} else {{
+          (exceptions['*'] = exceptions['*'] || []).push(sel);
+        }}
+      }} else if (rule.indexOf('##') !== -1 && rule.indexOf('#$#') === -1 && rule.indexOf('#?#') === -1) {{
+        const parts = rule.split('##', 2);
+        const sel = (parts[1] || '').trim();
+        if (!sel) continue;
+        const domains = parts[0].trim();
+        cssEntries.push({{ domains: domains, selector: sel }});
+      }}
+    }}
+
+    function isExcepted(sel) {{
+      if (exceptions['*'] && exceptions['*'].indexOf(sel) !== -1) return true;
+      for (const domain in exceptions) {{
+        if (domain === '*') continue;
+        if (domainMatches(domain) && exceptions[domain].indexOf(sel) !== -1) return true;
+      }}
+      return false;
+    }}
+
+    const selectors = [];
+    for (const entry of cssEntries) {{
+      if (isExcepted(entry.selector)) continue;
+      if (!entry.domains) {{
+        selectors.push(entry.selector);
+      }} else {{
+        for (const d of entry.domains.split(',')) {{
+          if (domainMatches(d.trim())) {{
+            selectors.push(entry.selector);
+            break;
+          }}
+        }}
+      }}
+    }}
+
+    if (selectors.length > 0) {{
+      const css = selectors.join(', ') + ' {{ display: none !important; }}';
+      if (typeof GM_addStyle === 'function') {{
+        GM_addStyle(css);
+      }} else {{
+        const style = document.createElement('style');
+        style.textContent = css;
+        (document.head || document.documentElement).appendChild(style);
+      }}
+    }}
+
+    return selectors;
+  }}
+
+  function reportToLog(applied) {{
+    if (!applied || !applied.length) return;
+    try {{
+      GM_xmlhttpRequest({{
+        method: 'POST',
+        url: LOG_URL,
+        headers: {{ 'Content-Type': 'application/json' }},
+        data: JSON.stringify({{
+          domain: hostname,
+          url: location.href,
+          applied: applied.slice(0, 20),
+          count: applied.length
+        }}),
+        timeout: 5000
+      }});
+    }} catch (e) {{}}
+  }}
+
+  function applyCached() {{
+    try {{
+      const cached = GM_getValue(CACHE_KEY, '');
+      if (cached) return parseAndApply(JSON.parse(cached));
+    }} catch (e) {{}}
+    return [];
+  }}
+
+  function fetchAndApply() {{
+    GM_xmlhttpRequest({{
+      method: 'GET',
+      url: API_URL,
+      responseType: 'json',
+      timeout: 10000,
+      onload: function(resp) {{
+        try {{
+          const data = typeof resp.response === 'string' ? JSON.parse(resp.response) : resp.response;
+          const rules = data.rules || [];
+          GM_setValue(CACHE_KEY, JSON.stringify(rules));
+          GM_setValue(CACHE_TS_KEY, Date.now());
+          const applied = parseAndApply(rules);
+          reportToLog(applied);
+        }} catch (e) {{
+          const applied = applyCached();
+          reportToLog(applied);
+        }}
+      }},
+      onerror: function() {{
+        const applied = applyCached();
+        reportToLog(applied);
+      }},
+      ontimeout: function() {{
+        const applied = applyCached();
+        reportToLog(applied);
+      }}
+    }});
+  }}
+
+  const lastFetch = GM_getValue(CACHE_TS_KEY, 0);
+  if (Date.now() - lastFetch < CACHE_TTL) {{
+    const applied = applyCached();
+    reportToLog(applied);
+  }} else {{
+    fetchAndApply();
+  }}
+}})();
+"""
+
+
+def cosmeticlists_page():
+    global blocklist_manager
+    lists = blocklist_manager.get_all() if blocklist_manager else []
+    cosmetic_data = []
+    total_rules = 0
+    for bl in lists:
+        rules = read_cosmetic_rules(str(bl["id"]))
+        if not rules:
+            continue
+        cosmetic_data.append({"id": bl["id"], "name": bl["name"], "url": bl.get("url", ""), "list_type": bl.get("list_type", "block"), "count": len(rules)})
+        total_rules += len(rules)
+
+    if not cosmetic_data:
+        table_html = '<div style="color:var(--muted);padding:2rem;text-align:center">No cosmetic rules found. Import blocklists that contain AdBlock-style cosmetic filters (##, #@#, #?#, #$#).</div>'
+    else:
+        rows_html = ""
+        for cd in cosmetic_data:
+            badge = {"block": "Blocklist", "allow": "Allowlist", "cosmetic": "Cosmetic"}.get(cd["list_type"], "Blocklist")
+            badge_cls = {"block": "bg-primary", "allow": "bg-success", "cosmetic": "bg-warning"}.get(cd["list_type"], "bg-primary")
+            rows_html += (
+                f"<tr>"
+                f"<td data-label='Name'>{html_escape(cd['name'])}</td>"
+                f"<td data-label='Type'><span class='badge {badge_cls}'>{badge}</span></td>"
+                f"<td data-label='URL' class='text-break' style='max-width:300px'>{html_escape(cd['url'] or '-')}</td>"
+                f"<td data-label='Cosmetic Rules'>{cd['count']}</td>"
+                f"<td data-label='Actions'>"
+                f"<button class='btn btn-sm btn-outline-light' onclick=\"clViewRules({cd['id']})\">View Rules</button>"
+                f"<button class='btn btn-sm btn-outline-light ms-2' onclick=\"clDownloadRules({cd['id']}, '{html_escape(cd['name'])}')\" title='Download'>&#x2B07;</button>"
+                f"</td>"
+                f"</tr>"
+            )
+        table_html = (
+            "<div class='table-responsive'><table class='table table-dark table-hover mobile-card-table'>"
+            "<thead><tr><th>Name</th><th>Type</th><th>Source URL</th><th>Cosmetic Rules</th><th></th></tr></thead>"
+            "<tbody>" + rows_html + "</tbody></table></div>"
+        )
+
+    return template(f"""
+<div class="page-toolbar">
+  <span class="page-title" style="margin-bottom:0">Cosmetic Lists</span>
+  <button class="btn btn-success" onclick="clDownloadUserscript()">&#x2B07; Download Userscript</button>
+</div>
+<div class="panel rounded-2 border border-secondary-subtle p-3 mb-3">
+  <div style="display:flex;gap:.75rem;align-items:center;margin-bottom:.75rem;flex-wrap:wrap">
+    <span class="text-secondary small">{len(cosmetic_data)} lists &middot; {total_rules} cosmetic rules total</span>
+    <input id="cl-search" class="form-control" style="width:auto;min-width:200px;max-width:320px;margin-left:auto"
+      placeholder="Search rules..." oninput="clFilterSearch()">
+  </div>
+  {table_html}
+</div>
+<div id="cl-view-modal" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="modal-box modal-box-lg">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+      <h2 class="h5" style="margin:0" id="cl-view-title">Cosmetic Rules</h2>
+      <button class="btn btn-sm btn-outline-light" onclick="document.getElementById('cl-view-modal').classList.remove('show')" style="border:none;font-size:1.2rem">&times;</button>
+    </div>
+    <div id="cl-view-body" style="max-height:65vh;overflow:auto"><div class="text-secondary small py-2">Loading…</div></div>
+  </div>
+</div>
+<script>
+async function clViewRules(id) {{
+  document.getElementById('cl-view-modal').classList.add('show');
+  const body = document.getElementById('cl-view-body');
+  body.innerHTML = '<div class="text-secondary small py-2">Loading…</div>';
+  try {{
+    const r = await fetch('/api/cosmeticlists/' + id, {{cache:'no-store'}});
+    const data = await r.json();
+    document.getElementById('cl-view-title').textContent = 'Cosmetic Rules: ' + (data.name || '');
+    if (!data.rules || !data.rules.length) {{
+      body.innerHTML = '<div class="text-secondary small py-2">No cosmetic rules.</div>';
+      return;
+    }}
+    let html = '<div class="table-responsive"><table class="table table-dark table-sm"><thead><tr><th>#</th><th>Rule</th></tr></thead><tbody>';
+    data.rules.forEach(function(rule, i) {{
+      html += '<tr><td>' + (i + 1) + '</td><td class="text-break" style="font-family:monospace;font-size:.8rem">' + clEsc(rule) + '</td></tr>';
+    }});
+    html += '</tbody></table></div>';
+    body.innerHTML = html;
+  }} catch (e) {{
+    body.innerHTML = '<div class="text-danger small py-2">Failed to load rules.</div>';
+  }}
+}}
+function clEsc(s) {{
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}}
+async function clDownloadRules(id, name) {{
+  try {{
+    const r = await fetch('/api/cosmeticlists/' + id, {{cache:'no-store'}});
+    const data = await r.json();
+    if (!data.rules || !data.rules.length) {{ alert('No cosmetic rules for this list.'); return; }}
+    const blob = new Blob([data.rules.join('\\n')], {{type:'text/plain'}});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = (name || 'cosmetic_rules') + '.txt';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }} catch (e) {{ alert('Failed to download rules.'); }}
+}}
+async function clDownloadUserscript() {{
+  try {{
+    const r = await fetch('/api/cosmeticlists/userscript', {{cache:'no-store'}});
+    const text = await r.text();
+    const blob = new Blob([text], {{type:'text/javascript'}});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'pyguarddns-cosmetic.user.js';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }} catch (e) {{ alert('Failed to download userscript.'); }}
+}}
+function clFilterSearch() {{
+  const q = document.getElementById('cl-search').value.toLowerCase();
+  const rows = document.querySelectorAll('.panel tbody tr');
+  rows.forEach(function(row) {{
+    const text = row.textContent.toLowerCase();
+    row.style.display = text.includes(q) ? '' : 'none';
+  }});
+}}
+</script>""", "Cosmetic Lists")
 
 
 def rewrites_page():
@@ -8700,7 +9013,9 @@ def handle_restore_data(data):
         for row in data.get("blocklists", []):
             name = row.get("name", "") or "unknown"
             url = row.get("url", row.get("source", ""))
-            list_type = "allow" if row.get("list_type") == "allow" else "block"
+            list_type = row.get("list_type", "block")
+            if list_type not in ("allow", "cosmetic"):
+                list_type = "block"
             enabled = int(row.get("enabled", 1))
             last_update = row.get("last_update", "")
             last_error = ""
@@ -9103,6 +9418,7 @@ class WebHandler(BaseHTTPRequestHandler):
             "/querylog": lambda: querylog_page(params),
             "/blocklists": lambda: blocklists_page(params.get("error", [""])[0], params.get("type", ["block"])[0], params.get("success", [""])[0]),
             "/rules": rules_page,
+            "/cosmeticlists": cosmeticlists_page,
             "/rewrites": rewrites_page,
             "/clients": clients_page,
             "/profiles": profiles_page,
@@ -9215,6 +9531,9 @@ class WebHandler(BaseHTTPRequestHandler):
 
     def _do_POST(self):
         path = urlparse(self.path).path
+        if path == "/api/cosmeticlists/log":
+            self._handle_cosmetic_log()
+            return
         if path == "/dns-query":
             self.handle_doh_query()
             return
@@ -9286,16 +9605,20 @@ class WebHandler(BaseHTTPRequestHandler):
             global blocklist_manager
             name = form.get("name", "").strip()
             url = form.get("url", "").strip()
-            list_type = "allow" if form.get("list_type") == "allow" else "block"
+            list_type = form.get("list_type", "block")
+            if list_type not in ("allow", "cosmetic"):
+                list_type = "block"
             content = form.get("content", "")
             try:
                 queued_jobs = []
                 if form.get("add_mode") == "from-list":
+                    if list_type == "cosmetic":
+                        raise ValueError("Cosmetic lists must be added manually")
                     preset_choices = form.get_all("preset_choice")
                     prefix = f"{list_type}-"
                     if not preset_choices:
                         raise ValueError("Select at least one list")
-                    preset_items = load_adlist_presets()[list_type]
+                    preset_items = load_adlist_presets().get(list_type, [])
                     selected_presets = []
                     for preset_choice in preset_choices:
                         if not preset_choice.startswith(prefix):
@@ -9310,7 +9633,7 @@ class WebHandler(BaseHTTPRequestHandler):
                     existing_rows = blocklist_manager.get_all() if blocklist_manager else []
                     existing_rows = [
                         row for row in existing_rows
-                        if ("allow" if row.get("list_type") == "allow" else "block") == list_type
+                        if row.get("list_type", "block") == list_type
                     ]
                     selected_presets = [
                         preset for preset in selected_presets
@@ -9371,7 +9694,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 if not bl_item.get("url", "").startswith(("http://", "https://")):
                     raise ValueError("Blocklist has no remote URL to update from")
                 blocklist_manager.update(bl_id)
-                list_type = "allow" if bl_item.get("list_type") == "allow" else "block"
+                list_type = bl_item.get("list_type", "block")
                 self.redirect(f"/blocklists?type={list_type}&success={quote('Update started')}")
             except Exception as exc:
                 list_type = form.get("list_type", "block")
@@ -9392,7 +9715,7 @@ class WebHandler(BaseHTTPRequestHandler):
             bl_id = int(form.get("id"))
             item = blocklist_manager.get_by_id(bl_id) if blocklist_manager else None
             if item:
-                list_type = "allow" if item.get("list_type") == "allow" else "block"
+                list_type = item.get("list_type", "block")
                 if bl_id not in queued_blocklist_delete_ids():
                     enqueue_blocklist_deletes([{"id": bl_id, "name": item.get("name", f"ID {bl_id}")}])
                 self.redirect(f"/blocklists?type={list_type}&success={quote('List delete queued')}")
@@ -9925,7 +10248,9 @@ class WebHandler(BaseHTTPRequestHandler):
             for row in data.get("blocklists", []):
                 name = row.get("name", "") or "unknown"
                 url = row.get("url", row.get("source", ""))
-                list_type = "allow" if row.get("list_type") == "allow" else "block"
+                list_type = row.get("list_type", "block")
+                if list_type not in ("allow", "cosmetic"):
+                    list_type = "block"
                 enabled = int(row.get("enabled", 1))
                 last_update = row.get("last_update", "")
                 last_error = ""
@@ -10108,6 +10433,63 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_cors_json(self, obj, status=200):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        path = urlparse(self.path).path
+        if path.startswith("/api/cosmeticlists/"):
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Max-Age", "86400")
+            self.end_headers()
+        else:
+            self.send_error(405)
+
+    def _handle_cosmetic_log(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length else b""
+            data = json.loads(raw) if raw else {}
+        except Exception:
+            self._send_cors_json({"error": "invalid json"}, 400)
+            return
+        page_domain = data.get("domain", "")
+        page_url = data.get("url", "")
+        applied = data.get("applied", [])
+        count = data.get("count", len(applied))
+        client_ip = self.client_address[0]
+        if not page_domain:
+            self._send_cors_json({"error": "missing domain"}, 400)
+            return
+        matched_rule = ", ".join(applied[:10])
+        if len(applied) > 10:
+            matched_rule += f" (+{len(applied) - 10} more)"
+        log_query(
+            client_ip=client_ip,
+            domain=page_domain,
+            normalized=normalize_domain(page_domain),
+            qtype_name="COSMETIC",
+            status="cosmetic",
+            blocked=0,
+            reason="",
+            matched_rule=matched_rule,
+            matched_list=f"{count} cosmetic rules applied",
+            upstream="userscript",
+            connection_type="https",
+        )
+        self._send_cors_json({"status": "ok", "logged": count})
 
     def send_prometheus_metrics(self):
         m = collect_metrics()
@@ -10453,6 +10835,37 @@ class WebHandler(BaseHTTPRequestHandler):
         elif re.search(r"/api/blocklists/\d+/report$", path):
             bl_id = int(path.strip("/").split("/")[2])
             self.send_json(blocklist_manager.get_cache_info(bl_id) if blocklist_manager else {})
+        elif path == "/api/cosmeticlists":
+            lists = blocklist_manager.get_all() if blocklist_manager else []
+            result = []
+            for bl in lists:
+                rules = read_cosmetic_rules(str(bl["id"]))
+                if not rules:
+                    continue
+                result.append({"id": bl["id"], "name": bl["name"], "url": bl.get("url", ""), "count": len(rules)})
+            self.send_json(result)
+        elif re.search(r"/api/cosmeticlists/\d+$", path):
+            cl_id = int(path.strip("/").split("/")[2])
+            bl = blocklist_manager.get_by_id(cl_id) if blocklist_manager else None
+            rules = read_cosmetic_rules(str(cl_id))
+            self.send_json({"id": cl_id, "name": bl["name"] if bl else "", "rules": rules})
+        elif path == "/api/cosmeticlists/all-rules":
+            lists = blocklist_manager.get_all() if blocklist_manager else []
+            all_rules = []
+            for bl in lists:
+                all_rules.extend(read_cosmetic_rules(str(bl["id"])))
+            self._send_cors_json({"rules": all_rules, "count": len(all_rules)})
+        elif path == "/api/cosmeticlists/userscript":
+            host_header = self.headers.get("Host", f"localhost:{WEB_PORT}")
+            api_base = f"http://{host_header}"
+            script = generate_cosmetic_userscript(api_base)
+            body = script.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/javascript; charset=utf-8")
+            self.send_header("Content-Disposition", "attachment; filename=pyguarddns-cosmetic.user.js")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         elif path == "/api/clients":
             if client_manager is not None:
                 self.send_json(client_manager.get_clients())
@@ -10594,7 +11007,9 @@ class WebHandler(BaseHTTPRequestHandler):
             global blocklist_manager
             name = form.get("name", "").strip()
             url = form.get("url", "").strip()
-            list_type = "allow" if form.get("list_type") == "allow" else "block"
+            list_type = form.get("list_type", "block")
+            if list_type not in ("allow", "cosmetic"):
+                list_type = "block"
             content = form.get("content", "")
             try:
                 if url:
