@@ -7339,114 +7339,188 @@ def generate_cosmetic_userscript(api_base, api_token=""):
     base = api_base.rstrip("/")
     api_url = base + "/api/cosmeticlists/all-rules"
     log_url = base + "/api/cosmeticlists/log"
+    try:
+        from urllib.parse import urlparse
+        connect_host = urlparse(base).hostname or "*"
+    except Exception:
+        connect_host = "*"
     return f"""// ==UserScript==
 // @name         PyGuardDNS Cosmetic Filter
 // @namespace    pyguarddns
-// @version      2.0
-// @description  Fetches cosmetic rules live from PyGuardDNS API and applies element hiding
+// @version      2.1
+// @description  Fetches cosmetic rules live from PyGuardDNS API, refreshes them on every page load and applies element hiding
 // @match        *://*/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
-// @grant        GM_addStyle
 // @grant        GM_getValue
 // @grant        GM_setValue
-// @connect      *
+// @connect      {connect_host}
 // ==/UserScript==
 
-(function() {{
+(function () {{
   'use strict';
 
   const API_URL = '{api_url}';
   const LOG_URL = '{log_url}';
   const API_TOKEN = '{api_token}';
+
   const CACHE_KEY = 'pyguarddns_cosmetic_rules';
   const CACHE_TS_KEY = 'pyguarddns_cosmetic_ts';
-  const CACHE_TTL = 300000;
+  const STYLE_ID = 'pyguarddns-cosmetic-style';
 
-  const hostname = location.hostname;
+  const hostname = location.hostname.toLowerCase();
+
+  function normalizeDomain(domain) {{
+    return String(domain || '')
+      .trim()
+      .toLowerCase()
+      .replace(/^\\|\\|/, '')
+      .replace(/\\^$/, '')
+      .replace(/^\\./, '');
+  }}
 
   function domainMatches(pattern) {{
-    return hostname === pattern || hostname.endsWith('.' + pattern);
+    const normalized = normalizeDomain(pattern);
+    if (!normalized || normalized === '*') return true;
+    return hostname === normalized || hostname.endsWith('.' + normalized);
+  }}
+
+  function getOrCreateStyleElement() {{
+    let style = document.getElementById(STYLE_ID);
+
+    if (!style) {{
+      style = document.createElement('style');
+      style.id = STYLE_ID;
+      style.type = 'text/css';
+      (document.head || document.documentElement).appendChild(style);
+    }}
+
+    return style;
+  }}
+
+  function setCosmeticCss(css) {{
+    getOrCreateStyleElement().textContent = css;
   }}
 
   function parseAndApply(rules) {{
     const cssEntries = [];
-    const exceptions = {{}};
+    const exceptions = new Map();
 
-    for (const rule of rules) {{
-      if (rule.indexOf('#@#') !== -1) {{
-        const parts = rule.split('#@#', 2);
-        const sel = (parts[1] || '').trim();
-        if (!sel) continue;
-        const domains = parts[0].trim();
-        if (domains) {{
-          for (const d of domains.split(',')) {{
-            const dt = d.trim();
-            if (dt) (exceptions[dt] = exceptions[dt] || []).push(sel);
-          }}
-        }} else {{
-          (exceptions['*'] = exceptions['*'] || []).push(sel);
+    for (const rawRule of rules) {{
+      if (typeof rawRule !== 'string') continue;
+
+      const rule = rawRule.trim();
+      if (!rule || rule.startsWith('!') || rule.startsWith('[')) continue;
+
+      if (rule.includes('#@#')) {{
+        const separatorIndex = rule.indexOf('#@#');
+        const domainPart = rule.slice(0, separatorIndex).trim();
+        const selector = rule.slice(separatorIndex + 3).trim();
+        if (!selector) continue;
+
+        const domains = domainPart
+          ? domainPart.split(',').map(normalizeDomain).filter(Boolean)
+          : ['*'];
+
+        for (const domain of domains) {{
+          if (!exceptions.has(domain)) exceptions.set(domain, new Set());
+          exceptions.get(domain).add(selector);
         }}
-      }} else if (rule.indexOf('##') !== -1 && rule.indexOf('#$#') === -1 && rule.indexOf('#?#') === -1) {{
-        const parts = rule.split('##', 2);
-        const sel = (parts[1] || '').trim();
-        if (!sel) continue;
-        const domains = parts[0].trim();
-        cssEntries.push({{ domains: domains, selector: sel }});
+        continue;
+      }}
+
+      if (
+        rule.includes('##') &&
+        !rule.includes('#$#') &&
+        !rule.includes('#?#') &&
+        !rule.includes('#%#')
+      ) {{
+        const separatorIndex = rule.indexOf('##');
+        const domainPart = rule.slice(0, separatorIndex).trim();
+        const selector = rule.slice(separatorIndex + 2).trim();
+        if (!selector) continue;
+
+        cssEntries.push({{ domains: domainPart, selector }});
       }}
     }}
 
-    function isExcepted(sel) {{
-      if (exceptions['*'] && exceptions['*'].indexOf(sel) !== -1) return true;
-      for (const domain in exceptions) {{
-        if (domain === '*') continue;
-        if (domainMatches(domain) && exceptions[domain].indexOf(sel) !== -1) return true;
+    function isExcepted(selector) {{
+      const globalExceptions = exceptions.get('*');
+      if (globalExceptions && globalExceptions.has(selector)) return true;
+
+      for (const [domain, selectors] of exceptions.entries()) {{
+        if (domain !== '*' && domainMatches(domain) && selectors.has(selector)) {{
+          return true;
+        }}
       }}
       return false;
     }}
 
-    const selectors = [];
+    const selectors = new Set();
+
     for (const entry of cssEntries) {{
       if (isExcepted(entry.selector)) continue;
+
       if (!entry.domains) {{
-        selectors.push(entry.selector);
-      }} else {{
-        for (const d of entry.domains.split(',')) {{
-          if (domainMatches(d.trim())) {{
-            selectors.push(entry.selector);
+        selectors.add(entry.selector);
+        continue;
+      }}
+
+      const domainList = entry.domains
+        .split(',')
+        .map(domain => domain.trim())
+        .filter(Boolean);
+
+      let included = false;
+      let excluded = false;
+
+      for (const domainEntry of domainList) {{
+        if (domainEntry.startsWith('~')) {{
+          if (domainMatches(domainEntry.slice(1))) {{
+            excluded = true;
             break;
           }}
+        }} else if (domainMatches(domainEntry)) {{
+          included = true;
         }}
+      }}
+
+      const hasPositiveDomains = domainList.some(domain => !domain.startsWith('~'));
+      if (!excluded && (included || !hasPositiveDomains)) {{
+        selectors.add(entry.selector);
       }}
     }}
 
-    if (selectors.length > 0) {{
-      const valid = [];
-      for (const sel of selectors) {{
-        try {{ document.querySelector(sel); valid.push(sel); }} catch(e) {{}}
-      }}
-      if (valid.length > 0) {{
-        const css = valid.join(', ') + ' {{ display: none !important; }}';
-        if (typeof GM_addStyle === 'function') {{
-          GM_addStyle(css);
-        }} else {{
-          const style = document.createElement('style');
-          style.textContent = css;
-          (document.head || document.documentElement).appendChild(style);
-        }}
+    const validSelectors = [];
+
+    for (const selector of selectors) {{
+      try {{
+        document.querySelector(selector);
+        validSelectors.push(selector);
+      }} catch (error) {{
+        console.debug('[PyGuardDNS] Invalid or unsupported selector:', selector);
       }}
     }}
 
-    return selectors;
+    const css = validSelectors.length > 0
+      ? validSelectors.join(',\\n') + '\\n{{\\n  display: none !important;\\n}}'
+      : '';
+
+    setCosmeticCss(css);
+    return validSelectors;
   }}
 
   function reportToLog(applied) {{
-    if (!applied || !applied.length) return;
+    if (!Array.isArray(applied) || applied.length === 0) return;
+
     try {{
       GM_xmlhttpRequest({{
         method: 'POST',
         url: LOG_URL,
-        headers: {{ 'Content-Type': 'application/json', 'X-API-Token': API_TOKEN }},
+        headers: {{
+          'Content-Type': 'application/json',
+          'X-API-Token': API_TOKEN
+        }},
         data: JSON.stringify({{
           domain: hostname,
           url: location.href,
@@ -7455,66 +7529,100 @@ def generate_cosmetic_userscript(api_base, api_token=""):
         }}),
         timeout: 5000
       }});
-    }} catch (e) {{}}
+    }} catch (error) {{
+      console.debug('[PyGuardDNS] Log request failed:', error);
+    }}
   }}
 
-  function applyCached() {{
+  function readCachedRules() {{
     try {{
       const cached = GM_getValue(CACHE_KEY, '');
-      if (cached) return parseAndApply(JSON.parse(cached));
-    }} catch (e) {{}}
-    return [];
+      if (!cached) return [];
+
+      const rules = JSON.parse(cached);
+      return Array.isArray(rules) ? rules : [];
+    }} catch (error) {{
+      console.warn('[PyGuardDNS] Cached rules are invalid:', error);
+      return [];
+    }}
   }}
 
-  function fetchAndApply() {{
+  function applyCachedImmediately() {{
+    const cachedRules = readCachedRules();
+    if (cachedRules.length === 0) return [];
+
+    const applied = parseAndApply(cachedRules);
+    console.debug('[PyGuardDNS] Applied', applied.length, 'cached selectors on', hostname);
+    return applied;
+  }}
+
+  function buildFreshApiUrl() {{
+    const separator = API_URL.includes('?') ? '&' : '?';
+    return API_URL + separator + '_pyguarddns_cache_bust=' + Date.now();
+  }}
+
+  function fetchAndApplyFresh() {{
     GM_xmlhttpRequest({{
       method: 'GET',
-      url: API_URL,
-      headers: {{ 'X-API-Token': API_TOKEN }},
+      url: buildFreshApiUrl(),
+      headers: {{
+        'X-API-Token': API_TOKEN,
+        'Cache-Control': 'no-cache, no-store, max-age=0',
+        'Pragma': 'no-cache',
+        'Expires': '0'
+      }},
       responseType: 'json',
       timeout: 10000,
-      onload: function(resp) {{
+
+      onload: function (response) {{
         try {{
-          if (resp.status !== 200) {{
-            console.warn('[PyGuardDNS] API returned', resp.status, resp.statusText);
-            const applied = applyCached();
-            reportToLog(applied);
+          if (response.status !== 200) {{
+            console.warn('[PyGuardDNS] API returned', response.status, response.statusText);
             return;
           }}
-          const data = typeof resp.response === 'string' ? JSON.parse(resp.response) : resp.response;
-          const rules = data.rules || [];
-          console.log('[PyGuardDNS] Fetched', rules.length, 'cosmetic rules');
+
+          const data = typeof response.response === 'string'
+            ? JSON.parse(response.response)
+            : response.response;
+
+          const rules = Array.isArray(data)
+            ? data
+            : Array.isArray(data?.rules)
+              ? data.rules
+              : [];
+
           GM_setValue(CACHE_KEY, JSON.stringify(rules));
           GM_setValue(CACHE_TS_KEY, Date.now());
+
           const applied = parseAndApply(rules);
-          console.log('[PyGuardDNS] Applied', applied.length, 'selectors on', hostname);
+
+          console.log(
+            '[PyGuardDNS] Fetched',
+            rules.length,
+            'fresh rules and applied',
+            applied.length,
+            'selectors on',
+            hostname
+          );
+
           reportToLog(applied);
-        }} catch (e) {{
-          console.warn('[PyGuardDNS] Parse error:', e);
-          const applied = applyCached();
-          reportToLog(applied);
+        }} catch (error) {{
+          console.warn('[PyGuardDNS] API response parse error:', error);
         }}
       }},
-      onerror: function(err) {{
-        console.warn('[PyGuardDNS] Fetch error:', err.statusText || 'network error');
-        const applied = applyCached();
-        reportToLog(applied);
+
+      onerror: function (error) {{
+        console.warn('[PyGuardDNS] Fetch error:', error.statusText || 'network error');
       }},
-      ontimeout: function() {{
+
+      ontimeout: function () {{
         console.warn('[PyGuardDNS] Fetch timeout');
-        const applied = applyCached();
-        reportToLog(applied);
       }}
     }});
   }}
 
-  const lastFetch = GM_getValue(CACHE_TS_KEY, 0);
-  if (Date.now() - lastFetch < CACHE_TTL) {{
-    const applied = applyCached();
-    reportToLog(applied);
-  }} else {{
-    fetchAndApply();
-  }}
+  applyCachedImmediately();
+  fetchAndApplyFresh();
 }})();
 """
 
