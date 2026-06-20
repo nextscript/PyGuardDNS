@@ -10859,7 +10859,13 @@ class WebHandler(BaseHTTPRequestHandler):
             self._send_cors_json({"rules": all_rules, "count": len(all_rules)})
         elif path == "/api/cosmeticlists/userscript":
             host_header = self.headers.get("Host", f"localhost:{WEB_PORT}")
-            api_base = f"http://{host_header}"
+            proto = self.headers.get("X-Forwarded-Proto", "").strip()
+            if not proto:
+                referer = self.headers.get("Referer", "")
+                proto = "https" if referer.startswith("https://") else ""
+            if not proto:
+                proto = "https" if getattr(self.connection, "getpeercert", None) else "http"
+            api_base = f"{proto}://{host_header}"
             api_token = get_setting(API_TOKEN_SETTING, "")
             script = generate_cosmetic_userscript(api_base, api_token)
             body = script.encode("utf-8")
