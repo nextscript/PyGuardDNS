@@ -7421,13 +7421,19 @@ def generate_cosmetic_userscript(api_base, api_token=""):
     }}
 
     if (selectors.length > 0) {{
-      const css = selectors.join(', ') + ' {{ display: none !important; }}';
-      if (typeof GM_addStyle === 'function') {{
-        GM_addStyle(css);
-      }} else {{
-        const style = document.createElement('style');
-        style.textContent = css;
-        (document.head || document.documentElement).appendChild(style);
+      const valid = [];
+      for (const sel of selectors) {{
+        try {{ document.querySelector(sel); valid.push(sel); }} catch(e) {{}}
+      }}
+      if (valid.length > 0) {{
+        const css = valid.join(', ') + ' {{ display: none !important; }}';
+        if (typeof GM_addStyle === 'function') {{
+          GM_addStyle(css);
+        }} else {{
+          const style = document.createElement('style');
+          style.textContent = css;
+          (document.head || document.documentElement).appendChild(style);
+        }}
       }}
     }}
 
@@ -7469,22 +7475,33 @@ def generate_cosmetic_userscript(api_base, api_token=""):
       timeout: 10000,
       onload: function(resp) {{
         try {{
+          if (resp.status !== 200) {{
+            console.warn('[PyGuardDNS] API returned', resp.status, resp.statusText);
+            const applied = applyCached();
+            reportToLog(applied);
+            return;
+          }}
           const data = typeof resp.response === 'string' ? JSON.parse(resp.response) : resp.response;
           const rules = data.rules || [];
+          console.log('[PyGuardDNS] Fetched', rules.length, 'cosmetic rules');
           GM_setValue(CACHE_KEY, JSON.stringify(rules));
           GM_setValue(CACHE_TS_KEY, Date.now());
           const applied = parseAndApply(rules);
+          console.log('[PyGuardDNS] Applied', applied.length, 'selectors on', hostname);
           reportToLog(applied);
         }} catch (e) {{
+          console.warn('[PyGuardDNS] Parse error:', e);
           const applied = applyCached();
           reportToLog(applied);
         }}
       }},
-      onerror: function() {{
+      onerror: function(err) {{
+        console.warn('[PyGuardDNS] Fetch error:', err.statusText || 'network error');
         const applied = applyCached();
         reportToLog(applied);
       }},
       ontimeout: function() {{
+        console.warn('[PyGuardDNS] Fetch timeout');
         const applied = applyCached();
         reportToLog(applied);
       }}
