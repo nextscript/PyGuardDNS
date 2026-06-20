@@ -18,7 +18,7 @@ RULES_DIR = os.path.join("data", "rules")
 RULES_FILE = os.path.join(RULES_DIR, "user_rules.pgrules")
 BACKUP_DIR = os.path.join(RULES_DIR, "backups")
 
-PREFIXES = frozenset({"bd::", "bs::", "br::", "ad::", "as::", "ar::"})
+PREFIXES = frozenset({"bd::", "bs::", "br::", "ad::", "as::", "ar::", "cm::"})
 BLOCK_PREFIXES = frozenset({"bd::", "bs::", "br::"})
 ALLOW_PREFIXES = frozenset({"ad::", "as::", "ar::"})
 
@@ -29,6 +29,7 @@ PREFIX_MEANING = {
     "ad::": "allow exact domain",
     "as::": "allow suffix domain",
     "ar::": "allow regex",
+    "cm::": "cosmetic rule",
 }
 
 DANGEROUS_REGEX_MESSAGE = "Pattern is too broad or may cause excessive CPU usage."
@@ -349,10 +350,15 @@ def parse_rule_line(line: str) -> Optional[dict]:
         if is_dangerous_regex(pattern):
             return {"error": DANGEROUS_REGEX_MESSAGE, "line": line}
         return {"action": "allow", "type": "regex", "pattern": pattern, "raw": line, "prefix": "ar::"}
+    if line.startswith("cm::"):
+        pattern = line[4:].strip()
+        if not pattern:
+            return {"error": "Missing pattern after cm::", "line": line}
+        return {"action": "cosmetic", "type": "cosmetic", "pattern": pattern, "raw": line, "prefix": "cm::"}
 
     prefix = line.split("::")[0] + "::" if "::" in line else ""
     if prefix and prefix not in PREFIXES:
-        return {"error": f'Invalid prefix "{prefix}"\nExpected: bd::  bs::  br::  ad::  as::  ar::', "line": line}
+        return {"error": f'Invalid prefix "{prefix}"\nExpected: bd::  bs::  br::  ad::  as::  ar::  cm::', "line": line}
     return {"error": "Unrecognized rule syntax", "line": line}
 
 
@@ -370,7 +376,7 @@ def validate_rules(text: str) -> list:
 
 
 def count_rules(text: str) -> dict:
-    counts = {"block_exact": 0, "block_suffix": 0, "block_regex": 0, "allow_exact": 0, "allow_suffix": 0, "allow_regex": 0, "total": 0}
+    counts = {"block_exact": 0, "block_suffix": 0, "block_regex": 0, "allow_exact": 0, "allow_suffix": 0, "allow_regex": 0, "cosmetic": 0, "total": 0}
     for raw_line in text.split("\n"):
         line = raw_line.strip()
         if not line or line.startswith("#") or line.startswith("!"):
@@ -392,6 +398,9 @@ def count_rules(text: str) -> dict:
             counts["total"] += 1
         elif line.startswith("ar::"):
             counts["allow_regex"] += 1
+            counts["total"] += 1
+        elif line.startswith("cm::"):
+            counts["cosmetic"] += 1
             counts["total"] += 1
     return counts
 
@@ -814,6 +823,9 @@ def build_indexes_from_cache(cache: dict, engine) -> dict:
             compiled = re.compile(pattern, re.IGNORECASE)
             engine.regex_allow.add(compiled, f"/{pattern}/")
             engine._track_source(f"/{pattern}/", source)
+        elif prefix == "cm::":
+            engine.cosmetic_rules.append(pattern)
+            engine._track_source(pattern, source)
         counts["valid"] += 1
     return counts
 

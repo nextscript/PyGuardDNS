@@ -171,6 +171,7 @@ class FilterEngine:
         self.rewrite_map: dict[str, str] = {}
         self.rewrite_wildcard: dict[str, str] = {}
         self.rewrite_domain_type: dict[str, str] = {}
+        self.cosmetic_rules: list[str] = []
         self.invalid_rules: list[str] = []
         self.pattern_sources: dict[str, set[str]] = {}
 
@@ -747,6 +748,9 @@ class FilterEngine:
             compiled = re.compile(pattern, re.IGNORECASE)
             self.regex_allow.add(compiled, f"/{pattern}/")
             self._track_source(f"/{pattern}/", list_name)
+        elif prefix == "cm::":
+            self.cosmetic_rules.append(pattern)
+            self._track_source(pattern, list_name)
         self._bump_generation()
 
     def track_source(self, key: str, list_name: str) -> None:
