@@ -14,7 +14,7 @@ By default, the application listens on DNS port `53` for UDP/TCP and serves the 
 - Web dashboard with live statistics, query log, top domains, blocked requests, and client overview
 - Query-log actions for one-click global or profile allow/block rules
 - Blocklist management from remote URLs or pasted text, including rollback-safe updates
-- Support for hosts files, Adblock/uBlock rules, wildcards, regex rules, and uMatrix lists
+- Support for hosts files, Adblock/uBlock rules, wildcards, regex rules, cosmetic rules, and uMatrix lists
 - Support for plain text, `.gz`, and `.zip` blocklists
 - ETag and Last-Modified support for efficient unchanged blocklist checks
 - Import reporting with valid, unique, duplicate, regex, allow, and block counts
@@ -184,6 +184,7 @@ PyGuardDNS uses two rule formats: the **pgrules format** for custom rules in `da
 | `ad::` | Allow | Allow exact domain | `ad::trusted.com` |
 | `as::` | Allow | Allow domain + all subdomains | `as::trusted.com` |
 | `ar::` | Allow | Allow by regex | `ar::/.*\.trusted\.com/` |
+| `cm::` | Cosmetic | Browser-side cosmetic filter rule | `cm::example.com##.ad-banner` |
 
 ### Adblock/uBlock Format (Blocklist Imports)
 
@@ -235,6 +236,7 @@ Allow rules always take precedence over block rules. Once a rule matches, evalua
 - `bs::` / `as::` (suffix) matches the given domain **and** all subdomains – `bs::example.com` blocks `example.com`, `sub.example.com`, `deep.sub.example.com`
 - `*.example.com` is treated like `bs::example.com`
 - `br::` / `ar::` (regex) are compiled case-insensitively and tested against the entire domain
+- `cm::` (cosmetic) stores browser-side element hiding rules (e.g. AdBlock `##` selectors) that do not affect DNS resolution but are served to browser extensions via the Cosmetic Lists API
 
 **Regex optimization:** Regex rules go through a literal index. Only regexes whose required literals appear in the queried domain are actually executed. Regexes with alternation (`|`) or optional groups (`?`) fall through to the fallback path and are tested on every query.
 
@@ -515,5 +517,8 @@ data/root.key             Root DNSKEYs in BIND format (optional override)
 data/trust_anchors.json   RFC 5011 trust anchor state
 requirements.txt          Runtime Python dependencies
 start-pyguarddns.bat      Windows start script
+start-pyguarddns.sh       Linux/macOS start script
+```
+
 start-pyguarddns.sh       Linux/macOS start script
 ```
