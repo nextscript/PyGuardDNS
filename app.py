@@ -7335,7 +7335,7 @@ setInterval(refreshBlocklistJobStatus, 1000);
 </div>""", "Blocklists")
 
 
-def generate_cosmetic_userscript(api_base, api_token="", embedded_rules=None):
+def generate_cosmetic_userscript(api_base, api_token=""):
     base = api_base.rstrip("/")
     api_url = base + "/api/cosmeticlists/all-rules"
     log_url = base + "/api/cosmeticlists/log"
@@ -7344,17 +7344,14 @@ def generate_cosmetic_userscript(api_base, api_token="", embedded_rules=None):
         connect_host = urlparse(base).hostname or "*"
     except Exception:
         connect_host = "*"
-    embedded_json = json.dumps(embedded_rules or [], ensure_ascii=False)
     return f"""// ==UserScript==
 // @name         PyGuardDNS Cosmetic Filter
 // @namespace    pyguarddns
-// @version      2.1
-// @description  Fetches cosmetic rules live from PyGuardDNS API, refreshes them on every page load and applies element hiding
+// @version      3.0
+// @description  Fetches cosmetic rules live from PyGuardDNS API on every page load and applies element hiding
 // @match        *://*/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
-// @grant        GM_getValue
-// @grant        GM_setValue
 // @connect      {connect_host}
 // ==/UserScript==
 
@@ -7364,11 +7361,7 @@ def generate_cosmetic_userscript(api_base, api_token="", embedded_rules=None):
   const API_URL = '{api_url}';
   const LOG_URL = '{log_url}';
   const API_TOKEN = '{api_token}';
-
-  const CACHE_KEY = 'pyguarddns_cosmetic_rules';
-  const CACHE_TS_KEY = 'pyguarddns_cosmetic_ts';
   const STYLE_ID = 'pyguarddns-cosmetic-style';
-  const EMBEDDED_RULES = {embedded_json};
 
   const hostname = location.hostname.toLowerCase();
 
@@ -7389,19 +7382,13 @@ def generate_cosmetic_userscript(api_base, api_token="", embedded_rules=None):
 
   function getOrCreateStyleElement() {{
     let style = document.getElementById(STYLE_ID);
-
     if (!style) {{
       style = document.createElement('style');
       style.id = STYLE_ID;
       style.type = 'text/css';
       (document.head || document.documentElement).appendChild(style);
     }}
-
     return style;
-  }}
-
-  function setCosmeticCss(css) {{
-    getOrCreateStyleElement().textContent = css;
   }}
 
   function parseAndApply(rules) {{
@@ -7410,7 +7397,6 @@ def generate_cosmetic_userscript(api_base, api_token="", embedded_rules=None):
 
     for (const rawRule of rules) {{
       if (typeof rawRule !== 'string') continue;
-
       const rule = rawRule.trim();
       if (!rule || rule.startsWith('!') || rule.startsWith('[')) continue;
 
@@ -7419,11 +7405,9 @@ def generate_cosmetic_userscript(api_base, api_token="", embedded_rules=None):
         const domainPart = rule.slice(0, separatorIndex).trim();
         const selector = rule.slice(separatorIndex + 3).trim();
         if (!selector) continue;
-
         const domains = domainPart
           ? domainPart.split(',').map(normalizeDomain).filter(Boolean)
           : ['*'];
-
         for (const domain of domains) {{
           if (!exceptions.has(domain)) exceptions.set(domain, new Set());
           exceptions.get(domain).add(selector);
@@ -7441,7 +7425,6 @@ def generate_cosmetic_userscript(api_base, api_token="", embedded_rules=None):
         const domainPart = rule.slice(0, separatorIndex).trim();
         const selector = rule.slice(separatorIndex + 2).trim();
         if (!selector) continue;
-
         cssEntries.push({{ domains: domainPart, selector }});
       }}
     }}
@@ -7449,7 +7432,6 @@ def generate_cosmetic_userscript(api_base, api_token="", embedded_rules=None):
     function isExcepted(selector) {{
       const globalExceptions = exceptions.get('*');
       if (globalExceptions && globalExceptions.has(selector)) return true;
-
       for (const [domain, selectors] of exceptions.entries()) {{
         if (domain !== '*' && domainMatches(domain) && selectors.has(selector)) {{
           return true;
@@ -7462,20 +7444,16 @@ def generate_cosmetic_userscript(api_base, api_token="", embedded_rules=None):
 
     for (const entry of cssEntries) {{
       if (isExcepted(entry.selector)) continue;
-
       if (!entry.domains) {{
         selectors.add(entry.selector);
         continue;
       }}
-
       const domainList = entry.domains
         .split(',')
         .map(domain => domain.trim())
         .filter(Boolean);
-
       let included = false;
       let excluded = false;
-
       for (const domainEntry of domainList) {{
         if (domainEntry.startsWith('~')) {{
           if (domainMatches(domainEntry.slice(1))) {{
@@ -7486,7 +7464,6 @@ def generate_cosmetic_userscript(api_base, api_token="", embedded_rules=None):
           included = true;
         }}
       }}
-
       const hasPositiveDomains = domainList.some(domain => !domain.startsWith('~'));
       if (!excluded && (included || !hasPositiveDomains)) {{
         selectors.add(entry.selector);
@@ -7494,27 +7471,24 @@ def generate_cosmetic_userscript(api_base, api_token="", embedded_rules=None):
     }}
 
     const validSelectors = [];
-
     for (const selector of selectors) {{
       try {{
         document.querySelector(selector);
         validSelectors.push(selector);
       }} catch (error) {{
-        console.debug('[PyGuardDNS] Invalid or unsupported selector:', selector);
+        console.debug('[PyGuardDNS] Invalid selector:', selector);
       }}
     }}
 
     const css = validSelectors.length > 0
       ? validSelectors.join(',\\n') + '\\n{{\\n  display: none !important;\\n}}'
       : '';
-
-    setCosmeticCss(css);
+    getOrCreateStyleElement().textContent = css;
     return validSelectors;
   }}
 
   function reportToLog(applied) {{
     if (!Array.isArray(applied) || applied.length === 0) return;
-
     try {{
       GM_xmlhttpRequest({{
         method: 'POST',
@@ -7536,98 +7510,46 @@ def generate_cosmetic_userscript(api_base, api_token="", embedded_rules=None):
     }}
   }}
 
-  function readCachedRules() {{
-    try {{
-      const cached = GM_getValue(CACHE_KEY, '');
-      if (!cached) return [];
+  GM_xmlhttpRequest({{
+    method: 'GET',
+    url: API_URL + (API_URL.includes('?') ? '&' : '?') + '_t=' + Date.now(),
+    headers: {{
+      'X-API-Token': API_TOKEN,
+      'Cache-Control': 'no-store'
+    }},
+    responseType: 'json',
+    timeout: 10000,
 
-      const rules = JSON.parse(cached);
-      return Array.isArray(rules) ? rules : [];
-    }} catch (error) {{
-      console.warn('[PyGuardDNS] Cached rules are invalid:', error);
-      return [];
-    }}
-  }}
-
-  function applyCachedImmediately() {{
-    let rules = readCachedRules();
-    if (rules.length === 0 && EMBEDDED_RULES.length > 0) {{
-      rules = EMBEDDED_RULES;
-    }}
-    if (rules.length === 0) return [];
-
-    const applied = parseAndApply(rules);
-    console.debug('[PyGuardDNS] Applied', applied.length, 'cached selectors on', hostname);
-    return applied;
-  }}
-
-  function buildFreshApiUrl() {{
-    const separator = API_URL.includes('?') ? '&' : '?';
-    return API_URL + separator + '_pyguarddns_cache_bust=' + Date.now();
-  }}
-
-  function fetchAndApplyFresh() {{
-    GM_xmlhttpRequest({{
-      method: 'GET',
-      url: buildFreshApiUrl(),
-      headers: {{
-        'X-API-Token': API_TOKEN,
-        'Cache-Control': 'no-cache, no-store, max-age=0',
-        'Pragma': 'no-cache',
-        'Expires': '0'
-      }},
-      responseType: 'json',
-      timeout: 10000,
-
-      onload: function (response) {{
-        try {{
-          if (response.status !== 200) {{
-            console.warn('[PyGuardDNS] API returned', response.status, response.statusText);
-            return;
-          }}
-
-          const data = typeof response.response === 'string'
-            ? JSON.parse(response.response)
-            : response.response;
-
-          const rules = Array.isArray(data)
-            ? data
-            : Array.isArray(data?.rules)
-              ? data.rules
-              : [];
-
-          GM_setValue(CACHE_KEY, JSON.stringify(rules));
-          GM_setValue(CACHE_TS_KEY, Date.now());
-
-          const applied = parseAndApply(rules);
-
-          console.log(
-            '[PyGuardDNS] Fetched',
-            rules.length,
-            'fresh rules and applied',
-            applied.length,
-            'selectors on',
-            hostname
-          );
-
-          reportToLog(applied);
-        }} catch (error) {{
-          console.warn('[PyGuardDNS] API response parse error:', error);
+    onload: function (response) {{
+      try {{
+        if (response.status !== 200) {{
+          console.warn('[PyGuardDNS] API returned', response.status, response.statusText);
+          return;
         }}
-      }},
-
-      onerror: function (error) {{
-        console.warn('[PyGuardDNS] Fetch error:', error.statusText || 'network error');
-      }},
-
-      ontimeout: function () {{
-        console.warn('[PyGuardDNS] Fetch timeout');
+        const data = typeof response.response === 'string'
+          ? JSON.parse(response.response)
+          : response.response;
+        const rules = Array.isArray(data)
+          ? data
+          : Array.isArray(data?.rules)
+            ? data.rules
+            : [];
+        const applied = parseAndApply(rules);
+        console.log('[PyGuardDNS] Applied', applied.length, '/', rules.length, 'rules on', hostname);
+        reportToLog(applied);
+      }} catch (error) {{
+        console.warn('[PyGuardDNS] API response parse error:', error);
       }}
-    }});
-  }}
+    }},
 
-  applyCachedImmediately();
-  fetchAndApplyFresh();
+    onerror: function (error) {{
+      console.warn('[PyGuardDNS] Fetch error:', error.statusText || 'network error');
+    }},
+
+    ontimeout: function () {{
+      console.warn('[PyGuardDNS] Fetch timeout');
+    }}
+  }});
 }})();
 """
 
@@ -10575,6 +10497,7 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-API-Token, Authorization")
@@ -11021,17 +10944,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 proto = "https" if getattr(self.connection, "getpeercert", None) else "http"
             api_base = f"{proto}://{host_header}"
             api_token = get_setting(API_TOKEN_SETTING, "")
-            all_cosmetic = []
-            for bl in (blocklist_manager.get_all() if blocklist_manager else []):
-                all_cosmetic.extend(read_cosmetic_rules(str(bl["id"])))
-            user_rules_text = read_rules()
-            for raw_line in user_rules_text.split("\n"):
-                line = raw_line.strip()
-                if line.startswith("cm::"):
-                    pattern = line[4:].strip()
-                    if pattern:
-                        all_cosmetic.append(pattern)
-            script = generate_cosmetic_userscript(api_base, api_token, all_cosmetic)
+            script = generate_cosmetic_userscript(api_base, api_token)
             body = script.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/javascript; charset=utf-8")
