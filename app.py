@@ -7335,7 +7335,7 @@ setInterval(refreshBlocklistJobStatus, 1000);
 </div>""", "Blocklists")
 
 
-def generate_cosmetic_userscript(api_base, api_token=""):
+def generate_cosmetic_userscript(api_base, api_token="", embedded_rules=None):
     base = api_base.rstrip("/")
     api_url = base + "/api/cosmeticlists/all-rules"
     log_url = base + "/api/cosmeticlists/log"
@@ -7344,6 +7344,7 @@ def generate_cosmetic_userscript(api_base, api_token=""):
         connect_host = urlparse(base).hostname or "*"
     except Exception:
         connect_host = "*"
+    embedded_json = json.dumps(embedded_rules or [], ensure_ascii=False)
     return f"""// ==UserScript==
 // @name         PyGuardDNS Cosmetic Filter
 // @namespace    pyguarddns
@@ -7367,6 +7368,7 @@ def generate_cosmetic_userscript(api_base, api_token=""):
   const CACHE_KEY = 'pyguarddns_cosmetic_rules';
   const CACHE_TS_KEY = 'pyguarddns_cosmetic_ts';
   const STYLE_ID = 'pyguarddns-cosmetic-style';
+  const EMBEDDED_RULES = {embedded_json};
 
   const hostname = location.hostname.toLowerCase();
 
@@ -7548,10 +7550,13 @@ def generate_cosmetic_userscript(api_base, api_token=""):
   }}
 
   function applyCachedImmediately() {{
-    const cachedRules = readCachedRules();
-    if (cachedRules.length === 0) return [];
+    let rules = readCachedRules();
+    if (rules.length === 0 && EMBEDDED_RULES.length > 0) {{
+      rules = EMBEDDED_RULES;
+    }}
+    if (rules.length === 0) return [];
 
-    const applied = parseAndApply(cachedRules);
+    const applied = parseAndApply(rules);
     console.debug('[PyGuardDNS] Applied', applied.length, 'cached selectors on', hostname);
     return applied;
   }}
@@ -10572,7 +10577,7 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-API-Token, Authorization")
         self.end_headers()
         self.wfile.write(body)
 
@@ -10582,7 +10587,7 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_response(204)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-API-Token, Authorization")
             self.send_header("Access-Control-Max-Age", "86400")
             self.end_headers()
         else:
@@ -11016,7 +11021,17 @@ class WebHandler(BaseHTTPRequestHandler):
                 proto = "https" if getattr(self.connection, "getpeercert", None) else "http"
             api_base = f"{proto}://{host_header}"
             api_token = get_setting(API_TOKEN_SETTING, "")
-            script = generate_cosmetic_userscript(api_base, api_token)
+            all_cosmetic = []
+            for bl in (blocklist_manager.get_all() if blocklist_manager else []):
+                all_cosmetic.extend(read_cosmetic_rules(str(bl["id"])))
+            user_rules_text = read_rules()
+            for raw_line in user_rules_text.split("\n"):
+                line = raw_line.strip()
+                if line.startswith("cm::"):
+                    pattern = line[4:].strip()
+                    if pattern:
+                        all_cosmetic.append(pattern)
+            script = generate_cosmetic_userscript(api_base, api_token, all_cosmetic)
             body = script.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/javascript; charset=utf-8")
