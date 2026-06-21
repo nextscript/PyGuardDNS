@@ -893,7 +893,7 @@ def init_db():
             "filtering_enabled": "1",
             "cache_enabled": "1",
             "cache_ttl": "300",
-            "cache_size": "4194304",
+            "cache_size": "1048576",
             "cache_min_ttl": "0",
             "cache_max_ttl": "0",
             "cache_optimistic": "0",
