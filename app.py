@@ -7347,11 +7347,13 @@ def generate_cosmetic_userscript(api_base, api_token=""):
     return f"""// ==UserScript==
 // @name         PyGuardDNS Cosmetic Filter
 // @namespace    pyguarddns
-// @version      3.0
-// @description  Fetches cosmetic rules live from PyGuardDNS API on every page load and applies element hiding
+// @version      4.0
+// @description  Applies cached cosmetic rules instantly, refreshes from API in background
 // @match        *://*/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
 // @connect      {connect_host}
 // ==/UserScript==
 
@@ -7362,6 +7364,7 @@ def generate_cosmetic_userscript(api_base, api_token=""):
   const LOG_URL = '{log_url}';
   const API_TOKEN = '{api_token}';
   const STYLE_ID = 'pyguarddns-cosmetic-style';
+  const CACHE_TTL = 30 * 60 * 1000;
 
   const hostname = location.hostname.toLowerCase();
 
@@ -7510,46 +7513,73 @@ def generate_cosmetic_userscript(api_base, api_token=""):
     }}
   }}
 
-  GM_xmlhttpRequest({{
-    method: 'GET',
-    url: API_URL + (API_URL.includes('?') ? '&' : '?') + '_t=' + Date.now(),
-    headers: {{
-      'X-API-Token': API_TOKEN,
-      'Cache-Control': 'no-store'
-    }},
-    responseType: 'json',
-    timeout: 10000,
+  function saveCache(rules) {{
+    try {{
+      GM_setValue('cosmetic_rules', JSON.stringify(rules));
+      GM_setValue('cosmetic_ts', Date.now());
+    }} catch (e) {{}}
+  }}
 
-    onload: function (response) {{
-      try {{
-        if (response.status !== 200) {{
-          console.warn('[PyGuardDNS] API returned', response.status, response.statusText);
-          return;
-        }}
-        const data = typeof response.response === 'string'
-          ? JSON.parse(response.response)
-          : response.response;
-        const rules = Array.isArray(data)
-          ? data
-          : Array.isArray(data?.rules)
-            ? data.rules
-            : [];
-        const applied = parseAndApply(rules);
-        console.log('[PyGuardDNS] Applied', applied.length, '/', rules.length, 'rules on', hostname);
-        reportToLog(applied);
-      }} catch (error) {{
-        console.warn('[PyGuardDNS] API response parse error:', error);
-      }}
-    }},
-
-    onerror: function (error) {{
-      console.warn('[PyGuardDNS] Fetch error:', error.statusText || 'network error');
-    }},
-
-    ontimeout: function () {{
-      console.warn('[PyGuardDNS] Fetch timeout');
+  function loadCache() {{
+    try {{
+      const raw = GM_getValue('cosmetic_rules', '');
+      if (!raw) return null;
+      return JSON.parse(raw);
+    }} catch (e) {{
+      return null;
     }}
-  }});
+  }}
+
+  function isCacheFresh() {{
+    try {{
+      const ts = GM_getValue('cosmetic_ts', 0);
+      return (Date.now() - ts) < CACHE_TTL;
+    }} catch (e) {{
+      return false;
+    }}
+  }}
+
+  function fetchAndApply() {{
+    GM_xmlhttpRequest({{
+      method: 'GET',
+      url: API_URL,
+      headers: {{ 'X-API-Token': API_TOKEN }},
+      responseType: 'json',
+      timeout: 10000,
+
+      onload: function (response) {{
+        try {{
+          if (response.status !== 200) return;
+          const data = typeof response.response === 'string'
+            ? JSON.parse(response.response)
+            : response.response;
+          const rules = Array.isArray(data)
+            ? data
+            : Array.isArray(data?.rules)
+              ? data.rules
+              : [];
+          saveCache(rules);
+          const applied = parseAndApply(rules);
+          console.log('[PyGuardDNS] Refreshed', applied.length, '/', rules.length, 'rules on', hostname);
+          reportToLog(applied);
+        }} catch (error) {{
+          console.warn('[PyGuardDNS] API response parse error:', error);
+        }}
+      }},
+
+      onerror: function () {{}},
+      ontimeout: function () {{}}
+    }});
+  }}
+
+  const cached = loadCache();
+  if (cached) {{
+    const applied = parseAndApply(cached);
+    console.log('[PyGuardDNS] Cache hit:', applied.length, 'rules on', hostname);
+    if (!isCacheFresh()) fetchAndApply();
+  }} else {{
+    fetchAndApply();
+  }}
 }})();
 """
 
