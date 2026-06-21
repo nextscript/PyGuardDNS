@@ -132,24 +132,28 @@ DB_PATH = os.environ.get("LOCALDNSGUARD_DB", "localdnsguard.sqlite3")
 DB_MEMORY_SYNC_INTERVAL = float(os.environ.get("LOCALDNSGUARD_DB_MEMORY_SYNC_INTERVAL", "60"))
 
 
-def _read_db_in_memory_setting():
-    env = os.environ.get("LOCALDNSGUARD_DB_IN_MEMORY")
-    if env is not None:
-        return env == "1"
+def _read_startup_setting(key, default):
     if os.path.exists(DB_PATH):
         try:
             tmp = sqlite3.connect(DB_PATH, timeout=2)
             try:
-                row = tmp.execute("SELECT value FROM settings WHERE key='db_in_memory'").fetchone()
+                row = tmp.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
                 if row:
-                    return row[0] == "1"
+                    return row[0]
             except Exception:
                 pass
             finally:
                 tmp.close()
         except Exception:
             pass
-    return True
+    return default
+
+
+def _read_db_in_memory_setting():
+    env = os.environ.get("LOCALDNSGUARD_DB_IN_MEMORY")
+    if env is not None:
+        return env == "1"
+    return _read_startup_setting("db_in_memory", "1") == "1"
 
 
 DB_IN_MEMORY = _read_db_in_memory_setting()
@@ -776,8 +780,16 @@ def sync_memory_db_to_disk(force=False):
             memory_db_dirty.clear()
 
 
+def _get_sync_interval():
+    try:
+        val = float(get_setting("db_memory_sync_interval", str(DB_MEMORY_SYNC_INTERVAL)))
+        return max(5.0, val)
+    except (ValueError, TypeError):
+        return DB_MEMORY_SYNC_INTERVAL
+
+
 def memory_db_sync_loop():
-    while not memory_db_sync_stop.wait(DB_MEMORY_SYNC_INTERVAL):
+    while not memory_db_sync_stop.wait(_get_sync_interval()):
         try:
             sync_memory_db_to_disk()
         except Exception:
@@ -966,6 +978,7 @@ def init_db():
             "encrypted_dns_certificate_pem": "",
             "encrypted_dns_private_key_pem": "",
             "db_in_memory": "1" if DB_IN_MEMORY else "0",
+            "db_memory_sync_interval": str(int(DB_MEMORY_SYNC_INTERVAL)),
         }
         for key, value in defaults.items():
             db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, value))
@@ -8707,6 +8720,11 @@ def settings_page(message="", is_error=False, values=None):
       <div class="settings-section-body settings-stack">
         {switch("db_in_memory", "In-Memory Database", "Load the SQLite database into RAM at startup and sync changes back to disk periodically. Faster queries but uses more memory.", "1")}
         <div class="settings-help">Currently <strong>{'active' if DB_IN_MEMORY else 'inactive'}</strong>. Changes take effect after restart.</div>
+        <div>
+          <label class="form-label">Memory Sync Interval (seconds)</label>
+          <input class="form-control" name="db_memory_sync_interval" type="number" min="5" max="3600" value="{html_escape(value('db_memory_sync_interval', str(int(DB_MEMORY_SYNC_INTERVAL))))}">
+          <div class="settings-help">How often the in-memory database is synced back to disk. Lower values reduce data loss risk, higher values improve performance. Minimum 5 seconds.</div>
+        </div>
       </div>
     </section>
 
@@ -10341,6 +10359,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 "dns_over_quic_enabled", "dns_over_quic_port",
                 "encrypted_dns_certificate_pem", "encrypted_dns_private_key_pem",
                 "db_in_memory",
+                "db_memory_sync_interval",
             ]
             try:
                 parse_port(form.get("localdnsguard_web_port", WEB_PORT), WEB_PORT, "LOCALDNSGUARD_WEB_PORT")
@@ -10357,6 +10376,9 @@ class WebHandler(BaseHTTPRequestHandler):
                 doh_ps_val = int(form.get("doh_pool_size", "4") or "4")
                 if doh_ps_val < 1 or doh_ps_val > 64:
                     raise ValueError("DoH Pool Size must be between 1 and 64")
+                sync_iv = int(form.get("db_memory_sync_interval", "60") or "60")
+                if sync_iv < 5 or sync_iv > 3600:
+                    raise ValueError("Memory Sync Interval must be between 5 and 3600 seconds")
                 parse_positive_float(form.get("upstream_timeout", "2.5"), 2.5, "Upstream timeout")
                 parse_positive_float(form.get("tcp_connect_timeout", "3.0"), 3.0, "TCP connect timeout")
                 parse_positive_float(form.get("tls_handshake_timeout", "4.0"), 4.0, "TLS handshake timeout")
