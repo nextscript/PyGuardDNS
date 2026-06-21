@@ -364,25 +364,144 @@ or:
 X-API-Token: <token>
 ```
 
-Useful endpoints:
+All endpoints are also documented in the built-in API page at `/api-docs` in the web interface.
 
-- `GET /api/status`
-- `GET /api/dashboard`
-- `GET /api/explain?domain=example.com&client=127.0.0.1`
-- `GET /api/querylog`
-- `GET /api/querylog.csv`
-- `POST /api/querylog/rule-action`
-- `GET /api/rules`
-- `GET /api/blocklists`
-- `POST /api/blocklists/update-all`
-- `GET /api/clients`
-- `GET /api/profiles`
-- `GET /api/upstreams`
-- `POST /api/cache/clear`
-- `GET /api/backup`
-- `GET /api/metrics`
-- `GET /api/runtime_metrics`
-- `GET /metrics`
+### Status & Dashboard
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | `/api/status` | System status, DNS and web port, statistics summary |
+| `GET` | `/api/dashboard` | Live dashboard data: statistics for the last 24 h, sparklines, top domains, top clients. Use `?refresh=1` to bypass the cache |
+| `GET` | `/api/stats/summary` | Short statistics: total requests, blocked requests, cache rate, clients, uptime |
+| `GET` | `/api/stats/breakdown` | Total vs. blocked requests for the last 24 h, 7 days, 30 days, and all-time |
+| `GET` | `/api/stats/cache` | Cache statistics |
+| `GET` | `/api/explain?domain=...&client=...` | Decision explanation for a domain with step-by-step path |
+
+### Query Log
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | `/api/querylog` | All retained DNS requests as JSON. Supports `q`, `client`, and `status` filters |
+| `GET` | `/api/querylog.csv` | Download the retained query log as a CSV file |
+| `POST` | `/api/querylog/rule-action` | Create a rule from a query log entry (one-click allow/block) |
+
+### Filtering
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `POST` | `/api/filtering/pause` | Disable filtering (Protection Enabled off) |
+| `POST` | `/api/filtering/resume` | Enable filtering (Protection Enabled on) |
+| `POST` | `/api/domain-test` | Test a domain through the decision pipeline |
+
+### Rules
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | `/api/rules` | All custom rules with parsed metadata |
+
+### Blocklists
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | `/api/blocklists` | All configured blocklists |
+| `GET` | `/api/blocklists/stats` | Blocklist statistics |
+| `GET` | `/api/blocklists/update-status` | Current background blocklist update progress |
+| `GET` | `/api/blocklists/job-status` | Status of running import, delete, and toggle jobs |
+| `GET` | `/api/blocklists/{id}/report` | Cache info and import report for a blocklist |
+| `POST` | `/api/blocklists/add` | Add a blocklist by URL or paste content |
+| `POST` | `/api/blocklists/update` | Re-download and reload one blocklist |
+| `POST` | `/api/blocklists/update-all` | Update all remote blocklists |
+| `POST` | `/api/blocklists/delete` | Delete a blocklist and its entries |
+
+### Cosmetic Lists
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | `/api/cosmeticlists` | All blocklists that contain cosmetic rules |
+| `GET` | `/api/cosmeticlists/user` | Cosmetic rules from user rules (`cm::` prefix) |
+| `GET` | `/api/cosmeticlists/{id}` | Cosmetic rules for a specific blocklist |
+| `GET` | `/api/cosmeticlists/all-rules` | All cosmetic rules merged from all blocklists and user rules |
+| `GET` | `/api/cosmeticlists/userscript` | Download the cosmetic filter userscript (Tampermonkey/Greasemonkey) |
+| `POST` | `/api/cosmeticlists/log` | Log cosmetic rule application from the browser userscript |
+
+### Clients
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | `/api/clients` | All saved clients with profile info |
+| `GET` | `/api/clients/{id}` | Single client details |
+| `POST` | `/api/clients` | Create or update a client |
+| `PUT` | `/api/clients/{id}` | Update a client |
+| `DELETE` | `/api/clients/{id}` | Delete a client |
+
+### Profiles
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | `/api/profiles` | All profiles |
+| `GET` | `/api/profiles/{id}` | Single profile details |
+| `POST` | `/api/profiles` | Create a profile |
+| `PUT` | `/api/profiles/{id}` | Update a profile |
+| `DELETE` | `/api/profiles/{id}` | Delete a profile (reassigns clients to Default) |
+| `GET` | `/api/profiles/{id}/rules` | Custom rules for a profile |
+| `POST` | `/api/profiles/{id}/rules` | Add a custom rule to a profile |
+| `DELETE` | `/api/profiles/{id}/rules/{rule_id}` | Delete a profile custom rule |
+| `GET` | `/api/profiles/{id}/blocklists` | Blocklists attached to a profile |
+| `POST` | `/api/profiles/{id}/blocklists` | Attach a blocklist to a profile |
+| `DELETE` | `/api/profiles/{id}/blocklists/{bl_id}` | Detach a blocklist from a profile |
+| `GET` | `/api/profiles/{id}/services` | Blocked services for a profile |
+| `POST` | `/api/profiles/{id}/services/add` | Add a service block to a profile |
+| `POST` | `/api/profiles/{id}/services/remove` | Remove a service block from a profile |
+| `DELETE` | `/api/profiles/{id}/services/{service}` | Remove a service block from a profile |
+| `GET` | `/api/services` | List all available service names for service blocking |
+
+### Upstreams
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | `/api/upstreams` | All configured upstream resolvers with latency and status |
+| `GET` | `/api/upstreams/detect?resolver=...` | Detect upstream type automatically |
+| `GET` | `/api/upstreams/health` | Health status for all upstreams |
+| `POST` | `/api/upstreams/test` | Test upstream and measure latency |
+| `POST` | `/api/upstreams/health/pause` | Toggle pause state for an upstream |
+
+### Cache
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `POST` | `/api/cache/clear` | Clear the whole DNS cache |
+
+### Backup & Restore
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | `/api/backup` | Download settings backup as JSON (settings, blocklists, rules, DNS rewrites, upstreams, profiles, clients) |
+| `POST` | `/api/restore` | Restore from a backup file |
+| `POST` | `/api/restore-preview` | Preview what a backup restore would change |
+
+### Updates
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | `/api/update/check` | Check GitHub for new commits. Use `?force=1` to bypass the 6-hour cache |
+| `POST` | `/api/update/apply` | Download and install the latest update from GitHub, then restart |
+
+### Audit Log & API Tokens
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | `/api/audit-log` | Audit log entries. Supports `limit` and `offset` parameters |
+| `POST` | `/api/audit-log/clear` | Clear the audit log |
+| `GET` | `/api/api-tokens` | List all API tokens |
+| `POST` | `/api/api-tokens` | Create or delete an API token (`action=create` or `action=delete`) |
+
+### Metrics
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | `/api/metrics` | All metrics as JSON |
+| `GET` | `/api/runtime_metrics` | DNS hot-path counters as JSON (cache hits/misses, filter decisions, upstream errors, query-log drops, queue sizes) |
+| `GET` | `/metrics` | Prometheus-compatible metrics |
 
 `/metrics` returns Prometheus-compatible metrics, including query counts, block rate, cache rate, active clients, upstreams, DoT/DoQ pool values, runtime counters, and DNSSEC validation results. `/api/runtime_metrics` returns the same DNS hot-path counters as JSON, such as cache hits/misses, filter decisions, upstream errors, query-log drops, queue sizes, and `unknown_client_dropped_total`.
 
