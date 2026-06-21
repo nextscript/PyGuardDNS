@@ -528,7 +528,7 @@ class BlocklistManager:
         entries = parse_filter_list(text, default_action="block" if list_type == "cosmetic" else list_type)
         if list_type == "allow":
             entries = [(action, pt, pattern) for action, pt, pattern in entries if action == "allow"]
-        result = convert_blocklist_text(text, "_tmp", source)
+        result = convert_blocklist_text(text, "_tmp", source, list_type=list_type)
         cosmetic_rules = result["cosmetic"]
         if list_type == "cosmetic":
             if not cosmetic_rules:
@@ -564,7 +564,7 @@ class BlocklistManager:
             self.db.commit()
         bl_id_val = curs.lastrowid
         list_id_str = str(bl_id_val)
-        result_full = convert_blocklist_text(text, list_id_str, source)
+        result_full = convert_blocklist_text(text, list_id_str, source, list_type=list_type)
         save_blocklist_cache(list_id_str, result_full["cache"])
         save_cosmetic_rules(list_id_str, result_full["cosmetic"])
         save_unsupported_rules(list_id_str, result_full["unsupported"])
@@ -650,7 +650,7 @@ class BlocklistManager:
                 entries = parse_filter_list(text, default_action="block" if list_type == "cosmetic" else list_type)
                 if list_type == "allow":
                     entries = [(action, pt, pattern) for action, pt, pattern in entries if action == "allow"]
-                result_conv = convert_blocklist_text(text, "_tmp_upd", item.get("url", ""))
+                result_conv = convert_blocklist_text(text, "_tmp_upd", item.get("url", ""), list_type=list_type)
                 cosmetic_rules = result_conv["cosmetic"]
                 if list_type == "cosmetic":
                     if not cosmetic_rules:
@@ -675,7 +675,7 @@ class BlocklistManager:
                     )
                     self.db.commit()
                 list_id_str = str(list_id)
-                result = convert_blocklist_text(text, list_id_str, item.get("url", ""))
+                result = convert_blocklist_text(text, list_id_str, item.get("url", ""), list_type=list_type)
                 save_blocklist_cache(list_id_str, result["cache"])
                 save_cosmetic_rules(list_id_str, result["cosmetic"])
                 save_unsupported_rules(list_id_str, result["unsupported"])
@@ -933,7 +933,10 @@ class BlocklistManager:
             except Exception as exc:
                 return {"ok": False, "error": str(exc)}
         list_id_str = str(list_id)
-        result = convert_blocklist_text(text, list_id_str, item.get("url", ""))
+        list_type = item.get("list_type", "block")
+        if list_type not in ("allow", "cosmetic"):
+            list_type = "block"
+        result = convert_blocklist_text(text, list_id_str, item.get("url", ""), list_type=list_type)
         save_blocklist_cache(list_id_str, result["cache"])
         save_cosmetic_rules(list_id_str, result["cosmetic"])
         save_unsupported_rules(list_id_str, result["unsupported"])

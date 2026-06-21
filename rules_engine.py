@@ -652,9 +652,20 @@ def import_lines(lines: list) -> ImportResult:
     return result
 
 
-def convert_blocklist_text(text: str, list_id: str, source_url: str = "") -> dict:
+_BLOCK_TO_ALLOW_PREFIX = {"bd::": "ad::", "bs::": "as::", "br::": "ar::"}
+
+
+def convert_blocklist_text(text: str, list_id: str, source_url: str = "", list_type: str = "block") -> dict:
     lines = text.splitlines()
     result = import_lines(lines)
+    converted = result.converted
+    if list_type == "allow":
+        converted = [
+            _BLOCK_TO_ALLOW_PREFIX.get(r[:4], r[:4]) + r[4:]
+            if len(r) > 4 and r[:4] in _BLOCK_TO_ALLOW_PREFIX
+            else r
+            for r in converted
+        ]
     sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
     cache = {
         "version": 1,
@@ -664,7 +675,7 @@ def convert_blocklist_text(text: str, list_id: str, source_url: str = "") -> dic
         "converted_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "counts": {
             "raw": len(lines),
-            "converted": len(result.converted),
+            "converted": len(converted),
             "cosmetic": len(result.cosmetic),
             "browser_only": len(result.browser_only),
             "ignored": len(result.ignored),
@@ -673,7 +684,7 @@ def convert_blocklist_text(text: str, list_id: str, source_url: str = "") -> dic
             "disabled": len(result.disabled),
             "duplicates": len(result.duplicates),
         },
-        "rules": result.converted,
+        "rules": converted,
     }
     return {
         "cache": cache,

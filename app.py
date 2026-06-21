@@ -9333,7 +9333,7 @@ def handle_restore_data(data):
             bl_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
             if content:
                 list_id_str = str(bl_id)
-                result = convert_blocklist_text(content, list_id_str, url)
+                result = convert_blocklist_text(content, list_id_str, url, list_type=list_type)
                 save_blocklist_cache(list_id_str, result["cache"])
                 save_cosmetic_rules(list_id_str, result["cosmetic"])
                 save_unsupported_rules(list_id_str, result["unsupported"])
@@ -10568,7 +10568,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 bl_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
                 if content:
                     list_id_str = str(bl_id)
-                    result = convert_blocklist_text(content, list_id_str, url)
+                    result = convert_blocklist_text(content, list_id_str, url, list_type=list_type)
                     save_blocklist_cache(list_id_str, result["cache"])
                     save_cosmetic_rules(list_id_str, result["cosmetic"])
                     save_unsupported_rules(list_id_str, result["unsupported"])
