@@ -7347,8 +7347,8 @@ def generate_cosmetic_userscript(api_base, api_token=""):
     return f"""// ==UserScript==
 // @name         PyGuardDNS Cosmetic Filter
 // @namespace    pyguarddns
-// @version      4.0
-// @description  Applies cached cosmetic rules instantly, refreshes from API in background
+// @version      4.1
+// @description  Injects cached CSS instantly (no flicker), refreshes from API in background
 // @match        *://*/*
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
@@ -7367,6 +7367,19 @@ def generate_cosmetic_userscript(api_base, api_token=""):
   const CACHE_TTL = 30 * 60 * 1000;
 
   const hostname = location.hostname.toLowerCase();
+  const cssKey = 'cosmetic_css_' + hostname;
+
+  // ── Instant injection from per-domain CSS cache ──────────────────
+  const cachedCss = GM_getValue(cssKey, '');
+  if (cachedCss) {{
+    const s = document.createElement('style');
+    s.id = STYLE_ID;
+    s.type = 'text/css';
+    s.textContent = cachedCss;
+    (document.head || document.documentElement).appendChild(s);
+  }}
+
+  // ── Helpers ──────────────────────────────────────────────────────
 
   function normalizeDomain(domain) {{
     return String(domain || '')
@@ -7394,7 +7407,7 @@ def generate_cosmetic_userscript(api_base, api_token=""):
     return style;
   }}
 
-  function parseAndApply(rules) {{
+  function buildCss(rules) {{
     const cssEntries = [];
     const exceptions = new Map();
 
@@ -7478,20 +7491,23 @@ def generate_cosmetic_userscript(api_base, api_token=""):
       try {{
         document.querySelector(selector);
         validSelectors.push(selector);
-      }} catch (error) {{
-        console.debug('[PyGuardDNS] Invalid selector:', selector);
-      }}
+      }} catch (error) {{}}
     }}
 
-    const css = validSelectors.length > 0
-      ? validSelectors.join(',\\n') + '\\n{{\\n  display: none !important;\\n}}'
-      : '';
-    getOrCreateStyleElement().textContent = css;
-    return validSelectors;
+    return {{
+      css: validSelectors.length > 0
+        ? validSelectors.join(',\\n') + '\\n{{\\n  display: none !important;\\n}}'
+        : '',
+      selectors: validSelectors
+    }};
   }}
 
-  function reportToLog(applied) {{
-    if (!Array.isArray(applied) || applied.length === 0) return;
+  function applyCss(css) {{
+    getOrCreateStyleElement().textContent = css;
+  }}
+
+  function reportToLog(selectors) {{
+    if (!Array.isArray(selectors) || selectors.length === 0) return;
     try {{
       GM_xmlhttpRequest({{
         method: 'POST',
@@ -7503,37 +7519,17 @@ def generate_cosmetic_userscript(api_base, api_token=""):
         data: JSON.stringify({{
           domain: hostname,
           url: location.href,
-          applied: applied.slice(0, 20),
-          count: applied.length
+          applied: selectors.slice(0, 20),
+          count: selectors.length
         }}),
         timeout: 5000
       }});
-    }} catch (error) {{
-      console.debug('[PyGuardDNS] Log request failed:', error);
-    }}
-  }}
-
-  function saveCache(rules) {{
-    try {{
-      GM_setValue('cosmetic_rules', JSON.stringify(rules));
-      GM_setValue('cosmetic_ts', Date.now());
-    }} catch (e) {{}}
-  }}
-
-  function loadCache() {{
-    try {{
-      const raw = GM_getValue('cosmetic_rules', '');
-      if (!raw) return null;
-      return JSON.parse(raw);
-    }} catch (e) {{
-      return null;
-    }}
+    }} catch (error) {{}}
   }}
 
   function isCacheFresh() {{
     try {{
-      const ts = GM_getValue('cosmetic_ts', 0);
-      return (Date.now() - ts) < CACHE_TTL;
+      return (Date.now() - GM_getValue('cosmetic_ts', 0)) < CACHE_TTL;
     }} catch (e) {{
       return false;
     }}
@@ -7558,12 +7554,17 @@ def generate_cosmetic_userscript(api_base, api_token=""):
             : Array.isArray(data?.rules)
               ? data.rules
               : [];
-          saveCache(rules);
-          const applied = parseAndApply(rules);
-          console.log('[PyGuardDNS] Refreshed', applied.length, '/', rules.length, 'rules on', hostname);
-          reportToLog(applied);
+
+          GM_setValue('cosmetic_rules', JSON.stringify(rules));
+          GM_setValue('cosmetic_ts', Date.now());
+
+          const result = buildCss(rules);
+          GM_setValue(cssKey, result.css);
+          applyCss(result.css);
+          console.log('[PyGuardDNS] Refreshed', result.selectors.length, '/', rules.length, 'rules on', hostname);
+          reportToLog(result.selectors);
         }} catch (error) {{
-          console.warn('[PyGuardDNS] API response parse error:', error);
+          console.warn('[PyGuardDNS] API error:', error);
         }}
       }},
 
@@ -7572,13 +7573,24 @@ def generate_cosmetic_userscript(api_base, api_token=""):
     }});
   }}
 
-  const cached = loadCache();
-  if (cached) {{
-    const applied = parseAndApply(cached);
-    console.log('[PyGuardDNS] Cache hit:', applied.length, 'rules on', hostname);
+  // ── Main flow ────────────────────────────────────────────────────
+  if (cachedCss) {{
+    console.log('[PyGuardDNS] Instant CSS inject on', hostname);
     if (!isCacheFresh()) fetchAndApply();
   }} else {{
-    fetchAndApply();
+    const cached = GM_getValue('cosmetic_rules', '');
+    if (cached) {{
+      try {{
+        const rules = JSON.parse(cached);
+        const result = buildCss(rules);
+        GM_setValue(cssKey, result.css);
+        applyCss(result.css);
+        console.log('[PyGuardDNS] Built CSS from rule cache:', result.selectors.length, 'on', hostname);
+      }} catch (e) {{}}
+      if (!isCacheFresh()) fetchAndApply();
+    }} else {{
+      fetchAndApply();
+    }}
   }}
 }})();
 """
