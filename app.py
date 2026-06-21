@@ -956,7 +956,7 @@ def init_db():
             "custom_block_ipv4": "0.0.0.0",
             "custom_block_ipv6": "::",
             "lan_only": "1",
-            "dnssec_validation_enabled": "1",
+            "dnssec_validation_enabled": "0",
             "filter_update_interval_hours": "24",
             "allowed_networks": "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128,fc00::/7",
             "query_log_enabled": "1",
