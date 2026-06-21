@@ -743,10 +743,13 @@ class DNSSECValidator:
     def _get_upstream_response(self, qname, rdtype, want_dnssec=True):
         try:
             msg = dns.message.make_query(qname, rdtype, want_dnssec=want_dnssec)
-            msg.use_edns(edns=True, payload=1232, ednsflags=dns.flags.DO)
+            msg.use_edns(edns=True, payload=4096, ednsflags=dns.flags.DO)
             msg.flags |= dns.flags.CD
             if self._query_func is not None:
-                return dns.message.from_wire(self._query_func(msg.to_wire()))
+                response = dns.message.from_wire(self._query_func(msg.to_wire()))
+                if response.flags & dns.flags.TC:
+                    logger.debug("DNSSEC upstream response truncated for %s %s", qname, rdtype)
+                return response
             if self._resolver is None:
                 return None
             response = self._resolver.resolve(qname, rdtype, raise_on_no_answer=False)
@@ -755,7 +758,7 @@ class DNSSECValidator:
             return None
         except dns.resolver.NXDOMAIN:
             msg = dns.message.make_query(qname, rdtype, want_dnssec=True)
-            msg.use_edns(edns=True, payload=1232, ednsflags=dns.flags.DO)
+            msg.use_edns(edns=True, payload=4096, ednsflags=dns.flags.DO)
             try:
                 response = self._resolver.resolve(qname, rdtype)
                 return response.response
