@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from dnssec_validator import (
     DNSSECCache,
+    DNSSECLookupFailure,
     DNSSECValidationResult,
     DNSSECValidationStatus,
     DNSSECValidator,
@@ -514,6 +515,54 @@ class TestNSEC3Proofs(TestDNSSECValidatorBase):
         metrics = get_dnssec_metrics()
         self.assertEqual(metrics["secure"], 3)
         self.assertEqual(metrics["bogus"], 1)
+
+
+class TestDNSSECLookupFailure(TestDNSSECValidatorBase):
+    """Infrastructure failures (timeout, missing DNSKEY, missing RRSIG) must
+    return INDETERMINATE, not BOGUS, so the response passes through instead
+    of being blocked with SERVFAIL."""
+
+    def _make_signed_response(self, qname="proton.me", qtype="A"):
+        qmsg, rmsg = self._make_query_response(qname, qtype)
+        self._add_a_answer(rmsg, qname)
+        qname_obj = dns.name.from_text(qname)
+        rrsig_rrset = dns.rrset.RRset(qname_obj, dns.rdataclass.IN, dns.rdatatype.RRSIG)
+        rrsig_rdata = dns.rdata.from_text(
+            dns.rdataclass.IN, dns.rdatatype.RRSIG,
+            "A 8 2 300 20260101000000 20250101000000 12345 proton.me. AAAA",
+        )
+        rrsig_rrset.add(rrsig_rdata)
+        rrsig_rrset.ttl = 300
+        rmsg.answer.append(rrsig_rrset)
+        return qmsg, rmsg
+
+    def test_dnskey_fetch_failure_returns_indeterminate(self):
+        """When DNSKEY fetch fails (timeout), result must be INDETERMINATE."""
+        def failing_query(wire):
+            raise Exception("timeout")
+
+        validator = DNSSECValidator(query_func=failing_query)
+        validator._anchor_ok = True
+
+        qmsg, rmsg = self._make_signed_response()
+        result = validator.validate_response(qmsg, rmsg)
+        self.assertEqual(result.status, DNSSECValidationStatus.INDETERMINATE)
+        self.assertNotEqual(result.status, DNSSECValidationStatus.BOGUS)
+
+    def test_lookup_failure_exception_is_distinct_from_validation_failure(self):
+        self.assertNotIsInstance(DNSSECLookupFailure("test"), dns.dnssec.ValidationFailure)
+
+    def test_dnskey_none_raises_lookup_failure_not_validation_failure(self):
+        """_validated_zone_keys must raise DNSSECLookupFailure when root
+        DNSKEY fetch returns None, not ValidationFailure."""
+        def null_query(wire):
+            msg = dns.message.make_response(dns.message.from_wire(wire))
+            return msg.to_wire()
+
+        validator = DNSSECValidator(query_func=null_query)
+        validator._anchor_ok = True
+        with self.assertRaises(DNSSECLookupFailure):
+            validator._validated_zone_keys(dns.name.from_text("example.com."))
 
 
 if __name__ == "__main__":

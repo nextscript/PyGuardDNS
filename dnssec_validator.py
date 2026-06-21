@@ -31,6 +31,12 @@ DNSKEY_ZONE_FLAG = 0x0100
 DNSKEY_SEP_FLAG = 0x0001
 NSEC3_OPT_OUT_FLAG = 0x01
 
+
+class DNSSECLookupFailure(Exception):
+    """DNSSEC chain validation could not complete due to missing data (fetch
+    failure, timeout, upstream stripping RRSIG).  This is NOT a cryptographic
+    failure — it indicates an infrastructure issue."""
+
 _EMBEDDED_ROOT_ANCHOR_XML = """\
 <?xml version="1.0" encoding="UTF-8"?>
 <TrustAnchor id="0C05FDD6-422C-4910-8ED6-430ED15E11C2" source="http://data.iana.org/root-anchors/root-anchors.xml">
@@ -873,7 +879,7 @@ class DNSSECValidator:
         chain = self._zone_chain(zone)
         root_dnskey, root_rrsig, _ = self._fetch_rrset(dns.name.root, dns.rdatatype.DNSKEY)
         if root_dnskey is None:
-            raise dns.dnssec.ValidationFailure("missing root DNSKEY RRset")
+            raise DNSSECLookupFailure("root DNSKEY fetch failed")
         if not self._root_anchor_matches(root_dnskey):
             raise dns.dnssec.ValidationFailure("root DNSKEY does not match local trust anchor")
         if root_rrsig is not None:
@@ -886,12 +892,16 @@ class DNSSECValidator:
             ds_rrset, ds_rrsig, _ = self._fetch_rrset(child_zone, dns.rdatatype.DS)
             if ds_rrset is None:
                 raise LookupError(f"insecure delegation proven or DS missing for {child_zone.to_text()}")
+            if ds_rrsig is None:
+                raise DNSSECLookupFailure(f"DS RRSIG missing for {child_zone.to_text()} (upstream may not return DNSSEC records)")
             self._validate_rrset_with_keys(ds_rrset, ds_rrsig, {current_zone: current_keys}, f"{child_zone.to_text()} DS")
             child_dnskey, child_rrsig, _ = self._fetch_rrset(child_zone, dns.rdatatype.DNSKEY)
             if child_dnskey is None:
-                raise dns.dnssec.ValidationFailure(f"missing DNSKEY RRset for {child_zone.to_text()}")
+                raise DNSSECLookupFailure(f"DNSKEY fetch failed for {child_zone.to_text()}")
             if not self._dnskey_matches_ds(child_zone, child_dnskey, ds_rrset):
                 raise dns.dnssec.ValidationFailure(f"DNSKEY does not match parent DS for {child_zone.to_text()}")
+            if child_rrsig is None:
+                raise DNSSECLookupFailure(f"DNSKEY RRSIG missing for {child_zone.to_text()}")
             self._validate_rrset_with_keys(child_dnskey, child_rrsig, {child_zone: child_dnskey}, f"{child_zone.to_text()} DNSKEY")
             current_zone = child_zone
             current_keys = child_dnskey
@@ -1231,6 +1241,8 @@ class DNSSECValidator:
                         break
                     except LookupError:
                         raise
+                    except DNSSECLookupFailure:
+                        raise
                     except Exception as e:
                         last_error = e
                 if last_error is not None:
@@ -1251,6 +1263,12 @@ class DNSSECValidator:
             return DNSSECValidationResult(
                 DNSSECValidationStatus.INSECURE,
                 f"{reason_detail} below insecure delegation: {e}",
+            )
+        except DNSSECLookupFailure as e:
+            _incr_metric("indeterminate")
+            return DNSSECValidationResult(
+                DNSSECValidationStatus.INDETERMINATE,
+                f"{reason_detail} chain lookup failed: {e}",
             )
         except (dns.dnssec.ValidationFailure, dns.exception.DNSException) as e:
             _incr_metric("bogus")
@@ -1310,6 +1328,8 @@ class DNSSECValidator:
                             DNSSECValidationStatus.INSECURE,
                             f"signed-looking answer below insecure delegation: {e}",
                         )
+                    except DNSSECLookupFailure:
+                        raise
                     except Exception as e:
                         last_error = e
                 if not validated:
@@ -1334,6 +1354,16 @@ class DNSSECValidator:
                 "no answer RRsets with matching RRSIG records could be validated",
             )
 
+        except DNSSECLookupFailure as e:
+            logger.info(
+                "DNSSEC indeterminate %s %s reason=%s",
+                qname_str, dns.rdatatype.to_text(qtype), e,
+            )
+            _incr_metric("indeterminate")
+            return DNSSECValidationResult(
+                DNSSECValidationStatus.INDETERMINATE,
+                f"chain lookup failed: {e}",
+            )
         except (dns.dnssec.ValidationFailure, dns.exception.DNSException) as e:
             logger.warning(
                 "DNSSEC bogus %s %s reason=%s",

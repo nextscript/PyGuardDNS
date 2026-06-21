@@ -4959,7 +4959,7 @@ def handle_dns_request(request, client_ip, connection_type=""):
                 if validator:
                     dnssec_result = validator.validate_response(qmsg, rmsg)
                     dnssec_status = dnssec_result.status
-                    if dnssec_result.status in ("bogus", "indeterminate"):
+                    if dnssec_result.status == "bogus":
                         servfail_response = build_error_response(request, 2)
                         log_query(client_ip, domain, normalized, qtype_name, "blocked",
                                   upstream=upstream, matched_rule="dnssec_bogus",
