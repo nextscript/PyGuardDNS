@@ -188,8 +188,8 @@ doh_connection_cache = {}
 dnscrypt_cert_cache = {}
 rules_cache = None
 shutdown_signal_received = False
-dns_concurrency = threading.BoundedSemaphore(int(os.environ.get("LOCALDNSGUARD_MAX_DNS_WORKERS", "48")))
-upstream_concurrency = threading.BoundedSemaphore(int(os.environ.get("LOCALDNSGUARD_MAX_UPSTREAM_WORKERS", "64")))
+dns_concurrency = threading.BoundedSemaphore(int(os.environ.get("LOCALDNSGUARD_MAX_DNS_WORKERS", "8")))
+upstream_concurrency = threading.BoundedSemaphore(int(os.environ.get("LOCALDNSGUARD_MAX_UPSTREAM_WORKERS", "16")))
 db_write_queue = []
 db_write_lock = threading.Lock()
 upstream_metric_last_write = {}
@@ -1419,11 +1419,11 @@ def load_runtime_network_settings():
     DNS_HTTPS_PORT = parse_port(get_setting("dns_over_https_port", DNS_HTTPS_PORT), DNS_HTTPS_PORT, "DNS-over-HTTPS port")
     DNS_QUIC_PORT = parse_port(get_setting("dns_over_quic_port", DNS_QUIC_PORT), DNS_QUIC_PORT, "DNS-over-QUIC port")
     try:
-        dns_w = max(1, int(get_setting("max_dns_workers", "48") or "48"))
+        dns_w = max(1, int(get_setting("max_dns_workers", "8") or "8"))
     except (ValueError, TypeError):
         dns_w = 48
     try:
-        up_w = max(1, int(get_setting("max_upstream_workers", "64") or "64"))
+        up_w = max(1, int(get_setting("max_upstream_workers", "16") or "16"))
     except (ValueError, TypeError):
         up_w = 64
     dns_concurrency = threading.BoundedSemaphore(dns_w)
@@ -8633,8 +8633,8 @@ def settings_page(message="", is_error=False, values=None):
 
         <div class="settings-subhead">Concurrency Limits</div>
         <div class="settings-field-grid">
-          <div><label class="form-label">Max DNS Workers</label><input class="form-control" name="max_dns_workers" type="number" min="1" max="512" value="{html_escape(value('max_dns_workers', '48'))}"></div>
-          <div><label class="form-label">Max Upstream Workers</label><input class="form-control" name="max_upstream_workers" type="number" min="1" max="512" value="{html_escape(value('max_upstream_workers', '64'))}"></div>
+          <div><label class="form-label">Max DNS Workers</label><input class="form-control" name="max_dns_workers" type="number" min="1" max="512" value="{html_escape(value('max_dns_workers', '8'))}"></div>
+          <div><label class="form-label">Max Upstream Workers</label><input class="form-control" name="max_upstream_workers" type="number" min="1" max="512" value="{html_escape(value('max_upstream_workers', '16'))}"></div>
           <div><label class="form-label">DoT Pool Size</label><input class="form-control" name="dot_pool_size" type="number" min="1" max="64" value="{html_escape(value('dot_pool_size', '4'))}"></div>
           <div><label class="form-label">DoH Pool Size</label><input class="form-control" name="doh_pool_size" type="number" min="1" max="64" value="{html_escape(value('doh_pool_size', '4'))}"></div>
         </div>
@@ -10308,10 +10308,10 @@ class WebHandler(BaseHTTPRequestHandler):
             try:
                 parse_port(form.get("localdnsguard_web_port", WEB_PORT), WEB_PORT, "LOCALDNSGUARD_WEB_PORT")
                 parse_port(form.get("localdnsguard_dns_port", DNS_PORT), DNS_PORT, "LOCALDNSGUARD_DNS_PORT")
-                dns_w_val = int(form.get("max_dns_workers", "48") or "48")
+                dns_w_val = int(form.get("max_dns_workers", "8") or "8")
                 if dns_w_val < 1 or dns_w_val > 512:
                     raise ValueError("Max DNS Workers must be between 1 and 512")
-                up_w_val = int(form.get("max_upstream_workers", "64") or "64")
+                up_w_val = int(form.get("max_upstream_workers", "16") or "16")
                 if up_w_val < 1 or up_w_val > 512:
                     raise ValueError("Max Upstream Workers must be between 1 and 512")
                 dot_ps_val = int(form.get("dot_pool_size", "4") or "4")
