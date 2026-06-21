@@ -188,8 +188,8 @@ doh_connection_cache = {}
 dnscrypt_cert_cache = {}
 rules_cache = None
 shutdown_signal_received = False
-dns_concurrency = threading.BoundedSemaphore(int(os.environ.get("LOCALDNSGUARD_MAX_DNS_WORKERS", "8")))
-upstream_concurrency = threading.BoundedSemaphore(int(os.environ.get("LOCALDNSGUARD_MAX_UPSTREAM_WORKERS", "16")))
+dns_concurrency = threading.BoundedSemaphore(int(os.environ.get("LOCALDNSGUARD_MAX_DNS_WORKERS", "48")))
+upstream_concurrency = threading.BoundedSemaphore(int(os.environ.get("LOCALDNSGUARD_MAX_UPSTREAM_WORKERS", "64")))
 db_write_queue = []
 db_write_lock = threading.Lock()
 upstream_metric_last_write = {}
@@ -199,7 +199,9 @@ DOT_POOL_SIZE = max(1, int(os.environ.get("LOCALDNSGUARD_DOT_POOL_SIZE", "4")))
 dot_pools = {}
 dot_pool_counters = {}
 dot_pools_lock = threading.RLock()
+DOH_POOL_SIZE = max(1, int(os.environ.get("LOCALDNSGUARD_DOH_POOL_SIZE", "4")))
 doh_pools = {}
+doh_pool_counters = {}
 doh_pools_lock = threading.RLock()
 quic_sessions = {}
 quic_sessions_lock = threading.RLock()
@@ -1406,6 +1408,7 @@ def make_encrypted_dns_ssl_context():
 
 def load_runtime_network_settings():
     global WEB_HOST, WEB_PORT, DNS_HOST, DNS_PORT, ENCRYPTED_DNS_HOST, ENCRYPTED_DNS_DOMAIN, DNS_TLS_PORT, DNS_QUIC_PORT, DNS_HTTPS_PORT
+    global dns_concurrency, upstream_concurrency, DOT_POOL_SIZE, DOH_POOL_SIZE
     WEB_HOST = get_setting("localdnsguard_web_host", WEB_HOST).strip() or "0.0.0.0"
     WEB_PORT = parse_port(get_setting("localdnsguard_web_port", WEB_PORT), WEB_PORT, "Web port")
     DNS_HOST = get_setting("localdnsguard_dns_host", DNS_HOST).strip() or "0.0.0.0"
@@ -1415,6 +1418,26 @@ def load_runtime_network_settings():
     DNS_TLS_PORT = parse_port(get_setting("dns_over_tls_port", DNS_TLS_PORT), DNS_TLS_PORT, "DNS-over-TLS port")
     DNS_HTTPS_PORT = parse_port(get_setting("dns_over_https_port", DNS_HTTPS_PORT), DNS_HTTPS_PORT, "DNS-over-HTTPS port")
     DNS_QUIC_PORT = parse_port(get_setting("dns_over_quic_port", DNS_QUIC_PORT), DNS_QUIC_PORT, "DNS-over-QUIC port")
+    try:
+        dns_w = max(1, int(get_setting("max_dns_workers", "48") or "48"))
+    except (ValueError, TypeError):
+        dns_w = 48
+    try:
+        up_w = max(1, int(get_setting("max_upstream_workers", "64") or "64"))
+    except (ValueError, TypeError):
+        up_w = 64
+    dns_concurrency = threading.BoundedSemaphore(dns_w)
+    upstream_concurrency = threading.BoundedSemaphore(up_w)
+    try:
+        dot_ps = max(1, int(get_setting("dot_pool_size", "4") or "4"))
+    except (ValueError, TypeError):
+        dot_ps = 4
+    DOT_POOL_SIZE = dot_ps
+    try:
+        doh_ps = max(1, int(get_setting("doh_pool_size", "4") or "4"))
+    except (ValueError, TypeError):
+        doh_ps = 4
+    DOH_POOL_SIZE = doh_ps
 
 
 def hash_password(password):
@@ -2783,9 +2806,13 @@ def query_doh_upstream_pooled(upstream, request, timeout=4.0):
     with doh_pools_lock:
         pool = doh_pools.get(key)
         if pool is None:
-            pool = DohConnection(upstream)
+            pool = [DohConnection(upstream) for _ in range(DOH_POOL_SIZE)]
             doh_pools[key] = pool
-    return pool.query(request, timeout=timeout)
+            doh_pool_counters[key] = 0
+        idx = doh_pool_counters[key] % len(pool)
+        doh_pool_counters[key] = idx + 1
+        conn = pool[idx]
+    return conn.query(request, timeout=timeout)
 
 
 def doh_pool_metrics():
@@ -2800,10 +2827,11 @@ def doh_pool_metrics():
         totals["doh_pool_size"] = len(doh_pools)
         pools = list(doh_pools.values())
     for pool in pools:
-        with pool.lock:
-            metrics = pool.metrics()
-        for key, value in metrics.items():
-            totals[key] += value
+        for conn in pool:
+            with conn.lock:
+                metrics = conn.metrics()
+            for key, val in metrics.items():
+                totals[key] += val
     return totals
 
 
@@ -8603,6 +8631,14 @@ def settings_page(message="", is_error=False, values=None):
           <div><label class="form-label">DoH/3 Total Timeout</label><input class="form-control" name="doh3_total_timeout" type="number" min="0.1" step="0.1" value="{html_escape(value('doh3_total_timeout', '2.2'))}"></div>
         </div>
 
+        <div class="settings-subhead">Concurrency Limits</div>
+        <div class="settings-field-grid">
+          <div><label class="form-label">Max DNS Workers</label><input class="form-control" name="max_dns_workers" type="number" min="1" max="512" value="{html_escape(value('max_dns_workers', '48'))}"></div>
+          <div><label class="form-label">Max Upstream Workers</label><input class="form-control" name="max_upstream_workers" type="number" min="1" max="512" value="{html_escape(value('max_upstream_workers', '64'))}"></div>
+          <div><label class="form-label">DoT Pool Size</label><input class="form-control" name="dot_pool_size" type="number" min="1" max="64" value="{html_escape(value('dot_pool_size', '4'))}"></div>
+          <div><label class="form-label">DoH Pool Size</label><input class="form-control" name="doh_pool_size" type="number" min="1" max="64" value="{html_escape(value('doh_pool_size', '4'))}"></div>
+        </div>
+
         <div class="settings-subhead">Encrypted DNS Endpoints</div>
         <div class="settings-field-grid">
           <div><label class="form-label">Encrypted DNS Listen Host</label><input class="form-control" name="encrypted_dns_host" value="{html_escape(value('encrypted_dns_host', DNS_HOST))}"></div>
@@ -10264,6 +10300,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 "localdnsguard_dns_host", "localdnsguard_dns_port", "encrypted_dns_host", "encrypted_dns_domain",
                 "upstream_timeout", "tcp_connect_timeout", "tls_handshake_timeout", "dns_query_timeout",
                 "dnssec_validation_timeout", "doq_total_timeout", "doh3_total_timeout",
+                "max_dns_workers", "max_upstream_workers", "dot_pool_size", "doh_pool_size",
                 "dns_over_tls_enabled", "dns_over_tls_port", "dns_over_https_enabled", "dns_over_https_port",
                 "dns_over_quic_enabled", "dns_over_quic_port",
                 "encrypted_dns_certificate_pem", "encrypted_dns_private_key_pem",
@@ -10271,6 +10308,18 @@ class WebHandler(BaseHTTPRequestHandler):
             try:
                 parse_port(form.get("localdnsguard_web_port", WEB_PORT), WEB_PORT, "LOCALDNSGUARD_WEB_PORT")
                 parse_port(form.get("localdnsguard_dns_port", DNS_PORT), DNS_PORT, "LOCALDNSGUARD_DNS_PORT")
+                dns_w_val = int(form.get("max_dns_workers", "48") or "48")
+                if dns_w_val < 1 or dns_w_val > 512:
+                    raise ValueError("Max DNS Workers must be between 1 and 512")
+                up_w_val = int(form.get("max_upstream_workers", "64") or "64")
+                if up_w_val < 1 or up_w_val > 512:
+                    raise ValueError("Max Upstream Workers must be between 1 and 512")
+                dot_ps_val = int(form.get("dot_pool_size", "4") or "4")
+                if dot_ps_val < 1 or dot_ps_val > 64:
+                    raise ValueError("DoT Pool Size must be between 1 and 64")
+                doh_ps_val = int(form.get("doh_pool_size", "4") or "4")
+                if doh_ps_val < 1 or doh_ps_val > 64:
+                    raise ValueError("DoH Pool Size must be between 1 and 64")
                 parse_positive_float(form.get("upstream_timeout", "2.5"), 2.5, "Upstream timeout")
                 parse_positive_float(form.get("tcp_connect_timeout", "3.0"), 3.0, "TCP connect timeout")
                 parse_positive_float(form.get("tls_handshake_timeout", "4.0"), 4.0, "TLS handshake timeout")
