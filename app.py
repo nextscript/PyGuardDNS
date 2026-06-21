@@ -129,8 +129,30 @@ class PyGuardConnection(sqlite3.Connection):
 
 APP_NAME = "PyGuardDNS"
 DB_PATH = os.environ.get("LOCALDNSGUARD_DB", "localdnsguard.sqlite3")
-DB_IN_MEMORY = os.environ.get("LOCALDNSGUARD_DB_IN_MEMORY", "1") == "1"
 DB_MEMORY_SYNC_INTERVAL = float(os.environ.get("LOCALDNSGUARD_DB_MEMORY_SYNC_INTERVAL", "60"))
+
+
+def _read_db_in_memory_setting():
+    env = os.environ.get("LOCALDNSGUARD_DB_IN_MEMORY")
+    if env is not None:
+        return env == "1"
+    if os.path.exists(DB_PATH):
+        try:
+            tmp = sqlite3.connect(DB_PATH, timeout=2)
+            try:
+                row = tmp.execute("SELECT value FROM settings WHERE key='db_in_memory'").fetchone()
+                if row:
+                    return row[0] == "1"
+            except Exception:
+                pass
+            finally:
+                tmp.close()
+        except Exception:
+            pass
+    return True
+
+
+DB_IN_MEMORY = _read_db_in_memory_setting()
 
 
 def _get_ram_db_path():
@@ -943,6 +965,7 @@ def init_db():
             "dns_over_quic_port": str(DNS_QUIC_PORT),
             "encrypted_dns_certificate_pem": "",
             "encrypted_dns_private_key_pem": "",
+            "db_in_memory": "1" if DB_IN_MEMORY else "0",
         }
         for key, value in defaults.items():
             db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (key, value))
@@ -8677,6 +8700,19 @@ def settings_page(message="", is_error=False, values=None):
     <section class="settings-section">
       <div class="settings-section-head">
         <div>
+          <div class="settings-section-title">Database</div>
+          <div class="settings-section-subtitle">SQLite storage engine settings.</div>
+        </div>
+      </div>
+      <div class="settings-section-body settings-stack">
+        {switch("db_in_memory", "In-Memory Database", "Load the SQLite database into RAM at startup and sync changes back to disk periodically. Faster queries but uses more memory.", "1")}
+        <div class="settings-help">Currently <strong>{'active' if DB_IN_MEMORY else 'inactive'}</strong>. Changes take effect after restart.</div>
+      </div>
+    </section>
+
+    <section class="settings-section">
+      <div class="settings-section-head">
+        <div>
           <div class="settings-section-title">Filtering & Validation</div>
           <div class="settings-section-subtitle">Global DNS filtering controls.</div>
         </div>
@@ -10304,6 +10340,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 "dns_over_tls_enabled", "dns_over_tls_port", "dns_over_https_enabled", "dns_over_https_port",
                 "dns_over_quic_enabled", "dns_over_quic_port",
                 "encrypted_dns_certificate_pem", "encrypted_dns_private_key_pem",
+                "db_in_memory",
             ]
             try:
                 parse_port(form.get("localdnsguard_web_port", WEB_PORT), WEB_PORT, "LOCALDNSGUARD_WEB_PORT")
