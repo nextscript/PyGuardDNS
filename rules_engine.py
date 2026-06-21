@@ -666,6 +666,14 @@ def convert_blocklist_text(text: str, list_id: str, source_url: str = "", list_t
             else r
             for r in converted
         ]
+        for item in result.lines:
+            if item.generated_rules:
+                item.generated_rules = [
+                    _BLOCK_TO_ALLOW_PREFIX.get(r[:4], r[:4]) + r[4:]
+                    if len(r) > 4 and r[:4] in _BLOCK_TO_ALLOW_PREFIX
+                    else r
+                    for r in item.generated_rules
+                ]
     sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
     cache = {
         "version": 1,
@@ -688,7 +696,7 @@ def convert_blocklist_text(text: str, list_id: str, source_url: str = "", list_t
     }
     return {
         "cache": cache,
-        "converted": result.converted,
+        "converted": converted,
         "cosmetic": result.cosmetic,
         "browser_only": result.browser_only,
         "ignored": result.ignored,
