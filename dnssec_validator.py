@@ -476,6 +476,7 @@ class TrustAnchorStore:
 class DNSSECValidator:
     def __init__(self, upstream_resolver=None, trust_anchor_path=None, trust_anchor_key_path=None, trust_anchor_json_path=None, timeout=3.0, query_func=None):
         self._timeout = timeout
+        self._deadline = None
         self._cache = DNSSECCache()
         self._anchor = TrustAnchorStore(xml_path=trust_anchor_path, key_path=trust_anchor_key_path, json_path=trust_anchor_json_path)
         self._resolver = upstream_resolver
@@ -877,7 +878,9 @@ class DNSSECValidator:
             raise dns.dnssec.ValidationFailure("no root trust anchor loaded")
 
         chain = self._zone_chain(zone)
+        self._check_deadline()
         root_dnskey, root_rrsig, _ = self._fetch_rrset(dns.name.root, dns.rdatatype.DNSKEY)
+        self._check_deadline()
         if root_dnskey is None:
             raise DNSSECLookupFailure("root DNSKEY fetch failed")
         if not self._root_anchor_matches(root_dnskey):
@@ -889,13 +892,17 @@ class DNSSECValidator:
         current_keys = root_dnskey
         current_zone = dns.name.root
         for child_zone in chain[1:]:
+            self._check_deadline()
             ds_rrset, ds_rrsig, _ = self._fetch_rrset(child_zone, dns.rdatatype.DS)
+            self._check_deadline()
             if ds_rrset is None:
                 raise LookupError(f"insecure delegation proven or DS missing for {child_zone.to_text()}")
             if ds_rrsig is None:
                 raise DNSSECLookupFailure(f"DS RRSIG missing for {child_zone.to_text()} (upstream may not return DNSSEC records)")
             self._validate_rrset_with_keys(ds_rrset, ds_rrsig, {current_zone: current_keys}, f"{child_zone.to_text()} DS")
+            self._check_deadline()
             child_dnskey, child_rrsig, _ = self._fetch_rrset(child_zone, dns.rdatatype.DNSKEY)
+            self._check_deadline()
             if child_dnskey is None:
                 raise DNSSECLookupFailure(f"DNSKEY fetch failed for {child_zone.to_text()}")
             if not self._dnskey_matches_ds(child_zone, child_dnskey, ds_rrset):
@@ -1076,6 +1083,7 @@ class DNSSECValidator:
 
     def validate_response(self, query_message, response_message):
         start = time.perf_counter()
+        self._deadline = start + self._timeout
         try:
             question = query_message.question[0] if query_message and query_message.question else None
             if question:
@@ -1088,7 +1096,12 @@ class DNSSECValidator:
                 self._cache.set_validation(cache_key, result, 3600)
             return result
         finally:
+            self._deadline = None
             _add_validation_time(time.perf_counter() - start)
+
+    def _check_deadline(self):
+        if self._deadline is not None and time.perf_counter() > self._deadline:
+            raise DNSSECLookupFailure("validation exceeded time budget")
 
     def _validate_impl(self, query_message, response_message):
         if query_message is None or response_message is None:
