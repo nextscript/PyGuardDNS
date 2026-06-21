@@ -6671,6 +6671,7 @@ HaGeZi's Allowlist Referral: https://raw.githubusercontent.com/hagezi/dns-blockl
 Ealenn Allow: https://raw.githubusercontent.com/Ealenn/AdGuard-Home-List/gh-pages/AdGuard-Home-List.Allow.txt
 AdGuard Home Whitelist: https://raw.githubusercontent.com/hl2guide/AdGuard-Home-Whitelist/main/whitelist.txt
 kristerkari: https://raw.githubusercontent.com/kristerkari/umatrix-recipes/master/README.md
+anudeepND: https://raw.githubusercontent.com/anudeepND/whitelist/master/domains/whitelist.txt
 """
 
 
