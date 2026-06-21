@@ -7364,7 +7364,7 @@ def generate_cosmetic_userscript(api_base, api_token=""):
   const LOG_URL = '{log_url}';
   const API_TOKEN = '{api_token}';
   const STYLE_ID = 'pyguarddns-cosmetic-style';
-  const CACHE_TTL = 30 * 60 * 1000;
+  const CACHE_TTL = 10 * 1000;
 
   const hostname = location.hostname.toLowerCase();
   const cssKey = 'cosmetic_css_' + hostname;
