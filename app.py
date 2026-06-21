@@ -6372,10 +6372,202 @@ def rules_page(kind=None):
 <textarea class="form-control font-monospace mb-2" name="rules" rows="20" style="font-size:13px">{h(current_rules)}</textarea>
 <div class="d-flex justify-content-between align-items-center">
 <small class="text-muted">Syntax: <code>bd::</code> block domain, <code>bs::</code> block suffix, <code>br::</code> block regex, <code>ad::</code> allow domain, <code>as::</code> allow suffix, <code>ar::</code> allow regex, <code>cm::</code> cosmetic rule. One rule per line, <code>#</code> for comments.</small>
+<div class="d-flex gap-2">
+<button class="btn btn-outline-light" type="button" onclick="document.getElementById('cosmetic-helper-modal').classList.add('show')">Cosmetic Helper</button>
 <button class="btn btn-success" type="submit">Save Rules</button>
 </div>
+</div>
 </form>
-</div>""", "Rules")
+</div>
+<div id="cosmetic-helper-modal" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="modal-box modal-box-lg">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+      <h2 class="h5" style="margin:0">Cosmetic Rule Helper</h2>
+      <button class="btn btn-sm btn-outline-light" onclick="document.getElementById('cosmetic-helper-modal').classList.remove('show')" style="border:none;font-size:1.2rem">&times;</button>
+    </div>
+    <p class="text-secondary small mb-3">Paste an HTML snippet from a website and this tool generates AdBlock-style cosmetic filter rules (<code>##</code>) that hide matching elements.</p>
+    <div class="mb-3">
+      <label class="form-label small">Domain (optional)</label>
+      <input id="ch-domain" class="form-control" placeholder="example.com" autocomplete="off">
+    </div>
+    <div class="mb-3">
+      <label class="form-label small">HTML snippet</label>
+      <textarea id="ch-html" class="form-control font-monospace" rows="5" style="font-size:12px" placeholder='&lt;div class="ad-banner" id="top-ad"&gt;...&lt;/div&gt;'></textarea>
+    </div>
+    <div class="row g-2 mb-3">
+      <div class="col-auto">
+        <label class="form-label small">Mode</label>
+        <select id="ch-mode" class="form-select form-select-sm">
+          <option value="auto">Auto (best match)</option>
+          <option value="id">By ID</option>
+          <option value="class">By class</option>
+          <option value="tag">By tag</option>
+          <option value="attr">By attribute</option>
+        </select>
+      </div>
+      <div class="col-auto d-flex align-items-end" style="gap:1.5rem">
+        <div class="form-check"><input class="form-check-input" type="checkbox" id="ch-deep"><label class="form-check-label small" for="ch-deep" style="margin-left:.35rem">Deep scan</label></div>
+        <div class="form-check"><input class="form-check-input" type="checkbox" id="ch-parent"><label class="form-check-label small" for="ch-parent" style="margin-left:.35rem">Include parent</label></div>
+        <div class="form-check"><input class="form-check-input" type="checkbox" id="ch-text"><label class="form-check-label small" for="ch-text" style="margin-left:.35rem">Include text</label></div>
+      </div>
+    </div>
+    <div class="mb-3">
+      <label class="form-label small">Generated rules <span id="ch-count" class="text-secondary"></span></label>
+      <textarea id="ch-output" class="form-control font-monospace" rows="8" style="font-size:12px" readonly></textarea>
+    </div>
+    <div class="d-flex gap-2 justify-content-end">
+      <button class="btn btn-sm btn-outline-light" type="button" onclick="chCopy()">Copy</button>
+      <button class="btn btn-sm btn-success" type="button" onclick="chInsert()">Insert into Rules</button>
+    </div>
+  </div>
+</div>
+<script>
+(function(){{
+  const domainInput = document.getElementById('ch-domain');
+  const htmlInput = document.getElementById('ch-html');
+  const mode = document.getElementById('ch-mode');
+  const deepScan = document.getElementById('ch-deep');
+  const includeParent = document.getElementById('ch-parent');
+  const includeText = document.getElementById('ch-text');
+  const output = document.getElementById('ch-output');
+  const countLabel = document.getElementById('ch-count');
+  const rulesArea = document.querySelector('textarea[name="rules"]');
+
+  function normalizeDomain(value) {{
+    let d = (value || '').trim().toLowerCase();
+    d = d.replace(/^https?:\\/\\//, '').replace(/\\/.*$/, '').replace(/^www\\./, '');
+    return d || '';
+  }}
+  function normalizeDomainField() {{
+    const normalized = normalizeDomain(domainInput.value);
+    if (normalized) domainInput.value = normalized;
+  }}
+
+  function parseHTML(html) {{
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+    return Array.from(doc.body.children);
+  }}
+
+  function isHashedClass(c) {{
+    return /^[A-Za-z]+-[a-z]{{2}}-[a-z0-9]{{5,}}/.test(c);
+  }}
+
+  function buildSelectors(el, smode) {{
+    const results = [];
+    const tag = el.tagName.toLowerCase();
+    if (smode === 'id' || smode === 'auto') {{
+      if (el.id) results.push('#' + CSS.escape(el.id));
+    }}
+    if (smode === 'class' || smode === 'auto') {{
+      const classes = Array.from(el.classList);
+      if (classes.length) {{
+        const stable = classes.filter(function(c) {{ return !isHashedClass(c); }});
+        if (stable.length) {{
+          results.push(tag + '.' + stable.map(function(c) {{ return CSS.escape(c); }}).join('.'));
+        }}
+        if (classes.length !== stable.length) {{
+          results.push(tag + '.' + classes.map(function(c) {{ return CSS.escape(c); }}).join('.'));
+        }}
+      }}
+    }}
+    if (smode === 'attr' || smode === 'auto') {{
+      for (const attr of el.attributes) {{
+        if (['class','id','style'].includes(attr.name)) continue;
+        if (attr.value && attr.value.length < 80) {{
+          results.push(tag + '[' + attr.name + '="' + attr.value.replace(/"/g, '\\\\"') + '"]');
+          break;
+        }}
+      }}
+    }}
+    if (smode === 'tag') {{
+      results.push(tag);
+    }}
+    if (!results.length) results.push(tag);
+    return results;
+  }}
+
+  function makeRules() {{
+    const html = htmlInput.value.trim();
+    if (!html) {{ output.value = ''; countLabel.textContent = ''; return; }}
+    const domain = normalizeDomain(domainInput.value);
+    const prefix = domain ? domain + '##' : '##';
+    const smode = mode.value;
+    const withDeep = deepScan.checked;
+    const withParent = includeParent.checked;
+    const withText = includeText.checked;
+    const elements = parseHTML(html);
+    const rules = [];
+    const seen = new Set();
+
+    function addEl(el) {{
+      const sels = buildSelectors(el, smode);
+      for (const sel of sels) {{
+        if (!seen.has(sel)) {{
+          seen.add(sel);
+          rules.push(prefix + sel);
+        }}
+      }}
+    }}
+
+    for (const el of elements) {{
+      addEl(el);
+      if (withParent && el.parentElement && el.parentElement.tagName !== 'BODY') {{
+        addEl(el.parentElement);
+      }}
+      if (withText) {{
+        const text = (el.textContent || '').trim().slice(0, 40);
+        if (text) {{
+          const tsel = el.tagName.toLowerCase() + ':has-text(' + text.replace(/[()]/g, '\\\\$&') + ')';
+          if (!seen.has(tsel)) {{
+            seen.add(tsel);
+            rules.push(prefix + tsel);
+          }}
+        }}
+      }}
+      if (withDeep) {{
+        el.querySelectorAll('*').forEach(function(child) {{ addEl(child); }});
+      }}
+    }}
+    output.value = rules.join('\\n');
+    countLabel.textContent = '(' + rules.length + ')';
+  }}
+
+  function live() {{ makeRules(); }}
+  htmlInput.addEventListener('input', live);
+  domainInput.addEventListener('input', function() {{
+    const normalized = normalizeDomain(domainInput.value);
+    if (normalized) domainInput.value = normalized;
+    live();
+  }});
+  domainInput.addEventListener('blur', normalizeDomainField);
+  domainInput.addEventListener('change', normalizeDomainField);
+  [mode, deepScan, includeParent, includeText].forEach(function(element) {{
+    element.addEventListener('change', live);
+  }});
+
+  window.chCopy = function() {{
+    const text = output.value;
+    if (!text) return;
+    navigator.clipboard.writeText(text).then(function() {{
+      const btn = event.target;
+      btn.textContent = 'Copied!';
+      setTimeout(function() {{ btn.textContent = 'Copy'; }}, 1500);
+    }});
+  }};
+  window.chInsert = function() {{
+    const text = output.value.trim();
+    if (!text) return;
+    const lines = text.split('\\n').map(function(r) {{ return 'cm::' + r; }}).join('\\n');
+    const current = rulesArea.value.trimEnd();
+    rulesArea.value = current + (current ? '\\n' : '') + lines;
+    document.getElementById('cosmetic-helper-modal').classList.remove('show');
+  }};
+
+  htmlInput.value = '';
+  makeRules();
+}})();
+</script>""", "Rules")
 
 
 BUILTIN_ADLIST_PRESETS = """
