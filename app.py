@@ -897,6 +897,7 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_query_blocked ON query_log(blocked);
             CREATE INDEX IF NOT EXISTS idx_rules_comment ON rules(comment);
             CREATE INDEX IF NOT EXISTS idx_rules_enabled_action_pattern ON rules(enabled, action, pattern_type, pattern);
+            CREATE INDEX IF NOT EXISTS idx_rules_action ON rules(action);
             CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions(expires_at);
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -956,7 +957,7 @@ def init_db():
             "custom_block_ipv4": "0.0.0.0",
             "custom_block_ipv6": "::",
             "lan_only": "1",
-            "dnssec_validation_enabled": "0",
+            "dnssec_validation_enabled": "1",
             "filter_update_interval_hours": "24",
             "allowed_networks": "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128,fc00::/7",
             "query_log_enabled": "1",
@@ -1124,6 +1125,9 @@ MIGRATIONS = [
         _ensure_column("query_log", "served_stale", "INTEGER NOT NULL DEFAULT 0"),
         _ensure_column("query_log", "prefetch_triggered", "INTEGER NOT NULL DEFAULT 0"),
         _ensure_column("query_log", "resolver_mode", "TEXT NOT NULL DEFAULT ''"),
+    )),
+    (15, "add index on rules action", lambda: db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_rules_action ON rules(action)"
     )),
 ]
 
@@ -7980,39 +7984,28 @@ function clFilterSearch() {{
 </script>""", "Cosmetic Lists")
 
 
-def rewrites_page():
-    rewrites = rows("SELECT * FROM rules WHERE action = 'rewrite' ORDER BY id DESC LIMIT 500")
-    edit_modals = ""
-    table = "".join(
-        f"<tr><td data-label='ID'>{r['id']}</td><td data-label='Enabled'>{toggle(r['enabled'])}</td>"
-        f"<td data-label='Type'>{r['pattern_type']}</td><td data-label='Domain' class='td-domain'>{r['pattern']}</td>"
-        f"<td data-label='Target' class='td-domain'>{r['target']}</td><td data-label='Comment'>{r['comment']}</td>"
+def _rw_row(r):
+    rid = r['id']
+    pt = html_escape(r['pattern_type'])
+    p = html_escape(r['pattern'])
+    t = html_escape(r['target'])
+    c = html_escape(r['comment'])
+    en = r['enabled']
+    return (
+        f"<tr><td data-label='ID'>{rid}</td><td data-label='Enabled'>{toggle(en)}</td>"
+        f"<td data-label='Type'>{pt}</td><td data-label='Domain' class='td-domain'>{p}</td>"
+        f"<td data-label='Target' class='td-domain'>{t}</td><td data-label='Comment'>{c}</td>"
         f"<td data-label='Actions'>"
-        f"<button class='btn btn-sm btn-outline-light' type='button' onclick=\"document.getElementById('rwEdit-{r['id']}').classList.add('show')\">&#x270E;</button>"
-        f"<form method='post' action='/rewrites/delete' style='display:inline;margin-left:.35rem'><input type='hidden' name='id' value='{r['id']}'>"
+        f'<button class="btn btn-sm btn-outline-light" type="button" onclick="rwEdit({rid},this)" '
+        f'data-pt="{pt}" data-p="{p}" data-t="{t}" data-c="{c}" data-en="{en}">&#x270E;</button>'
+        f"<form method='post' action='/rewrites/delete' style='display:inline;margin-left:.35rem'><input type='hidden' name='id' value='{rid}'>"
         f"<button class='btn btn-sm btn-outline-danger'>Delete</button></form></td></tr>"
-        for r in rewrites
     )
-    for r in rewrites:
-        eid = f"rwEdit-{r['id']}"
-        edit_modals += f"""
-<div id="{eid}" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('show')">
-  <div class="modal-box">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
-      <h2 class="h5" style="margin:0">Edit Rewrite #{r['id']}</h2>
-      <button class="btn btn-sm btn-outline-light" onclick="document.getElementById('{eid}').classList.remove('show')" style="border:none;font-size:1.2rem">&times;</button>
-    </div>
-    <form method="post" action="/rewrites/edit">
-      <input type="hidden" name="id" value="{r['id']}">
-      <label class="form-label">Type</label><select class="form-select mb-2" name="pattern_type"><option value="domain" {"selected" if r['pattern_type'] == 'domain' else ""}>domain</option><option value="wildcard" {"selected" if r['pattern_type'] == 'wildcard' else ""}>wildcard</option><option value="regex" {"selected" if r['pattern_type'] == 'regex' else ""}>regex</option></select>
-      <label class="form-label">Domain</label><input class="form-control mb-2" name="pattern" value="{html_escape(r['pattern'])}" required>
-      <label class="form-label">Target (IP or CNAME)</label><input class="form-control mb-2" name="target" value="{html_escape(r['target'])}" required>
-      <label class="form-label">Comment</label><input class="form-control mb-3" name="comment" value="{html_escape(r['comment'])}">
-      <label class="form-check mb-3"><input type="hidden" name="enabled" value="0"><input class="form-check-input" type="checkbox" name="enabled" value="1" {"checked" if r['enabled'] else ""}><span class="form-check-label">Enabled</span></label>
-      <button class="btn btn-success w-100" type="submit">Save</button>
-    </form>
-  </div>
-</div>"""
+
+
+def rewrites_page():
+    rewrites = rows("SELECT id, enabled, pattern_type, pattern, target, comment FROM rules WHERE action = 'rewrite' ORDER BY id DESC LIMIT 500")
+    table = "".join(_rw_row(r) for r in rewrites)
     return template(f"""
 <h1 class="h3 mb-3">DNS Rewrites</h1>
 <div class="row g-3">
@@ -8024,7 +8017,36 @@ def rewrites_page():
 <label class="form-label">Comment</label><input class="form-control mb-3" name="comment">
 <button class="btn btn-success w-100">Save</button></form></div>
 <div class="col-xl-8"><div class="panel rounded-2 border border-secondary-subtle p-3"><div class="table-responsive"><table class="table table-dark table-hover mobile-card-table"><thead><tr><th>ID</th><th>Enabled</th><th>Type</th><th>Domain</th><th>Target</th><th>Comment</th><th></th></tr></thead><tbody>{table}</tbody></table></div></div></div>
-</div>{edit_modals}""", "DNS Rewrites")
+</div>
+<div id="rwEditModal" class="modal-overlay" onclick="if(event.target===this)this.classList.remove('show')">
+  <div class="modal-box">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem">
+      <h2 class="h5" style="margin:0" id="rwEditTitle">Edit Rewrite</h2>
+      <button class="btn btn-sm btn-outline-light" onclick="document.getElementById('rwEditModal').classList.remove('show')" style="border:none;font-size:1.2rem">&times;</button>
+    </div>
+    <form method="post" action="/rewrites/edit">
+      <input type="hidden" name="id" id="rwEditId">
+      <label class="form-label">Type</label><select class="form-select mb-2" name="pattern_type" id="rwEditType"><option value="domain">domain</option><option value="wildcard">wildcard</option><option value="regex">regex</option></select>
+      <label class="form-label">Domain</label><input class="form-control mb-2" name="pattern" id="rwEditPattern" required>
+      <label class="form-label">Target (IP or CNAME)</label><input class="form-control mb-2" name="target" id="rwEditTarget" required>
+      <label class="form-label">Comment</label><input class="form-control mb-3" name="comment" id="rwEditComment">
+      <label class="form-check mb-3"><input type="hidden" name="enabled" value="0"><input class="form-check-input" type="checkbox" name="enabled" value="1" id="rwEditEnabled"><span class="form-check-label">Enabled</span></label>
+      <button class="btn btn-success w-100" type="submit">Save</button>
+    </form>
+  </div>
+</div>
+<script>
+function rwEdit(id,btn){{
+  document.getElementById('rwEditTitle').textContent='Edit Rewrite #'+id;
+  document.getElementById('rwEditId').value=id;
+  document.getElementById('rwEditType').value=btn.dataset.pt;
+  document.getElementById('rwEditPattern').value=btn.dataset.p;
+  document.getElementById('rwEditTarget').value=btn.dataset.t;
+  document.getElementById('rwEditComment').value=btn.dataset.c;
+  document.getElementById('rwEditEnabled').checked=btn.dataset.en==='1';
+  document.getElementById('rwEditModal').classList.add('show');
+}}
+</script>""", "DNS Rewrites")
 
 
 def clients_page():
