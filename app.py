@@ -4938,9 +4938,19 @@ def _log_worker_exhausted(protocol):
 
 
 def _worker_limiter_maintenance_loop():
-    while not server_shutdown_event.wait(5):
+    if _psutil_available:
+        try:
+            _psutil_mod.cpu_percent(interval=None)
+            _psutil_proc.cpu_percent(interval=None)
+        except Exception:
+            pass
+    while not server_shutdown_event.wait(3):
         try:
             dns_worker_limiter.maintenance()
+        except Exception:
+            pass
+        try:
+            _sample_system_resources()
         except Exception:
             pass
 
@@ -8743,23 +8753,15 @@ try:
     import psutil as _psutil_mod
     _psutil_available = True
     _psutil_proc = _psutil_mod.Process()
-    _psutil_mod.cpu_percent(interval=None)
-    _psutil_proc.cpu_percent(interval=None)
 except Exception:
     _psutil_mod = None
 
-_system_resources_cache = {"data": None, "ts": 0.0}
+_system_resources_cache = [None]
 _system_resources_lock = threading.Lock()
 
 
-def _collect_system_resources():
-    now = time.monotonic()
-    with _system_resources_lock:
-        cached = _system_resources_cache
-        if cached["data"] is not None and now - cached["ts"] < 1.5:
-            return cached["data"]
-
-    uptime = now - _app_start_monotonic if _app_start_monotonic else 0
+def _sample_system_resources():
+    uptime = time.monotonic() - _app_start_monotonic if _app_start_monotonic else 0
     if _psutil_available:
         try:
             cpu_system = _psutil_mod.cpu_percent(interval=None)
@@ -8767,7 +8769,7 @@ def _collect_system_resources():
             mem = _psutil_mod.virtual_memory()
             mem_info = _psutil_proc.memory_info()
             data = {
-                "cpu": {"system_percent": cpu_system, "process_percent": cpu_process, "cores": _psutil_mod.cpu_count()},
+                "cpu": {"system_percent": round(cpu_system, 1), "process_percent": round(cpu_process, 1), "cores": _psutil_mod.cpu_count()},
                 "memory": {"total_bytes": mem.total, "available_bytes": mem.available, "process_rss_bytes": mem_info.rss, "process_percent": round(mem_info.rss / mem.total * 100, 1) if mem.total else 0},
                 "process": {"pid": os.getpid(), "threads": threading.active_count(), "uptime_seconds": round(uptime, 1)},
             }
@@ -8784,11 +8786,20 @@ def _collect_system_resources():
             "process": {"pid": os.getpid(), "threads": threading.active_count(), "uptime_seconds": round(uptime, 1)},
             "psutil_missing": True,
         }
-
     with _system_resources_lock:
-        _system_resources_cache["data"] = data
-        _system_resources_cache["ts"] = now
+        _system_resources_cache[0] = data
     return data
+
+
+def _collect_system_resources():
+    with _system_resources_lock:
+        cached = _system_resources_cache[0]
+    if cached is not None:
+        cached["process"]["threads"] = threading.active_count()
+        uptime = time.monotonic() - _app_start_monotonic if _app_start_monotonic else 0
+        cached["process"]["uptime_seconds"] = round(uptime, 1)
+        return cached
+    return _sample_system_resources()
 
 
 def _system_monitor_api_summary():
@@ -8948,134 +8959,163 @@ def system_monitor_page():
 </div>
 <script>
 (function(){
-let paused=false, timer=null, abortCtl=null;
-const csrf=decodeURIComponent((document.cookie.match(/(?:^|;)\\s*csrf_token=([^;]*)/)||['',''])[1]);
+var paused=false, timer=null, abortCtl=null, errEl=document.getElementById('sm-action-result');
+var csrf=decodeURIComponent((document.cookie.match(/(?:^|;)[ ]*csrf_token=([^;]*)/) || ['',''])[1]);
 
-function m(l,v){return '<div class="sm-metric"><span class="sm-label">'+l+'</span><span class="sm-value">'+v+'</span></div>';}
-
+function m(l,v){ return '<div class="sm-metric"><span class="sm-label">'+l+'</span><span class="sm-value">'+(v!=null?v:'N/A')+'</span></div>'; }
 function bar(pct){
-  let c=pct<70?'sm-bar-green':pct<90?'sm-bar-yellow':'sm-bar-red';
+  var c = pct < 70 ? 'sm-bar-green' : pct < 90 ? 'sm-bar-yellow' : 'sm-bar-red';
   return '<div class="sm-bar"><div class="sm-bar-fill '+c+'" style="width:'+Math.min(100,pct)+'%"></div></div>';
 }
-
-function fmt(s){return s!=null?s:'N/A';}
-function fmtBytes(b){if(b==null)return'N/A';if(b<1024)return b+' B';if(b<1048576)return(b/1024).toFixed(1)+' KB';if(b<1073741824)return(b/1048576).toFixed(1)+' MB';return(b/1073741824).toFixed(2)+' GB';}
-function fmtUptime(s){let d=Math.floor(s/86400),h=Math.floor(s%86400/3600),mi=Math.floor(s%3600/60);return(d?d+'d ':'')+(h?h+'h ':'')+(mi+'m');}
+function p(v){ return (v != null && v !== '' && v !== false) ? v + '%' : 'N/A'; }
+function fb(b){ if(b==null) return 'N/A'; if(b<1024) return b+' B'; if(b<1048576) return (b/1024).toFixed(1)+' KB'; if(b<1073741824) return (b/1048576).toFixed(1)+' MB'; return (b/1073741824).toFixed(2)+' GB'; }
+function fu(s){ var d=Math.floor(s/86400), h=Math.floor(s%86400/3600), mi=Math.floor(s%3600/60); return (d?d+'d ':'')+(h?h+'h ':'')+(mi+'m'); }
+function ls(s){ return s==='active' ? '<span class="sm-status sm-status-green"></span>Active' : '<span class="sm-status sm-status-red"></span>Stopped'; }
 
 function renderSummary(d){
-  let srv=d.server||{}, w=d.dns_workers||{}, r=d.resources||{};
-  let statusDot=d.dns_running?'sm-status-green':'sm-status-red';
-  let statusText=d.dns_running?'Running':'Stopped';
-  document.getElementById('sm-srv-status').innerHTML='<span class="sm-status '+statusDot+'"></span>'+statusText;
-  let ports=fmt(srv.dns_host)+':'+fmt(srv.dns_port);
-  if(srv.dot_port)ports+=' | DoT:'+srv.dot_port;
-  if(srv.doh_port)ports+=' | DoH:'+srv.doh_port;
-  if(srv.doq_port)ports+=' | DoQ:'+srv.doq_port;
-  document.getElementById('sm-server').innerHTML=
-    m('PID',srv.pid)+m('Uptime',fmtUptime(srv.uptime_seconds||0))+
-    m('Python',fmt(srv.python_version))+m('OS',fmt(srv.os))+
-    m('Hostname',fmt(srv.hostname))+m('Version',fmt(srv.app_version))+
-    m('DNS Endpoints',ports);
+  var srv = d.server || {};
+  var w   = d.dns_workers || {};
+  var uw  = d.upstream_workers || {};
+  var net = d.network || {};
+  var r   = d.resources || {};
+  var cpu = r.cpu || {};
+  var mem = r.memory || {};
+  var proc = r.process || {};
+  var rm  = d.runtime_metrics || {};
 
-  let pct=w.current_limit?Math.round(w.active/w.current_limit*100):0;
-  document.getElementById('sm-dns-workers').innerHTML=
-    '<div style="font-size:.92rem;font-weight:800;margin-bottom:.3rem">'+w.active+' / '+w.current_limit+' ('+pct+'%)</div>'+
-    bar(pct)+
-    '<div style="font-size:.78rem;color:var(--muted2);margin:.3rem 0">Dynamic capacity: '+w.current_limit+' / '+w.max_limit+'</div>'+
-    m('Base Limit',w.base_limit)+m('Burst Limit',w.max_limit)+m('Current Limit',w.current_limit)+
-    m('Active',w.active)+m('Free',w.free)+m('Waiting',w.waiting)+
-    m('Peak',w.peak)+m('Rejected Total',w.rejected_total)+
-    m('Burst Expansions',w.burst_expansions_total)+m('Shrink Ops',w.shrink_total)+
-    m('Rejected UDP',w.rejected_udp)+m('Rejected TCP',w.rejected_tcp)+m('Rejected DoT',w.rejected_dot)+
-    (pct>=90?'<div class="sm-warn">Warning: DNS worker usage is above 90%</div>':'');
+  /* Server Status */
+  var statusDot = d.dns_running ? 'sm-status-green' : 'sm-status-red';
+  document.getElementById('sm-srv-status').innerHTML = '<span class="sm-status '+statusDot+'"></span>' + (d.dns_running ? 'Running' : 'Stopped');
+  var ports = (srv.dns_host||'?') + ':' + (srv.dns_port||'?');
+  if(srv.dot_port) ports += '  |  DoT:' + srv.dot_port;
+  if(srv.doh_port) ports += '  |  DoH:' + srv.doh_port;
+  if(srv.doq_port) ports += '  |  DoQ:' + srv.doq_port;
+  document.getElementById('sm-server').innerHTML =
+    m('PID', srv.pid) + m('Uptime', fu(srv.uptime_seconds||0)) +
+    m('Python', srv.python_version) + m('OS', srv.os) +
+    m('Hostname', srv.hostname) + m('Version', srv.app_version) +
+    m('DNS Endpoints', ports);
 
-  let uw=d.upstream_workers||{};
-  document.getElementById('sm-upstream-workers').innerHTML=
-    m('Max Limit',uw.max_limit||'-')+
-    m('Upstream Errors',uw.errors_total||0);
+  /* DNS Workers */
+  var pct = w.current_limit ? Math.round(w.active / w.current_limit * 100) : 0;
+  document.getElementById('sm-dns-workers').innerHTML =
+    '<div style="font-size:.95rem;font-weight:800;margin-bottom:.35rem">' + w.active + ' / ' + w.current_limit + '  (' + pct + '%)</div>' +
+    bar(pct) +
+    '<div style="font-size:.78rem;color:var(--muted2);margin:.35rem 0">Dynamic capacity: ' + w.current_limit + ' / ' + w.max_limit + '</div>' +
+    m('Base Limit', w.base_limit) + m('Burst Limit', w.max_limit) + m('Current Limit', w.current_limit) +
+    m('Active', w.active) + m('Free', w.free) + m('Waiting', w.waiting) +
+    m('Peak', w.peak) + m('Rejected Total', w.rejected_total) +
+    m('Burst Expansions', w.burst_expansions_total) + m('Shrink Ops', w.shrink_total) +
+    m('Rejected UDP', w.rejected_udp) + m('Rejected TCP', w.rejected_tcp) + m('Rejected DoT', w.rejected_dot) +
+    (pct >= 90 ? '<div class="sm-warn">Warning: DNS worker usage above 90%</div>' : '');
 
-  let net=d.network||{};
-  function ls(s){return s==='active'?'<span class="sm-status sm-status-green"></span>Active':'<span class="sm-status sm-status-red"></span>Stopped';}
-  document.getElementById('sm-network').innerHTML=
-    m('UDP Listener',ls(net.udp_listener))+m('TCP Listener',ls(net.tcp_listener))+
-    m('DoT Listener',ls(net.dot_listener))+m('DoH Listener',ls(net.doh_listener))+
-    m('DoQ Listener',ls(net.doq_listener))+m('Threads',net.thread_count||'-');
+  /* Upstream Workers */
+  document.getElementById('sm-upstream-workers').innerHTML =
+    m('Max Limit', uw.max_limit) + m('Upstream Errors', uw.errors_total);
 
-  let cpu=r.cpu||{},mem=r.memory||{},proc=r.process||{};
-  function pctFmt(v){return v!=null&&v!==false?v+'%':'N/A';}
-  let resHtml='';
-  if(r.psutil_missing){resHtml='<div style="color:var(--muted2);font-size:.84rem;margin-bottom:.5rem">System metrics unavailable: psutil is not installed</div>';}
-  resHtml+=m('System CPU',pctFmt(cpu.system_percent))+
-    m('Process CPU',pctFmt(cpu.process_percent))+
-    m('CPU Cores',fmt(cpu.cores))+
-    m('Total RAM',fmtBytes(mem.total_bytes))+m('Available RAM',fmtBytes(mem.available_bytes))+
-    m('Process RSS',fmtBytes(mem.process_rss_bytes))+m('Process Memory',pctFmt(mem.process_percent))+
-    m('Threads',fmt(proc.threads))+m('Process Uptime',fmtUptime(proc.uptime_seconds||0));
-  document.getElementById('sm-resources').innerHTML=resHtml;
+  /* Network */
+  document.getElementById('sm-network').innerHTML =
+    m('UDP Listener', ls(net.udp_listener)) + m('TCP Listener', ls(net.tcp_listener)) +
+    m('DoT Listener', ls(net.dot_listener)) + m('DoH Listener', ls(net.doh_listener)) +
+    m('DoQ Listener', ls(net.doq_listener)) + m('Threads', net.thread_count);
 
-  let rm=d.runtime_metrics||{};
-  let warns=[];
-  if(pct>=90)warns.push('DNS worker usage: '+pct+'%');
-  if(proc.threads&&proc.threads>200)warns.push('High thread count: '+proc.threads);
-  if(w.rejected_total>0)warns.push('Total rejected requests: '+w.rejected_total);
-  if(w.waiting>0)warns.push(w.waiting+' request(s) waiting for DNS worker slots');
-  document.getElementById('sm-diagnostics').innerHTML=
-    (warns.length?warns.map(function(w){return '<div class="sm-warn">'+w+'</div>';}).join(''):'<div style="color:#22c55e;font-size:.84rem">No warnings</div>')+
-    m('Total DNS Requests',rm.dns_requests_total||0)+
-    m('Cache Hits',rm.dns_cache_hits_total||0)+
-    m('Cache Misses',rm.dns_cache_misses_total||0)+
-    m('Filter Blocks',rm.dns_filter_blocks_total||0)+
-    m('Upstream Errors',rm.dns_upstream_errors_total||0)+
-    m('Active Requests (now)',d._active_total||0);
+  /* System Resources */
+  var rh = '';
+  if(r.psutil_missing) rh += '<div style="color:var(--muted2);font-size:.84rem;margin-bottom:.5rem">Install psutil for system metrics</div>';
+  rh += m('System CPU', p(cpu.system_percent)) +
+    m('Process CPU', p(cpu.process_percent)) +
+    m('CPU Cores', cpu.cores) +
+    m('Total RAM', fb(mem.total_bytes)) + m('Available RAM', fb(mem.available_bytes)) +
+    m('Process RSS', fb(mem.process_rss_bytes)) + m('Process Memory', p(mem.process_percent)) +
+    m('Threads', proc.threads) + m('Process Uptime', fu(proc.uptime_seconds||0));
+  document.getElementById('sm-resources').innerHTML = rh;
+
+  /* Diagnostics */
+  var warns = [];
+  if(pct >= 90) warns.push('DNS worker usage: ' + pct + '%');
+  if(proc.threads > 200) warns.push('High thread count: ' + proc.threads);
+  if(w.rejected_total > 0) warns.push('Total rejected requests: ' + w.rejected_total);
+  if(w.waiting > 0) warns.push(w.waiting + ' request(s) waiting for DNS worker slots');
+  var dh = warns.length
+    ? warns.map(function(x){ return '<div class="sm-warn">' + x + '</div>'; }).join('')
+    : '<div style="color:#22c55e;font-size:.84rem">No warnings</div>';
+  dh += m('Total DNS Requests', rm.dns_requests_total || 0) +
+    m('Cache Hits', rm.dns_cache_hits_total || 0) +
+    m('Cache Misses', rm.dns_cache_misses_total || 0) +
+    m('Filter Blocks', rm.dns_filter_blocks_total || 0) +
+    m('Upstream Errors', rm.dns_upstream_errors_total || 0) +
+    m('Active Requests (now)', d._active_total || 0);
+  document.getElementById('sm-diagnostics').innerHTML = dh;
 }
 
 function renderRequests(d){
-  let reqs=d.requests||[];
-  document.getElementById('sm-req-count').textContent=d.total_active+' active'+(d.truncated?' (showing '+d.returned+')':'');
-  if(!reqs.length){document.getElementById('sm-requests').innerHTML='<div style="color:var(--muted2);font-size:.84rem">No active requests</div>';return;}
-  let h='<table class="sm-req-table"><thead><tr><th>ID</th><th>Protocol</th><th>Client</th><th>Domain</th><th>Type</th><th>Stage</th><th>Runtime</th></tr></thead><tbody>';
-  reqs.sort(function(a,b){return b.runtime_ms-a.runtime_ms;});
-  reqs.forEach(function(r){
-    h+='<tr><td>'+r.request_id+'</td><td>'+r.protocol+'</td><td>'+r.client_ip+'</td><td>'+(r.domain||'-')+'</td><td>'+(r.query_type||'-')+'</td><td>'+r.stage+'</td><td>'+r.runtime_ms.toFixed(1)+' ms</td></tr>';
-  });
-  h+='</tbody></table>';
-  document.getElementById('sm-requests').innerHTML=h;
+  var reqs = d.requests || [];
+  document.getElementById('sm-req-count').textContent = d.total_active + ' active' + (d.truncated ? ' (showing ' + d.returned + ')' : '');
+  if(!reqs.length){ document.getElementById('sm-requests').innerHTML = '<div style="color:var(--muted2);font-size:.84rem">No active requests</div>'; return; }
+  var h = '<table class="sm-req-table"><thead><tr><th>ID</th><th>Protocol</th><th>Client</th><th>Domain</th><th>Type</th><th>Stage</th><th>Runtime</th></tr></thead><tbody>';
+  reqs.sort(function(a,b){ return b.runtime_ms - a.runtime_ms; });
+  for(var i = 0; i < reqs.length; i++){
+    var rr = reqs[i];
+    h += '<tr><td>' + rr.request_id + '</td><td>' + rr.protocol + '</td><td>' + rr.client_ip + '</td><td>' + (rr.domain||'-') + '</td><td>' + (rr.query_type||'-') + '</td><td>' + rr.stage + '</td><td>' + rr.runtime_ms.toFixed(1) + ' ms</td></tr>';
+  }
+  h += '</tbody></table>';
+  document.getElementById('sm-requests').innerHTML = h;
 }
+
+function showErr(msg){ document.getElementById('sm-live').textContent = 'Error: ' + msg; console.error('[SystemMonitor]', msg); }
 
 function poll(){
-  if(paused||document.hidden)return;
-  if(abortCtl)abortCtl.abort();
-  abortCtl=new AbortController();
-  fetch('/api/system-monitor/summary',{signal:abortCtl.signal,headers:{'X-CSRF-Token':csrf}})
-    .then(function(r){return r.json();})
-    .then(function(d){renderSummary(d);document.getElementById('sm-live').textContent='Updated '+new Date().toLocaleTimeString();})
-    .catch(function(){});
-  fetch('/api/system-monitor/active-requests',{signal:abortCtl.signal,headers:{'X-CSRF-Token':csrf}})
-    .then(function(r){return r.json();})
-    .then(function(d){renderRequests(d);})
-    .catch(function(){});
+  if(paused || document.hidden) return;
+  if(abortCtl) try { abortCtl.abort(); } catch(e){}
+  abortCtl = new AbortController();
+  fetch('/api/system-monitor/summary', {signal: abortCtl.signal})
+    .then(function(r){
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(function(d){
+      renderSummary(d);
+      document.getElementById('sm-live').textContent = 'Updated ' + new Date().toLocaleTimeString();
+    })
+    .catch(function(e){
+      if(e.name !== 'AbortError') showErr(e.message);
+    });
+  fetch('/api/system-monitor/active-requests', {signal: abortCtl.signal})
+    .then(function(r){
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(function(d){ renderRequests(d); })
+    .catch(function(e){
+      if(e.name !== 'AbortError') console.error('[SystemMonitor] active-requests:', e.message);
+    });
 }
 
-function schedule(){timer=setInterval(poll,2000);}
+function schedule(){ timer = setInterval(poll, 2000); }
 poll();
 schedule();
-document.addEventListener('visibilitychange',function(){if(document.hidden){clearInterval(timer);}else if(!paused){poll();schedule();}});
+document.addEventListener('visibilitychange', function(){
+  if(document.hidden){ clearInterval(timer); }
+  else if(!paused){ poll(); schedule(); }
+});
 
-window.smPause=function(){
-  paused=!paused;
-  document.getElementById('sm-pause-btn').textContent=paused?'Resume':'Pause';
-  if(paused){clearInterval(timer);}else{poll();schedule();}
+window.smPause = function(){
+  paused = !paused;
+  document.getElementById('sm-pause-btn').textContent = paused ? 'Resume' : 'Pause';
+  if(paused) clearInterval(timer); else { poll(); schedule(); }
 };
 
-window.smAction=function(url,msg){
-  if(!confirm(msg))return;
-  fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-CSRF-Token':csrf},body:'csrf_token='+encodeURIComponent(csrf)})
-    .then(function(r){return r.json();})
+window.smAction = function(url, msg){
+  if(!confirm(msg)) return;
+  fetch(url, {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'csrf_token=' + encodeURIComponent(csrf)})
+    .then(function(r){ return r.json(); })
     .then(function(d){
-      document.getElementById('sm-action-result').innerHTML='<span style="color:#22c55e">'+(d.ok?'Done':'')+(d.error||'')+(d.message||'')+'</span>';
-      setTimeout(poll,500);
+      var el = document.getElementById('sm-action-result');
+      if(d.ok) el.innerHTML = '<span style="color:#22c55e">' + (d.message||'Done') + '</span>';
+      else     el.innerHTML = '<span style="color:#f87171">' + (d.error||'Failed') + '</span>';
+      setTimeout(poll, 500);
     })
-    .catch(function(e){document.getElementById('sm-action-result').innerHTML='<span style="color:#f87171">Error: '+e.message+'</span>';});
+    .catch(function(e){ document.getElementById('sm-action-result').innerHTML = '<span style="color:#f87171">Error: ' + e.message + '</span>'; });
 };
 })();
 </script>
@@ -11397,6 +11437,7 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("X-XSS-Protection", "1; mode=block")
