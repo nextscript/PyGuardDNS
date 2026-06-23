@@ -8737,27 +8737,64 @@ relayInput.addEventListener('input', detectRelay);
 </script>{edit_modals}""", "Upstreams")
 
 
-def _system_monitor_api_summary():
-    snap = dns_worker_limiter.snapshot()
-    uptime = time.monotonic() - _app_start_monotonic if _app_start_monotonic else 0
-    try:
-        import psutil
-        proc = psutil.Process()
-        cpu_system = psutil.cpu_percent(interval=0)
-        cpu_process = proc.cpu_percent(interval=0)
-        mem = psutil.virtual_memory()
-        mem_info = proc.memory_info()
-        resources = {
-            "cpu": {"system_percent": cpu_system, "process_percent": cpu_process, "cores": psutil.cpu_count()},
-            "memory": {"total_bytes": mem.total, "available_bytes": mem.available, "process_rss_bytes": mem_info.rss, "process_percent": round(mem_info.rss / mem.total * 100, 1) if mem.total else 0},
-            "process": {"pid": os.getpid(), "threads": threading.active_count(), "uptime_seconds": round(uptime, 1)},
-        }
-    except Exception:
-        resources = {
+_psutil_available = False
+_psutil_proc = None
+try:
+    import psutil as _psutil_mod
+    _psutil_available = True
+    _psutil_proc = _psutil_mod.Process()
+    _psutil_mod.cpu_percent(interval=None)
+    _psutil_proc.cpu_percent(interval=None)
+except Exception:
+    _psutil_mod = None
+
+_system_resources_cache = {"data": None, "ts": 0.0}
+_system_resources_lock = threading.Lock()
+
+
+def _collect_system_resources():
+    now = time.monotonic()
+    with _system_resources_lock:
+        cached = _system_resources_cache
+        if cached["data"] is not None and now - cached["ts"] < 1.5:
+            return cached["data"]
+
+    uptime = now - _app_start_monotonic if _app_start_monotonic else 0
+    if _psutil_available:
+        try:
+            cpu_system = _psutil_mod.cpu_percent(interval=None)
+            cpu_process = _psutil_proc.cpu_percent(interval=None)
+            mem = _psutil_mod.virtual_memory()
+            mem_info = _psutil_proc.memory_info()
+            data = {
+                "cpu": {"system_percent": cpu_system, "process_percent": cpu_process, "cores": _psutil_mod.cpu_count()},
+                "memory": {"total_bytes": mem.total, "available_bytes": mem.available, "process_rss_bytes": mem_info.rss, "process_percent": round(mem_info.rss / mem.total * 100, 1) if mem.total else 0},
+                "process": {"pid": os.getpid(), "threads": threading.active_count(), "uptime_seconds": round(uptime, 1)},
+            }
+        except Exception:
+            data = {
+                "cpu": {"system_percent": None, "process_percent": None, "cores": os.cpu_count()},
+                "memory": {"total_bytes": None, "available_bytes": None, "process_rss_bytes": None, "process_percent": None},
+                "process": {"pid": os.getpid(), "threads": threading.active_count(), "uptime_seconds": round(uptime, 1)},
+            }
+    else:
+        data = {
             "cpu": {"system_percent": None, "process_percent": None, "cores": os.cpu_count()},
             "memory": {"total_bytes": None, "available_bytes": None, "process_rss_bytes": None, "process_percent": None},
             "process": {"pid": os.getpid(), "threads": threading.active_count(), "uptime_seconds": round(uptime, 1)},
+            "psutil_missing": True,
         }
+
+    with _system_resources_lock:
+        _system_resources_cache["data"] = data
+        _system_resources_cache["ts"] = now
+    return data
+
+
+def _system_monitor_api_summary():
+    snap = dns_worker_limiter.snapshot()
+    uptime = time.monotonic() - _app_start_monotonic if _app_start_monotonic else 0
+    resources = _collect_system_resources()
     dns_running = bool(dns_servers)
     up_max = max(1, int(get_setting("max_upstream_workers", "16") or "16"))
     runtime_m = get_runtime_metrics()
@@ -8965,20 +9002,31 @@ function renderSummary(d){
     m('DoQ Listener',ls(net.doq_listener))+m('Threads',net.thread_count||'-');
 
   let cpu=r.cpu||{},mem=r.memory||{},proc=r.process||{};
-  document.getElementById('sm-resources').innerHTML=
-    m('System CPU',fmt(cpu.system_percent)!=null?cpu.system_percent+'%':'N/A')+
-    m('Process CPU',fmt(cpu.process_percent)!=null?cpu.process_percent+'%':'N/A')+
+  function pctFmt(v){return v!=null&&v!==false?v+'%':'N/A';}
+  let resHtml='';
+  if(r.psutil_missing){resHtml='<div style="color:var(--muted2);font-size:.84rem;margin-bottom:.5rem">System metrics unavailable: psutil is not installed</div>';}
+  resHtml+=m('System CPU',pctFmt(cpu.system_percent))+
+    m('Process CPU',pctFmt(cpu.process_percent))+
     m('CPU Cores',fmt(cpu.cores))+
     m('Total RAM',fmtBytes(mem.total_bytes))+m('Available RAM',fmtBytes(mem.available_bytes))+
-    m('Process RSS',fmtBytes(mem.process_rss_bytes))+m('Process Memory',mem.process_percent!=null?mem.process_percent+'%':'N/A')+
+    m('Process RSS',fmtBytes(mem.process_rss_bytes))+m('Process Memory',pctFmt(mem.process_percent))+
     m('Threads',fmt(proc.threads))+m('Process Uptime',fmtUptime(proc.uptime_seconds||0));
+  document.getElementById('sm-resources').innerHTML=resHtml;
 
+  let rm=d.runtime_metrics||{};
   let warns=[];
   if(pct>=90)warns.push('DNS worker usage: '+pct+'%');
   if(proc.threads&&proc.threads>200)warns.push('High thread count: '+proc.threads);
+  if(w.rejected_total>0)warns.push('Total rejected requests: '+w.rejected_total);
+  if(w.waiting>0)warns.push(w.waiting+' request(s) waiting for DNS worker slots');
   document.getElementById('sm-diagnostics').innerHTML=
     (warns.length?warns.map(function(w){return '<div class="sm-warn">'+w+'</div>';}).join(''):'<div style="color:#22c55e;font-size:.84rem">No warnings</div>')+
-    m('Active Requests',d._active_total||0);
+    m('Total DNS Requests',rm.dns_requests_total||0)+
+    m('Cache Hits',rm.dns_cache_hits_total||0)+
+    m('Cache Misses',rm.dns_cache_misses_total||0)+
+    m('Filter Blocks',rm.dns_filter_blocks_total||0)+
+    m('Upstream Errors',rm.dns_upstream_errors_total||0)+
+    m('Active Requests (now)',d._active_total||0);
 }
 
 function renderRequests(d){
@@ -12002,6 +12050,7 @@ class WebHandler(BaseHTTPRequestHandler):
             data = _system_monitor_api_summary()
             ar = get_active_requests_snapshot()
             data["_active_total"] = ar["total_active"]
+            data["runtime_metrics"] = get_runtime_metrics()
             self.send_json(data)
         elif path == "/api/system-monitor/workers":
             snap = dns_worker_limiter.snapshot()
