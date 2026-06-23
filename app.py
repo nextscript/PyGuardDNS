@@ -8927,8 +8927,8 @@ def system_monitor_page():
 .sm-modal-btn-ghost:hover{background:rgba(55,75,100,.2)}
 .sm-modal-btn-danger{color:#f87171;border-color:rgba(239,68,68,.25)}
 .sm-modal-btn-danger:hover{background:rgba(239,68,68,.1);border-color:rgba(239,68,68,.4)}
-.sm-log-body{flex:1;overflow:hidden;min-height:0}
-.sm-log-pre{height:100%;overflow:auto;padding:1rem 1.1rem;margin:0;font-family:ui-monospace,SFMono-Regular,Consolas,'Liberation Mono',monospace;font-size:.76rem;line-height:1.65;color:#c8d4e4;white-space:pre-wrap;word-break:break-all;background:rgba(5,8,14,.5);tab-size:2;scrollbar-width:thin;scrollbar-color:rgba(55,75,100,.4) transparent}
+.sm-log-body{flex:1;overflow:hidden;min-height:0;position:relative}
+.sm-log-pre{position:absolute;inset:0;overflow-y:auto;padding:1rem 1.1rem;margin:0;font-family:ui-monospace,SFMono-Regular,Consolas,'Liberation Mono',monospace;font-size:.76rem;line-height:1.65;color:#c8d4e4;white-space:pre-wrap;word-break:break-all;background:rgba(5,8,14,.5);tab-size:2;scrollbar-width:thin;scrollbar-color:rgba(55,75,100,.4) transparent}
 .sm-log-pre::-webkit-scrollbar{width:6px}
 .sm-log-pre::-webkit-scrollbar-track{background:transparent}
 .sm-log-pre::-webkit-scrollbar-thumb{background:rgba(55,75,100,.4);border-radius:3px}
