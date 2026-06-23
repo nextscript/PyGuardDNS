@@ -8914,7 +8914,29 @@ def system_monitor_page():
 .sm-req-table th{text-align:left;padding:.4rem .5rem;border-bottom:1px solid var(--border);color:var(--muted2);font-weight:600;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em}
 .sm-req-table td{padding:.35rem .5rem;border-bottom:1px solid rgba(30,45,61,.2);font-variant-numeric:tabular-nums}
 .sm-warn{color:#eab308;font-size:.82rem;margin-top:.4rem}
-@media(max-width:980px){.sm-grid{grid-template-columns:1fr}}
+.sm-modal-backdrop{display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.55);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);align-items:center;justify-content:center;animation:smFadeIn .15s ease}
+.sm-modal{background:#0d1424;border:1px solid rgba(55,75,100,.45);border-radius:.85rem;width:min(92vw,940px);max-height:85vh;display:flex;flex-direction:column;box-shadow:0 12px 48px rgba(0,0,0,.5),0 0 0 1px rgba(100,130,180,.06);animation:smSlideUp .2s ease}
+.sm-modal-header{display:flex;align-items:center;justify-content:space-between;padding:.75rem 1.1rem;border-bottom:1px solid rgba(55,75,100,.35);background:rgba(15,22,38,.6)}
+.sm-modal-title-row{display:flex;align-items:center;gap:.55rem}
+.sm-modal-title{font-weight:800;font-size:.95rem;letter-spacing:-.01em}
+.sm-modal-badge{font-size:.7rem;font-weight:600;padding:.15rem .5rem;border-radius:10px;background:rgba(100,130,180,.12);color:var(--muted2);letter-spacing:.02em}
+.sm-modal-actions{display:flex;align-items:center;gap:.3rem}
+.sm-modal-btn{display:inline-flex;align-items:center;justify-content:center;gap:.3rem;padding:.35rem .7rem;border-radius:.4rem;border:1px solid rgba(55,75,100,.4);background:transparent;color:var(--text);font-size:.8rem;font-weight:600;cursor:pointer;transition:all .15s}
+.sm-modal-btn:hover{background:rgba(55,75,100,.2);border-color:rgba(80,110,150,.5)}
+.sm-modal-btn-ghost{border-color:transparent;padding:.35rem .45rem}
+.sm-modal-btn-ghost:hover{background:rgba(55,75,100,.2)}
+.sm-modal-btn-danger{color:#f87171;border-color:rgba(239,68,68,.25)}
+.sm-modal-btn-danger:hover{background:rgba(239,68,68,.1);border-color:rgba(239,68,68,.4)}
+.sm-log-body{flex:1;overflow:hidden;min-height:0}
+.sm-log-pre{height:100%;overflow:auto;padding:1rem 1.1rem;margin:0;font-family:ui-monospace,SFMono-Regular,Consolas,'Liberation Mono',monospace;font-size:.76rem;line-height:1.65;color:#c8d4e4;white-space:pre-wrap;word-break:break-all;background:rgba(5,8,14,.5);tab-size:2;scrollbar-width:thin;scrollbar-color:rgba(55,75,100,.4) transparent}
+.sm-log-pre::-webkit-scrollbar{width:6px}
+.sm-log-pre::-webkit-scrollbar-track{background:transparent}
+.sm-log-pre::-webkit-scrollbar-thumb{background:rgba(55,75,100,.4);border-radius:3px}
+.sm-modal-footer{display:flex;align-items:center;justify-content:space-between;padding:.5rem 1.1rem;border-top:1px solid rgba(55,75,100,.25);background:rgba(15,22,38,.4)}
+.sm-modal-footer-hint{font-size:.72rem;color:var(--muted2);display:flex;align-items:center}
+@keyframes smFadeIn{from{opacity:0}to{opacity:1}}
+@keyframes smSlideUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+@media(max-width:980px){.sm-grid{grid-template-columns:1fr}.sm-modal{width:96vw;max-height:90vh}}
 </style>
 <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem">
   <div>
@@ -8928,16 +8950,27 @@ def system_monitor_page():
     <a class="sm-btn" href="/settings">Edit Limits</a>
   </div>
 </div>
-<div id="sm-log-modal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.6);align-items:center;justify-content:center">
-  <div style="background:var(--card);border:1px solid var(--border);border-radius:.7rem;width:min(90vw,900px);max-height:85vh;display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,.4)">
-    <div style="display:flex;align-items:center;justify-content:space-between;padding:.8rem 1rem;border-bottom:1px solid var(--border)">
-      <span style="font-weight:800;font-size:.95rem">System Monitor Log</span>
-      <div style="display:flex;gap:.4rem">
-        <button class="sm-btn sm-btn-danger" onclick="smClearLog()">Clear</button>
-        <button class="sm-btn" onclick="smCloseLog()">Close</button>
+<div id="sm-log-modal" class="sm-modal-backdrop">
+  <div class="sm-modal">
+    <div class="sm-modal-header">
+      <div class="sm-modal-title-row">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="opacity:.6"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+        <span class="sm-modal-title">Monitor Log</span>
+        <span id="sm-log-lines" class="sm-modal-badge">0 lines</span>
+      </div>
+      <div class="sm-modal-actions">
+        <button class="sm-modal-btn sm-modal-btn-ghost" onclick="smRefreshLog()" title="Refresh"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg></button>
+        <button class="sm-modal-btn sm-modal-btn-danger" onclick="smClearLog()">Clear</button>
+        <button class="sm-modal-btn" onclick="smCloseLog()"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
       </div>
     </div>
-    <pre id="sm-log-content" style="flex:1;overflow:auto;padding:.8rem 1rem;margin:0;font-size:.78rem;line-height:1.5;color:var(--text);white-space:pre-wrap;word-break:break-all">Loading...</pre>
+    <div class="sm-log-body">
+      <pre id="sm-log-content" class="sm-log-pre">Loading...</pre>
+    </div>
+    <div class="sm-modal-footer">
+      <span class="sm-modal-footer-hint">system-monitor.log</span>
+      <label class="sm-modal-footer-hint" style="cursor:pointer"><input type="checkbox" id="sm-log-autoscroll" checked style="margin-right:.3rem;accent-color:var(--accent)">Auto-scroll</label>
+    </div>
   </div>
 </div>
 <div class="sm-grid">
@@ -9159,10 +9192,9 @@ window.smAction = function(url, msg){
     .catch(function(e){ document.getElementById('sm-action-result').innerHTML = '<span style="color:#f87171">Error: ' + e.message + '</span>'; });
 };
 
-window.smOpenLog = function(){
-  var modal = document.getElementById('sm-log-modal');
+function loadLog(){
   var content = document.getElementById('sm-log-content');
-  modal.style.display = 'flex';
+  var badge = document.getElementById('sm-log-lines');
   content.textContent = 'Loading...';
   fetch('/api/system-monitor/log', {credentials: 'same-origin'})
     .then(function(r){
@@ -9170,28 +9202,51 @@ window.smOpenLog = function(){
       return r.json();
     })
     .then(function(d){
-      content.textContent = d.content || '(empty)';
-      content.scrollTop = content.scrollHeight;
+      var text = d.content || '';
+      if(!text.trim()){
+        content.textContent = 'No log entries yet. DNS requests will appear here once traffic flows.';
+        badge.textContent = '0 lines';
+      } else {
+        content.textContent = text;
+        var lines = text.split(String.fromCharCode(10)).filter(function(l){return l.trim();}).length;
+        badge.textContent = lines + ' line' + (lines!==1?'s':'');
+        if(document.getElementById('sm-log-autoscroll').checked){
+          content.scrollTop = content.scrollHeight;
+        }
+      }
     })
-    .catch(function(e){ content.textContent = 'Error: ' + e.message; });
+    .catch(function(e){ content.textContent = 'Error: ' + e.message; badge.textContent = 'error'; });
+}
+
+window.smOpenLog = function(){
+  document.getElementById('sm-log-modal').style.display = 'flex';
+  loadLog();
 };
+
+window.smRefreshLog = function(){ loadLog(); };
 
 window.smCloseLog = function(){
   document.getElementById('sm-log-modal').style.display = 'none';
 };
 
 window.smClearLog = function(){
-  if(!confirm('Clear monitor log?')) return;
+  if(!confirm('Clear all log entries?')) return;
   fetch('/api/system-monitor/log/clear', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'csrf_token=' + encodeURIComponent(csrf)})
     .then(function(r){ return r.json(); })
     .then(function(d){
-      if(d.ok) document.getElementById('sm-log-content').textContent = '(cleared)';
+      if(d.ok){
+        document.getElementById('sm-log-content').textContent = 'Log cleared.';
+        document.getElementById('sm-log-lines').textContent = '0 lines';
+      }
     })
     .catch(function(e){ document.getElementById('sm-log-content').textContent = 'Error: ' + e.message; });
 };
 
 document.getElementById('sm-log-modal').addEventListener('click', function(e){
   if(e.target === this) smCloseLog();
+});
+document.addEventListener('keydown', function(e){
+  if(e.key === 'Escape' && document.getElementById('sm-log-modal').style.display === 'flex') smCloseLog();
 });
 })();
 </script>
