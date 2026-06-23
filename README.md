@@ -49,6 +49,9 @@ By default, the application listens on DNS port `53` for UDP/TCP and serves the 
 - SQLite RAM mode loads the database into memory for runtime reads/writes, with optional `/dev/shm` on Linux; syncs back to disk at configurable intervals and on shutdown
 - Audit log for administrative actions
 - Instance lock to prevent multiple server instances
+- Dynamic DNS worker limiter with automatic burst expansion and cooldown shrink
+- System Monitor dashboard with live DNS worker, upstream, resource, and active request metrics
+- Automatic system-monitor.log rotation every 24 hours with gzip compression and 30-day retention
 - Automatic crash reporting with thread dumps
 - Start scripts for Windows and Linux/macOS
 - CLI commands for status, backup, restore, blocklist updates, and domain testing
@@ -88,6 +91,8 @@ By default, the application listens on DNS port `53` for UDP/TCP and serves the 
 | Load-balancing resolver | Yes | Yes | Limited |
 | Bootstrap resolver | Yes | Yes | No native support |
 | Runtime metrics API | Yes | Yes | Limited |
+| Dynamic worker limiter | Yes | No | No |
+| System monitor dashboard | Yes | No | No |
 
 ### Summary
 
@@ -159,8 +164,13 @@ Important runtime values can be configured through environment variables:
 | `LOCALDNSGUARD_DNS_HOST` | `0.0.0.0` | Host/IP for DNS UDP/TCP |
 | `LOCALDNSGUARD_DNS_PORT` | `53` | DNS port |
 | `LOCALDNSGUARD_STRICT_DNS_PORT` | `0` | If set to `1`, the app exits when the DNS port is already in use |
-| `LOCALDNSGUARD_MAX_DNS_WORKERS` | `48` | Maximum concurrent DNS requests |
-| `LOCALDNSGUARD_MAX_UPSTREAM_WORKERS` | `64` | Maximum concurrent upstream requests |
+| `LOCALDNSGUARD_MAX_DNS_WORKERS` | `32` | DNS worker base limit |
+| `LOCALDNSGUARD_MAX_DNS_WORKERS_BURST` | `64` | DNS worker burst limit (must be >= base) |
+| `LOCALDNSGUARD_DNS_WORKER_SHRINK_SECONDS` | `60` | Seconds without overload before burst limit returns to base |
+| `LOCALDNSGUARD_DNS_WORKER_ACQUIRE_TIMEOUT` | `0.05` | Max seconds to wait for a worker slot (0 = reject immediately) |
+| `LOCALDNSGUARD_MAX_UPSTREAM_WORKERS` | `16` | Maximum concurrent upstream requests |
+| `LOCALDNSGUARD_MAX_TCP_CONNECTIONS` | `128` | Max concurrent TCP client connections |
+| `LOCALDNSGUARD_MAX_DOT_CONNECTIONS` | `128` | Max concurrent DNS-over-TLS client connections |
 | `LOCALDNSGUARD_ENCRYPTED_DNS_HOST` | DNS host | Host/IP for DoT/DoH/DoQ |
 | `LOCALDNSGUARD_ENCRYPTED_DNS_DOMAIN` | empty | Public name for encrypted DNS |
 | `LOCALDNSGUARD_DNS_TLS_PORT` | `853` | Port for DNS-over-TLS |
@@ -299,6 +309,62 @@ The DNS cache supports negative caching (NXDOMAIN and NODATA responses) with con
 Hot-path counters (cache hits/misses, filter decisions, upstream errors, query-log drops, queue sizes, dropped client registrations) are available through `/metrics` and `/api/runtime_metrics`. The query log includes detailed timing metrics: upstream protocol, response time, connect time, handshake time, upstream query time, DNSSEC status, pool reuse, stale serving, and prefetch triggers.
 
 `benchmark_request_path.py` can reproduce cache-hit, clean-miss, blocked, and mixed traffic patterns, optionally with a simulated slow disk, to measure the effect of changes on this path. `benchmark_resolver.py` measures cold cache, warm cache, negative cache, NXDOMAIN cache, and parallel race resolver performance.
+
+## Dynamic DNS Worker Limiter
+
+DNS request concurrency is managed by the `DynamicDNSWorkerLimiter` in `dynamic_worker_limiter.py`. It controls how many DNS requests are processed simultaneously, with automatic burst expansion under load and cooldown shrink back to the base limit.
+
+### How It Works
+
+- **Base limit**: The normal maximum number of concurrent DNS workers (default: `32`).
+- **Burst limit**: When all base slots are occupied and a new request arrives, the limiter automatically expands by one slot, up to the burst limit (default: `64`). This allows temporary traffic spikes without dropping requests.
+- **Shrink cooldown**: After the last overload event, the limiter waits for a configurable cooldown period (default: `60` seconds). If no further overload occurs and active workers drop below the base limit, the limit resets back to base.
+- **Acquire timeout**: Each incoming DNS request tries to acquire a worker slot within a short timeout (default: `0.05` seconds). If no slot is available, the request is rejected and counted.
+- **Rejection tracking**: Rejected requests are counted per protocol (UDP, TCP, DoT) for diagnostics.
+
+A background maintenance thread runs every 3 seconds to trigger cooldown shrinks even if no new requests arrive.
+
+### Configuration
+
+Worker limits can be configured through environment variables or the Settings page in the web interface:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `LOCALDNSGUARD_MAX_DNS_WORKERS` | `32` | DNS worker base limit |
+| `LOCALDNSGUARD_MAX_DNS_WORKERS_BURST` | `64` | DNS worker burst limit (must be >= base) |
+| `LOCALDNSGUARD_DNS_WORKER_SHRINK_SECONDS` | `60` | Seconds without overload before limit returns to base |
+| `LOCALDNSGUARD_DNS_WORKER_ACQUIRE_TIMEOUT` | `0.05` | Max seconds to wait for a worker slot (0 = reject immediately) |
+| `LOCALDNSGUARD_MAX_UPSTREAM_WORKERS` | `16` | Fixed upstream concurrency limit |
+| `LOCALDNSGUARD_MAX_TCP_CONNECTIONS` | `128` | Max concurrent TCP client connections |
+| `LOCALDNSGUARD_MAX_DOT_CONNECTIONS` | `128` | Max concurrent DNS-over-TLS client connections |
+
+## System Monitor
+
+The System Monitor page (`/system-monitor`) provides a live overview of the server's runtime state. It auto-refreshes every 2 seconds and shows:
+
+- **DNS Workers**: active, free, peak, current limit, base/burst limit, burst expansions, rejected requests (total and per protocol)
+- **Upstream Workers**: active and max limit
+- **Network**: status of UDP, TCP, DoT, DoH, and DoQ listeners, thread count
+- **System Resources**: CPU (system and process), memory (total, available, process RSS), PID, uptime
+- **Active Requests**: currently processing DNS requests with client, domain, protocol, stage, and duration
+- **Monitor Log**: live view of `system-monitor.log` with per-request START/STAGE/END tracing
+
+### System Monitor API
+
+| Method | Endpoint | Description |
+| --- | --- | --- |
+| `GET` | `/api/system-monitor/summary` | Full summary: server info, DNS/upstream workers, network, resources |
+| `GET` | `/api/system-monitor/workers` | DNS and upstream worker stats with burst/rejection counters |
+| `GET` | `/api/system-monitor/active-requests` | Currently processing DNS requests |
+| `GET` | `/api/system-monitor/resources` | CPU, memory, and process info |
+| `GET` | `/api/system-monitor/diagnostics` | Warnings when worker usage is high or requests are waiting |
+| `GET` | `/api/system-monitor/log` | Raw content of `system-monitor.log` |
+| `POST` | `/api/system-monitor/log/clear` | Clear the monitor log |
+| `POST` | `/api/system-monitor/dns/restart` | Restart DNS listeners |
+| `POST` | `/api/system-monitor/dns/stop` | Stop DNS listeners |
+| `POST` | `/api/system-monitor/dns/start` | Start DNS listeners |
+| `POST` | `/api/system-monitor/cache/clear` | Clear DNS cache |
+| `POST` | `/api/system-monitor/statistics/reset` | Reset worker peak/rejection statistics |
 
 ## Blocklist Updates
 
@@ -559,6 +625,10 @@ LOCALDNSGUARD_DB_IN_MEMORY=0
 
 The sync interval can be changed with `LOCALDNSGUARD_DB_MEMORY_SYNC_INTERVAL`. A hard power loss or process crash can lose changes made since the last sync.
 
+### Log Rotation
+
+The system monitor log (`system-monitor.log`) is automatically compressed into a gzip backup every 24 hours. Backups are stored in the `log-backups/` directory with a timestamp in the filename (e.g. `system-monitor_2026-06-23_03-00-00.log.gz`). After each backup, the active log is cleared. Backups older than 30 days are automatically deleted.
+
 Upstream configuration is stored as individual JSON files in `data/upstreams/`.
 
 Blocklist caches, cosmetic rules, unsupported rules, and original text are stored as files under `data/blocklists/`.
@@ -621,23 +691,23 @@ Tests cold cache, warm cache, NXDOMAIN cache hits, negative cache misses, and pa
 ## Project Structure
 
 ```txt
-app.py                    Web UI, DNS server, API, CLI, and runtime
-dns_engine.py             Filter engine for rules, rewrites, SafeSearch, and service blocks
-dnssec_validator.py       DNSSEC chain-of-trust validation and trust anchor store
-blocklist_manager.py      Import, parsing, update, and storage of blocklists
-client_manager.py         Profiles, clients, profile rules, and service blocks
-rules_engine.py           User rule format (pgrules), blocklist conversion, and cache I/O
-upstream_manager.py       Upstream resolver configuration stored as JSON files
-benchmark_filter_engine.py Synthetic filter-engine benchmark
-benchmark_request_path.py Synthetic benchmark for the DNS request hot path
-benchmark_resolver.py     Benchmark for cache, negative cache, and resolver modes
-data/root-anchors.xml     IANA root trust anchor (KSK key digests and public keys)
-data/root.key             Root DNSKEYs in BIND format (optional override)
-data/trust_anchors.json   RFC 5011 trust anchor state
-requirements.txt          Runtime Python dependencies
-start-pyguarddns.bat      Windows start script
-start-pyguarddns.sh       Linux/macOS start script
-```
-
-start-pyguarddns.sh       Linux/macOS start script
+app.py                      Web UI, DNS server, API, CLI, and runtime
+dns_engine.py               Filter engine for rules, rewrites, SafeSearch, and service blocks
+dnssec_validator.py         DNSSEC chain-of-trust validation and trust anchor store
+dynamic_worker_limiter.py   Dynamic DNS worker limiter with burst expansion and cooldown shrink
+blocklist_manager.py        Import, parsing, update, and storage of blocklists
+client_manager.py           Profiles, clients, profile rules, and service blocks
+rules_engine.py             User rule format (pgrules), blocklist conversion, and cache I/O
+upstream_manager.py         Upstream resolver configuration stored as JSON files
+benchmark_filter_engine.py  Synthetic filter-engine benchmark
+benchmark_request_path.py   Synthetic benchmark for the DNS request hot path
+benchmark_resolver.py       Benchmark for cache, negative cache, and resolver modes
+system-monitor.log          Live per-request tracing log (START/STAGE/END)
+log-backups/                Compressed system-monitor.log backups (auto-rotated every 24 h, pruned after 30 days)
+data/root-anchors.xml       IANA root trust anchor (KSK key digests and public keys)
+data/root.key               Root DNSKEYs in BIND format (optional override)
+data/trust_anchors.json     RFC 5011 trust anchor state
+requirements.txt            Runtime Python dependencies
+start-pyguarddns.bat        Windows start script
+start-pyguarddns.sh         Linux/macOS start script
 ```
