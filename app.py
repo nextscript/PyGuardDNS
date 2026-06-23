@@ -3,6 +3,7 @@ import base64
 import csv
 import atexit
 import faulthandler
+import gzip
 import hashlib
 import hmac
 import io
@@ -334,6 +335,50 @@ def _monitor_log(msg):
                 f.write(line)
     except Exception:
         pass
+
+
+_MONITOR_LOG_BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "log-backups")
+_MONITOR_LOG_BACKUP_INTERVAL = 86400
+_MONITOR_LOG_BACKUP_RETENTION_DAYS = 30
+
+
+def _purge_old_backups():
+    cutoff = time.time() - _MONITOR_LOG_BACKUP_RETENTION_DAYS * 86400
+    try:
+        for name in os.listdir(_MONITOR_LOG_BACKUP_DIR):
+            if not name.endswith(".log.gz"):
+                continue
+            path = os.path.join(_MONITOR_LOG_BACKUP_DIR, name)
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+    except Exception:
+        pass
+
+
+def _rotate_monitor_log():
+    """Compress system-monitor.log into a dated .gz backup every 24 h."""
+    os.makedirs(_MONITOR_LOG_BACKUP_DIR, exist_ok=True)
+    while not server_shutdown_event.is_set():
+        server_shutdown_event.wait(_MONITOR_LOG_BACKUP_INTERVAL)
+        if server_shutdown_event.is_set():
+            break
+        _purge_old_backups()
+        with _monitor_log_lock:
+            try:
+                if not os.path.isfile(_monitor_log_path) or os.path.getsize(_monitor_log_path) == 0:
+                    continue
+                stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+                gz_name = os.path.join(_MONITOR_LOG_BACKUP_DIR, f"system-monitor_{stamp}.log.gz")
+                with open(_monitor_log_path, "rb") as src, gzip.open(gz_name, "wb") as dst:
+                    while True:
+                        chunk = src.read(1 << 20)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+                with open(_monitor_log_path, "w", encoding="utf-8") as f:
+                    f.truncate(0)
+            except Exception:
+                pass
 
 
 def register_active_request(client_ip, domain, qtype, protocol):
@@ -13453,6 +13498,9 @@ def main():
         log.flush()
         threading.Thread(target=_worker_limiter_maintenance_loop, name="worker-limiter-maintenance", daemon=True).start()
         log.write(f"{now_iso()} worker limiter maintenance ready\n")
+        log.flush()
+        threading.Thread(target=_rotate_monitor_log, name="monitor-log-rotate", daemon=True).start()
+        log.write(f"{now_iso()} monitor log rotation ready (every 24h -> log-backups/)\n")
         log.flush()
         start_update_checker()
         log.write(f"{now_iso()} update checker ready (checks every 1 hour)\n")
