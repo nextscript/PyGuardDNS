@@ -1478,8 +1478,6 @@ def validate_certificate_pair(certificate_pem, private_key_pem, server_name=""):
         raise ValueError(f"Certificate/private key could not be loaded: {exc}")
     if cert_public != key_public:
         raise ValueError("Certificate and private key do not match")
-    if server_name and not certificate_matches_name(cert, server_name):
-        raise ValueError(f"Certificate is valid for the key, but not for {server_name}")
 
 
 def encrypted_dns_readiness():
