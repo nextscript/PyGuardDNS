@@ -322,6 +322,20 @@ def get_runtime_metrics():
     return snapshot
 
 
+_monitor_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "system-monitor.log")
+_monitor_log_lock = threading.Lock()
+
+
+def _monitor_log(msg):
+    try:
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n"
+        with _monitor_log_lock:
+            with open(_monitor_log_path, "a", encoding="utf-8") as f:
+                f.write(line)
+    except Exception:
+        pass
+
+
 def register_active_request(client_ip, domain, qtype, protocol):
     global _active_request_counter
     with _active_requests_lock:
@@ -340,6 +354,8 @@ def register_active_request(client_ip, domain, qtype, protocol):
             "upstream_name": "",
             "blocked": False,
         }
+    snap = dns_worker_limiter.snapshot()
+    _monitor_log(f"[REQ #{rid}] START  proto={protocol} client={client_ip} | workers active={snap.active_workers}/{snap.current_limit} peak={snap.peak_active_workers} burst={snap.burst_expansions_total} rejected={snap.rejected_total}")
     return rid
 
 
@@ -348,11 +364,17 @@ def update_active_request(request_id, **kwargs):
         entry = _active_requests.get(request_id)
         if entry:
             entry.update(kwargs)
+            if "domain" in kwargs or "stage" in kwargs:
+                _monitor_log(f"[REQ #{request_id}] STAGE  {entry.get('stage','?'):20s} domain={entry.get('domain','')} type={entry.get('query_type','')} cache={entry.get('cache_status','')}")
 
 
 def unregister_active_request(request_id):
     with _active_requests_lock:
-        _active_requests.pop(request_id, None)
+        entry = _active_requests.pop(request_id, None)
+    if entry:
+        duration_ms = (time.monotonic() - entry["started_monotonic"]) * 1000
+        snap = dns_worker_limiter.snapshot()
+        _monitor_log(f"[REQ #{request_id}] END    {duration_ms:8.2f}ms proto={entry['protocol']} domain={entry.get('domain','')} type={entry.get('query_type','')} stage={entry.get('stage','')} cache={entry.get('cache_status','')} blocked={entry.get('blocked',False)} | workers active={snap.active_workers}/{snap.current_limit}")
 
 
 def get_active_requests_snapshot(limit=500):
