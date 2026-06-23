@@ -1471,8 +1471,8 @@ def validate_certificate_pair(certificate_pem, private_key_pem, server_name=""):
         return
     if not certificate_pem.startswith("-----BEGIN CERTIFICATE-----"):
         raise ValueError("Certificate must start with -----BEGIN CERTIFICATE----- or -----BEGIN PKCS7-----")
-    if not private_key_pem.startswith(("-----BEGIN RSA PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----")):
-        raise ValueError("Private key must start with -----BEGIN RSA PRIVATE KEY----- or -----BEGIN PRIVATE KEY-----")
+    if not private_key_pem.startswith(("-----BEGIN RSA PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----", "-----BEGIN EC PRIVATE KEY-----")):
+        raise ValueError("Private key must start with -----BEGIN RSA PRIVATE KEY-----, -----BEGIN PRIVATE KEY----- or -----BEGIN EC PRIVATE KEY-----")
     try:
         from cryptography import x509
         from cryptography.hazmat.primitives import serialization
@@ -10685,6 +10685,14 @@ class WebHandler(BaseHTTPRequestHandler):
         if path == "/favicon.ico":
             self.send_favicon()
             return
+        if path.startswith("/control/"):
+            if not self._adguard_auth():
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="AdGuard Home"')
+                self.end_headers()
+                return
+            self._adguard_control_get(path)
+            return
         if path.startswith("/api/"):
             if not self.api_auth_mode():
                 self.send_json({"error": "unauthorized"}, 401)
@@ -10822,6 +10830,14 @@ class WebHandler(BaseHTTPRequestHandler):
 
     def _do_POST(self):
         path = urlparse(self.path).path
+        if path == "/control/protection":
+            if not self._adguard_auth():
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="AdGuard Home"')
+                self.end_headers()
+                return
+            self._adguard_control_protection()
+            return
         if path == "/api/cosmeticlists/log":
             self._handle_cosmetic_log()
             return
@@ -11481,6 +11497,156 @@ class WebHandler(BaseHTTPRequestHandler):
                         db.commit()
                         return "token"
         return "session" if self.authed() else ""
+
+    # ------------------------------------------------------------------ #
+    #  AdGuard Home compatible API  (/control/*)                          #
+    # ------------------------------------------------------------------ #
+
+    def _adguard_auth(self):
+        auth = self.headers.get("Authorization", "")
+        if auth.lower().startswith("basic "):
+            try:
+                decoded = base64.b64decode(auth.split(" ", 1)[1]).decode("utf-8")
+                username, password = decoded.split(":", 1)
+            except Exception:
+                return False
+            stored_hash = get_setting("admin_password_hash", "")
+            if stored_hash:
+                try:
+                    return bcrypt.checkpw(password.encode("utf-8"), stored_hash.encode("utf-8"))
+                except Exception:
+                    return False
+            return username == "admin" and get_setting("admin_password_set", "0") == "0"
+        return bool(self.api_auth_mode())
+
+    def _adguard_control_get(self, path):
+        if path == "/control/stats":
+            self._adguard_stats()
+        elif path == "/control/status":
+            self._adguard_status()
+        elif path == "/control/filtering/status":
+            self._adguard_filtering_status()
+        else:
+            self.send_json({"error": "not found"}, 404)
+
+    def _adguard_stats(self):
+        summary = one("""
+            SELECT COUNT(*) total,
+                   COALESCE(SUM(blocked),0) blocked,
+                   COALESCE(SUM(CASE WHEN blocked=0 THEN 1 ELSE 0 END),0) replaced_safebrowsing,
+                   COALESCE(SUM(CASE WHEN status='rewritten' THEN 1 ELSE 0 END),0) replaced_parental
+            FROM query_log WHERE timestamp >= datetime('now','localtime','-24 hours')
+        """) or {"total": 0, "blocked": 0, "replaced_safebrowsing": 0, "replaced_parental": 0}
+        top_queried = rows("""
+            SELECT normalized_domain as domain, COUNT(*) as cnt
+            FROM query_log WHERE timestamp >= datetime('now','localtime','-24 hours')
+              AND normalized_domain != ''
+            GROUP BY normalized_domain ORDER BY cnt DESC LIMIT 10
+        """)
+        top_clients = rows("""
+            SELECT client_ip, COUNT(*) as cnt
+            FROM query_log WHERE timestamp >= datetime('now','localtime','-24 hours')
+            GROUP BY client_ip ORDER BY cnt DESC LIMIT 10
+        """)
+        top_blocked_domains = rows("""
+            SELECT normalized_domain as domain, COUNT(*) as cnt
+            FROM query_log WHERE blocked=1
+              AND timestamp >= datetime('now','localtime','-24 hours')
+              AND normalized_domain != ''
+            GROUP BY normalized_domain ORDER BY cnt DESC LIMIT 10
+        """)
+        hourly = rows("""
+            SELECT strftime('%Y-%m-%d %H', timestamp) as hr,
+                   COUNT(*) as total,
+                   COALESCE(SUM(blocked),0) as blocked
+            FROM query_log WHERE timestamp >= datetime('now','localtime','-24 hours')
+            GROUP BY hr ORDER BY hr
+        """)
+        dns_queries = [0] * 24
+        blocked_filtering = [0] * 24
+        for r in hourly:
+            try:
+                h = datetime.strptime(r["hr"], "%Y-%m-%d %H")
+                diff = datetime.now() - h
+                idx = 23 - int(diff.total_seconds() // 3600)
+                if 0 <= idx < 24:
+                    dns_queries[idx] = r["total"]
+                    blocked_filtering[idx] = r["blocked"]
+            except Exception:
+                pass
+        self.send_json({
+            "time_units": "hours",
+            "num_dns_queries": summary["total"],
+            "num_blocked_filtering": summary["blocked"],
+            "num_replaced_safebrowsing": 0,
+            "num_replaced_safesearch": 0,
+            "num_replaced_parental": 0,
+            "avg_processing_time": 0.014,
+            "top_queried_domains": [{r["domain"]: r["cnt"]} for r in top_queried],
+            "top_clients": [{r["client_ip"]: r["cnt"]} for r in top_clients],
+            "top_blocked_domains": [{r["domain"]: r["cnt"]} for r in top_blocked_domains],
+            "dns_queries": dns_queries,
+            "blocked_filtering": blocked_filtering,
+            "replaced_safebrowsing": [0] * 24,
+            "replaced_parental": [0] * 24,
+        })
+
+    def _adguard_status(self):
+        filtering = get_setting("filtering_enabled", "1") == "1"
+        self.send_json({
+            "version": "PyGuardDNS-compat",
+            "language": "en",
+            "dns_addresses": [f"{DNS_HOST}:{DNS_PORT}"],
+            "dns_port": DNS_PORT,
+            "http_port": WEB_PORT,
+            "protection_enabled": filtering,
+            "protection_disabled_duration": 0,
+            "dhcp_available": False,
+            "running": True,
+        })
+
+    def _adguard_filtering_status(self):
+        filtering = get_setting("filtering_enabled", "1") == "1"
+        filters = []
+        if blocklist_manager:
+            for bl in blocklist_manager.get_all():
+                filters.append({
+                    "url": bl.get("url", ""),
+                    "name": bl.get("name", ""),
+                    "last_updated": bl.get("last_successful_update", "") or bl.get("last_update", ""),
+                    "id": bl["id"],
+                    "rules_count": bl.get("rule_count", 0),
+                    "enabled": bool(bl.get("enabled", 1)),
+                })
+        user_rules_count = one("SELECT COUNT(*) c FROM rules WHERE enabled=1")
+        total_rules = (user_rules_count["c"] if user_rules_count else 0) + sum(f["rules_count"] for f in filters)
+        self.send_json({
+            "enabled": filtering,
+            "interval": int(get_setting("filter_update_interval_hours", "24")),
+            "filters": filters,
+            "whitelist_filters": [],
+            "user_rules": [],
+            "total_rules_count": total_rules,
+        })
+
+    def _adguard_control_protection(self):
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        body = self.rfile.read(length)
+        try:
+            data = json.loads(body)
+        except Exception:
+            self.send_json({"error": "invalid json"}, 400)
+            return
+        enabled = data.get("enabled", True)
+        set_setting("filtering_enabled", "1" if enabled else "0")
+        try:
+            invalidate_rules_cache()
+        except Exception:
+            pass
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b"{}")
 
     def csrf_token(self):
         session = self.current_session()
