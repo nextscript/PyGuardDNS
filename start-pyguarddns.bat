@@ -189,5 +189,5 @@ set "PYTHON_EXE=%BASE_PYTHON_EXE%"
 exit /b 1
 
 :runtime_requirements_ok
-"%PYTHON_EXE%" -c "import bcrypt, certifi, cryptography, OpenSSL, service_identity, nacl, aioquic" >nul 2>&1
+"%PYTHON_EXE%" -c "import bcrypt, certifi, cryptography, OpenSSL, service_identity, nacl, aioquic, psutil" >nul 2>&1
 exit /b %errorlevel%

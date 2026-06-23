@@ -123,6 +123,7 @@ import OpenSSL
 import service_identity
 import nacl
 import aioquic
+import psutil
 PY
 }
 

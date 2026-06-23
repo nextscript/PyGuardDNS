@@ -8747,14 +8747,14 @@ relayInput.addEventListener('input', detectRelay);
 </script>{edit_modals}""", "Upstreams")
 
 
-_psutil_available = False
-_psutil_proc = None
 try:
     import psutil as _psutil_mod
     _psutil_available = True
     _psutil_proc = _psutil_mod.Process()
-except Exception:
+except ImportError:
     _psutil_mod = None
+    _psutil_available = False
+    _psutil_proc = None
 
 _system_resources_cache = [None]
 _system_resources_lock = threading.Lock()
