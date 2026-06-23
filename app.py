@@ -8978,9 +8978,7 @@ def system_monitor_page():
     </div>
   </div>
 
-</div>
-<div id="sm-debug" style="margin-top:1rem;padding:.7rem;background:rgba(11,18,32,.6);border:1px solid var(--border);border-radius:.5rem;font-size:.75rem;font-family:monospace;color:var(--muted2);max-height:300px;overflow:auto;display:none"></div>
-<script>
+</div><script>
 (function(){
 var paused=false, timer=null, abortCtl=null, pollCount=0;
 var csrf=decodeURIComponent((document.cookie.match(/(?:^|;)[ ]*csrf_token=([^;]*)/) || ['',''])[1]);
@@ -9098,7 +9096,6 @@ function poll(){
   if(abortCtl) try { abortCtl.abort(); } catch(e){}
   abortCtl = new AbortController();
   pollCount++;
-  var dbg = document.getElementById('sm-debug');
   fetch('/api/system-monitor/summary', {signal: abortCtl.signal, credentials: 'same-origin'})
     .then(function(r){
       if(!r.ok){
@@ -9109,12 +9106,6 @@ function poll(){
       return r.json();
     })
     .then(function(d){
-      if(pollCount <= 3){
-        dbg.style.display = 'block';
-        dbg.textContent = 'API Response (poll #' + pollCount + '): ' + JSON.stringify(d, null, 1).substring(0, 1500);
-      } else {
-        dbg.style.display = 'none';
-      }
       render(d);
       liveEl.textContent = 'Updated ' + new Date().toLocaleTimeString();
       liveEl.style.color = 'var(--muted2)';
@@ -9124,8 +9115,6 @@ function poll(){
         console.error('[SystemMonitor] fetch error:', e);
         liveEl.textContent = 'ERROR: ' + e.message;
         liveEl.style.color = '#f87171';
-        dbg.style.display = 'block';
-        dbg.textContent = 'Fetch failed: ' + e.message + ' | URL: /api/system-monitor/summary | Check browser console (F12) for details.';
       }
     });
 }
