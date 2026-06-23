@@ -1449,13 +1449,28 @@ def certificate_matches_name(cert, server_name):
     return False
 
 
-def validate_certificate_pair(certificate_pem, private_key_pem, server_name=""):
+def normalize_certificate_pem(certificate_pem):
     certificate_pem = (certificate_pem or "").strip()
+    if not certificate_pem or not certificate_pem.startswith("-----BEGIN PKCS7-----"):
+        return certificate_pem
+    try:
+        from cryptography.hazmat.primitives.serialization.pkcs7 import load_pem_pkcs7_certificates
+        from cryptography.hazmat.primitives.serialization import Encoding
+    except ImportError:
+        raise ValueError("PKCS#7 conversion requires cryptography")
+    certs = load_pem_pkcs7_certificates(certificate_pem.encode("utf-8"))
+    if not certs:
+        raise ValueError("PKCS#7 container contains no certificates")
+    return "\n".join(c.public_bytes(Encoding.PEM).decode("utf-8").strip() for c in certs)
+
+
+def validate_certificate_pair(certificate_pem, private_key_pem, server_name=""):
+    certificate_pem = normalize_certificate_pem((certificate_pem or "").strip())
     private_key_pem = (private_key_pem or "").strip()
     if not certificate_pem and not private_key_pem:
         return
     if not certificate_pem.startswith("-----BEGIN CERTIFICATE-----"):
-        raise ValueError("Certificate must start with -----BEGIN CERTIFICATE-----")
+        raise ValueError("Certificate must start with -----BEGIN CERTIFICATE----- or -----BEGIN PKCS7-----")
     if not private_key_pem.startswith(("-----BEGIN RSA PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----")):
         raise ValueError("Private key must start with -----BEGIN RSA PRIVATE KEY----- or -----BEGIN PRIVATE KEY-----")
     try:
@@ -1544,6 +1559,7 @@ def log_doq_event(message):
 
 
 def write_temp_pem_files(certificate_pem, private_key_pem):
+    certificate_pem = normalize_certificate_pem(certificate_pem)
     cert_file = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".crt")
     key_file = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".key")
     try:
