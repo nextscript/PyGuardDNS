@@ -200,9 +200,8 @@ class DynamicDNSWorkerLimiter:
             return
 
         now = time.monotonic()
-        reference_time = max(self.last_overload_time, self.last_activity_time)
 
-        if now - reference_time < self.shrink_after:
+        if now - self.last_overload_time < self.shrink_after:
             return
 
         old_limit = self.current_limit
