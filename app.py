@@ -12670,16 +12670,26 @@ class DoQRuntimeServer:
                         peer = self._quic._network_paths[0].addr[0] if self._quic._network_paths else ""
                         update_doq_metric("queries")
                         update_doq_metric("last_peer", peer)
-                        response = handle_dns_request(request, peer, "QUIC")
-                        payload = b"" if response is None else struct.pack("!H", len(response)) + response
-                        try:
-                            question = parse_dns_question(request)
-                            rcode = dns_response_rcode(response)
-                            if rcode and rcode != 0:
-                                with open("web-error.log", "a", encoding="utf-8") as log:
-                                    log.write(f"{now_iso()} dns-over-quic response peer={peer} domain={question['domain']} type={question['qtype_name']} rcode={rcode}\n")
-                        except Exception:
-                            pass
+                        if not dns_worker_limiter.acquire(timeout=DNS_WORKER_ACQUIRE_TIMEOUT):
+                            bump_runtime_metric("dns_worker_rejected_total")
+                            dns_worker_limiter.record_rejection("doq")
+                            _log_worker_exhausted("doq")
+                            err_resp = build_error_response(request, 2)
+                            payload = struct.pack("!H", len(err_resp)) + err_resp
+                        else:
+                            try:
+                                response = handle_dns_request(request, peer, "QUIC")
+                                payload = b"" if response is None else struct.pack("!H", len(response)) + response
+                                try:
+                                    question = parse_dns_question(request)
+                                    rcode = dns_response_rcode(response)
+                                    if rcode and rcode != 0:
+                                        with open("web-error.log", "a", encoding="utf-8") as log:
+                                            log.write(f"{now_iso()} dns-over-quic response peer={peer} domain={question['domain']} type={question['qtype_name']} rcode={rcode}\n")
+                                except Exception:
+                                    pass
+                            finally:
+                                dns_worker_limiter.release()
                     except Exception as exc:
                         update_doq_metric("errors")
                         update_doq_metric("last_error", str(exc))
