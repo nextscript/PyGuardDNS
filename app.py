@@ -11510,12 +11510,10 @@ class WebHandler(BaseHTTPRequestHandler):
                 username, password = decoded.split(":", 1)
             except Exception:
                 return False
-            stored_hash = get_setting("admin_password_hash", "")
-            if stored_hash:
-                try:
-                    return bcrypt.checkpw(password.encode("utf-8"), stored_hash.encode("utf-8"))
-                except Exception:
-                    return False
+            with db_lock:
+                user = db.execute("SELECT password_hash FROM users WHERE username=?", (username,)).fetchone()
+            if user:
+                return verify_password(password, user["password_hash"])
             return username == "admin" and get_setting("admin_password_set", "0") == "0"
         return bool(self.api_auth_mode())
 
