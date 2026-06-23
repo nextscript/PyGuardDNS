@@ -8924,7 +8924,20 @@ def system_monitor_page():
   <div style="display:flex;gap:.5rem;align-items:center">
     <span id="sm-live" style="font-size:.78rem;color:var(--muted2)">Updating...</span>
     <button class="sm-btn" onclick="smPause()" id="sm-pause-btn">Pause</button>
+    <button class="sm-btn" onclick="smOpenLog()" title="View monitor log" style="padding:.35rem .5rem;line-height:1"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg></button>
     <a class="sm-btn" href="/settings">Edit Limits</a>
+  </div>
+</div>
+<div id="sm-log-modal" style="display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.6);align-items:center;justify-content:center">
+  <div style="background:var(--card);border:1px solid var(--border);border-radius:.7rem;width:min(90vw,900px);max-height:85vh;display:flex;flex-direction:column;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:.8rem 1rem;border-bottom:1px solid var(--border)">
+      <span style="font-weight:800;font-size:.95rem">System Monitor Log</span>
+      <div style="display:flex;gap:.4rem">
+        <button class="sm-btn sm-btn-danger" onclick="smClearLog()">Clear</button>
+        <button class="sm-btn" onclick="smCloseLog()">Close</button>
+      </div>
+    </div>
+    <pre id="sm-log-content" style="flex:1;overflow:auto;padding:.8rem 1rem;margin:0;font-size:.78rem;line-height:1.5;color:var(--text);white-space:pre-wrap;word-break:break-all">Loading...</pre>
   </div>
 </div>
 <div class="sm-grid">
@@ -9145,6 +9158,41 @@ window.smAction = function(url, msg){
     })
     .catch(function(e){ document.getElementById('sm-action-result').innerHTML = '<span style="color:#f87171">Error: ' + e.message + '</span>'; });
 };
+
+window.smOpenLog = function(){
+  var modal = document.getElementById('sm-log-modal');
+  var content = document.getElementById('sm-log-content');
+  modal.style.display = 'flex';
+  content.textContent = 'Loading...';
+  fetch('/api/system-monitor/log', {credentials: 'same-origin'})
+    .then(function(r){
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(function(d){
+      content.textContent = d.content || '(empty)';
+      content.scrollTop = content.scrollHeight;
+    })
+    .catch(function(e){ content.textContent = 'Error: ' + e.message; });
+};
+
+window.smCloseLog = function(){
+  document.getElementById('sm-log-modal').style.display = 'none';
+};
+
+window.smClearLog = function(){
+  if(!confirm('Clear monitor log?')) return;
+  fetch('/api/system-monitor/log/clear', {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'csrf_token=' + encodeURIComponent(csrf)})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(d.ok) document.getElementById('sm-log-content').textContent = '(cleared)';
+    })
+    .catch(function(e){ document.getElementById('sm-log-content').textContent = 'Error: ' + e.message; });
+};
+
+document.getElementById('sm-log-modal').addEventListener('click', function(e){
+  if(e.target === this) smCloseLog();
+});
 })();
 </script>
 """, "System Monitor")
@@ -12153,6 +12201,15 @@ class WebHandler(BaseHTTPRequestHandler):
             if snap.waiters > 0:
                 warnings.append(f"{snap.waiters} request(s) waiting for DNS worker slots")
             self.send_json({"warnings": warnings, "thread_count": threading.active_count()})
+        elif path == "/api/system-monitor/log":
+            try:
+                with open(_monitor_log_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except FileNotFoundError:
+                content = ""
+            except Exception as exc:
+                content = f"Error reading log: {exc}"
+            self.send_json({"ok": True, "content": content})
         else:
             self.send_json({"error": "not found"}, 404)
 
@@ -12428,6 +12485,14 @@ class WebHandler(BaseHTTPRequestHandler):
             dns_worker_limiter.reset_statistics()
             log_admin_action(self.session_user(), "stats_reset", "Worker statistics reset", self.client_address[0])
             self.send_json({"ok": True, "message": "Statistics reset"})
+        elif path == "/api/system-monitor/log/clear":
+            try:
+                with open(_monitor_log_path, "w", encoding="utf-8") as f:
+                    f.write("")
+                log_admin_action(self.session_user(), "monitor_log_clear", "System monitor log cleared", self.client_address[0])
+                self.send_json({"ok": True, "message": "Log cleared"})
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 500)
         else:
             self.send_json({"error": "not found"}, 404)
 
