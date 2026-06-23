@@ -34,8 +34,11 @@ import urllib.request
 
 import bcrypt
 
+import collections
+
 from dns_engine import FilterEngine, FilterResult
 from blocklist_manager import BlocklistManager, fetch_url_text as fetch_blocklist_url_text, parse_filter_list, set_dns_resolver as _set_blocklist_dns_resolver
+from dynamic_worker_limiter import DynamicDNSWorkerLimiter, WorkerLimiterSnapshot
 from client_manager import ClientManager, SERVICE_DOMAINS, SERVICE_CATEGORIES, SAFESEARCH_REWRITES, YOUTUBE_SAFESEARCH_REWRITES, SAFESEARCH_PROFILE_COLUMNS
 try:
     from dnssec_validator import DNSSECValidator, DNSSECValidationStatus, ensure_root_trust_anchor, get_dnssec_metrics
@@ -214,8 +217,21 @@ doh_connection_cache = {}
 dnscrypt_cert_cache = {}
 rules_cache = None
 shutdown_signal_received = False
-dns_concurrency = threading.BoundedSemaphore(int(os.environ.get("LOCALDNSGUARD_MAX_DNS_WORKERS", "8")))
+dns_worker_limiter = DynamicDNSWorkerLimiter(
+    base_limit=max(1, int(os.environ.get("LOCALDNSGUARD_MAX_DNS_WORKERS", "32"))),
+    max_limit=max(1, int(os.environ.get("LOCALDNSGUARD_MAX_DNS_WORKERS_BURST", "64"))),
+    shrink_after=max(1, float(os.environ.get("LOCALDNSGUARD_DNS_WORKER_SHRINK_SECONDS", "60"))),
+)
+DNS_WORKER_ACQUIRE_TIMEOUT = max(0.0, float(os.environ.get("LOCALDNSGUARD_DNS_WORKER_ACQUIRE_TIMEOUT", "0.05")))
 upstream_concurrency = threading.BoundedSemaphore(int(os.environ.get("LOCALDNSGUARD_MAX_UPSTREAM_WORKERS", "16")))
+tcp_connection_semaphore = threading.BoundedSemaphore(max(1, int(os.environ.get("LOCALDNSGUARD_MAX_TCP_CONNECTIONS", "128"))))
+dot_connection_semaphore = threading.BoundedSemaphore(max(1, int(os.environ.get("LOCALDNSGUARD_MAX_DOT_CONNECTIONS", "128"))))
+TCP_IDLE_TIMEOUT = max(1, int(os.environ.get("LOCALDNSGUARD_TCP_IDLE_TIMEOUT", "30")))
+DOT_IDLE_TIMEOUT = max(1, int(os.environ.get("LOCALDNSGUARD_DOT_IDLE_TIMEOUT", "30")))
+
+_active_requests = {}
+_active_requests_lock = threading.Lock()
+_active_request_counter = 0
 db_write_queue = []
 db_write_lock = threading.Lock()
 upstream_metric_last_write = {}
@@ -304,6 +320,63 @@ def get_runtime_metrics():
     with _active_engine_lock:
         snapshot["filter_engine_generation"] = _filter_engine_generation
     return snapshot
+
+
+def register_active_request(client_ip, domain, qtype, protocol):
+    global _active_request_counter
+    with _active_requests_lock:
+        _active_request_counter += 1
+        rid = _active_request_counter
+        _active_requests[rid] = {
+            "request_id": rid,
+            "client_ip": client_ip,
+            "domain": domain,
+            "query_type": qtype,
+            "protocol": protocol,
+            "stage": "received",
+            "started_monotonic": time.monotonic(),
+            "started_at": time.time(),
+            "cache_status": "",
+            "upstream_name": "",
+            "blocked": False,
+        }
+    return rid
+
+
+def update_active_request(request_id, **kwargs):
+    with _active_requests_lock:
+        entry = _active_requests.get(request_id)
+        if entry:
+            entry.update(kwargs)
+
+
+def unregister_active_request(request_id):
+    with _active_requests_lock:
+        _active_requests.pop(request_id, None)
+
+
+def get_active_requests_snapshot(limit=500):
+    now = time.monotonic()
+    with _active_requests_lock:
+        items = list(_active_requests.values())
+    items.sort(key=lambda r: r["started_monotonic"])
+    result = []
+    for r in items[:limit]:
+        result.append({
+            "request_id": r["request_id"],
+            "client_ip": r["client_ip"],
+            "domain": r["domain"],
+            "query_type": r["query_type"],
+            "protocol": r["protocol"],
+            "stage": r["stage"],
+            "cache_status": r.get("cache_status", ""),
+            "upstream_name": r.get("upstream_name", ""),
+            "blocked": r.get("blocked", False),
+            "runtime_ms": round((now - r["started_monotonic"]) * 1000, 1),
+        })
+    return {"requests": result, "total_active": len(items), "returned": len(result), "truncated": len(items) > limit}
+
+
 _dnssec_validator = None
 _dnssec_validator_lock = threading.Lock()
 blocklist_manager = None
@@ -1448,7 +1521,8 @@ def make_encrypted_dns_ssl_context():
 
 def load_runtime_network_settings():
     global WEB_HOST, WEB_PORT, DNS_HOST, DNS_PORT, ENCRYPTED_DNS_HOST, ENCRYPTED_DNS_DOMAIN, DNS_TLS_PORT, DNS_QUIC_PORT, DNS_HTTPS_PORT
-    global dns_concurrency, upstream_concurrency, DOT_POOL_SIZE, DOH_POOL_SIZE
+    global upstream_concurrency, DOT_POOL_SIZE, DOH_POOL_SIZE
+    global DNS_WORKER_ACQUIRE_TIMEOUT, tcp_connection_semaphore, dot_connection_semaphore, TCP_IDLE_TIMEOUT, DOT_IDLE_TIMEOUT
     WEB_HOST = get_setting("localdnsguard_web_host", WEB_HOST).strip() or "0.0.0.0"
     WEB_PORT = parse_port(get_setting("localdnsguard_web_port", WEB_PORT), WEB_PORT, "Web port")
     DNS_HOST = get_setting("localdnsguard_dns_host", DNS_HOST).strip() or "0.0.0.0"
@@ -1459,15 +1533,45 @@ def load_runtime_network_settings():
     DNS_HTTPS_PORT = parse_port(get_setting("dns_over_https_port", DNS_HTTPS_PORT), DNS_HTTPS_PORT, "DNS-over-HTTPS port")
     DNS_QUIC_PORT = parse_port(get_setting("dns_over_quic_port", DNS_QUIC_PORT), DNS_QUIC_PORT, "DNS-over-QUIC port")
     try:
-        dns_w = max(1, int(get_setting("max_dns_workers", "8") or "8"))
+        dns_w_base = max(1, int(get_setting("max_dns_workers", "32") or "32"))
     except (ValueError, TypeError):
-        dns_w = 48
+        dns_w_base = 32
+    try:
+        dns_w_burst = max(dns_w_base, int(get_setting("max_dns_workers_burst", "64") or "64"))
+    except (ValueError, TypeError):
+        dns_w_burst = max(dns_w_base, 64)
+    try:
+        dns_w_shrink = max(1.0, float(get_setting("dns_worker_shrink_seconds", "60") or "60"))
+    except (ValueError, TypeError):
+        dns_w_shrink = 60.0
+    try:
+        DNS_WORKER_ACQUIRE_TIMEOUT = max(0.0, float(get_setting("dns_worker_acquire_timeout", "0.05") or "0.05"))
+    except (ValueError, TypeError):
+        DNS_WORKER_ACQUIRE_TIMEOUT = 0.05
+    dns_worker_limiter.update_limits(dns_w_base, dns_w_burst, dns_w_shrink)
     try:
         up_w = max(1, int(get_setting("max_upstream_workers", "16") or "16"))
     except (ValueError, TypeError):
         up_w = 64
-    dns_concurrency = threading.BoundedSemaphore(dns_w)
     upstream_concurrency = threading.BoundedSemaphore(up_w)
+    try:
+        tcp_conn = max(1, int(get_setting("max_tcp_connections", "128") or "128"))
+    except (ValueError, TypeError):
+        tcp_conn = 128
+    tcp_connection_semaphore = threading.BoundedSemaphore(tcp_conn)
+    try:
+        dot_conn = max(1, int(get_setting("max_dot_connections", "128") or "128"))
+    except (ValueError, TypeError):
+        dot_conn = 128
+    dot_connection_semaphore = threading.BoundedSemaphore(dot_conn)
+    try:
+        TCP_IDLE_TIMEOUT = max(1, int(get_setting("tcp_idle_timeout", "30") or "30"))
+    except (ValueError, TypeError):
+        TCP_IDLE_TIMEOUT = 30
+    try:
+        DOT_IDLE_TIMEOUT = max(1, int(get_setting("dot_idle_timeout", "30") or "30"))
+    except (ValueError, TypeError):
+        DOT_IDLE_TIMEOUT = 30
     try:
         dot_ps = max(1, int(get_setting("dot_pool_size", "4") or "4"))
     except (ValueError, TypeError):
@@ -4818,6 +4922,14 @@ def start_db_writer():
     threading.Thread(target=db_writer_loop, name="db-writer", daemon=True).start()
 
 
+def _worker_limiter_maintenance_loop():
+    while not server_shutdown_event.wait(5):
+        try:
+            dns_worker_limiter.maintenance()
+        except Exception:
+            pass
+
+
 def db_maintenance_loop():
     last_vacuum_setting = "db_last_vacuum"
     while True:
@@ -4872,6 +4984,14 @@ def log_query_sync(client_ip, domain, normalized, qtype_name, status, response_i
 def handle_dns_request(request, client_ip, connection_type=""):
     started = time.perf_counter()
     bump_runtime_metric("dns_requests_total")
+    request_id = register_active_request(client_ip, "", "", connection_type)
+    try:
+        return _handle_dns_request_inner(request, client_ip, connection_type, started, request_id)
+    finally:
+        unregister_active_request(request_id)
+
+
+def _handle_dns_request_inner(request, client_ip, connection_type, started, request_id):
     ensure_client(client_ip)
     client_info = lookup_client_snapshot(client_ip)
     client_log_name = client_info.get("name", "") if client_info else ""
@@ -4882,6 +5002,7 @@ def handle_dns_request(request, client_ip, connection_type=""):
         domain = question["domain"]
         normalized = question["normalized_domain"]
         qtype_name = question["qtype_name"]
+        update_active_request(request_id, domain=domain, query_type=qtype_name, stage="filtering")
 
         if get_setting("disable_ipv6", "0") == "1" and qtype_name == "AAAA":
             response = build_empty_response(request)
@@ -4917,6 +5038,7 @@ def handle_dns_request(request, client_ip, connection_type=""):
             log_query(client_ip, domain, normalized, qtype_name, "local", matched_rule="local nodata", cache_status="local", reason="local no data", duration_ms=(time.perf_counter() - started) * 1000, client_name=dc, profile_name=dp, connection_type=connection_type, resolver_mode=resolver_mode)
             return response
 
+        update_active_request(request_id, stage="cache_lookup")
         cached = get_cached(normalized, qtype_name)
         if cached:
             bump_runtime_metric("dns_cache_hits_total")
@@ -4938,6 +5060,7 @@ def handle_dns_request(request, client_ip, connection_type=""):
             return neg_response
 
         bump_runtime_metric("dns_cache_misses_total")
+        update_active_request(request_id, stage="upstream", cache_status="miss")
 
         forwarding_request = request
         if get_setting("dnssec_validation_enabled", "0") == "1":
@@ -5027,22 +5150,6 @@ class LimitedThreadingMixIn(socketserver.ThreadingMixIn):
     daemon_threads = True
     block_on_close = False
 
-    def process_request(self, request, client_address):
-        if not dns_concurrency.acquire(blocking=False):
-            self.shutdown_request(request)
-            return
-        try:
-            super().process_request(request, client_address)
-        except Exception:
-            dns_concurrency.release()
-            raise
-
-    def process_request_thread(self, request, client_address):
-        try:
-            super().process_request_thread(request, client_address)
-        finally:
-            dns_concurrency.release()
-
 
 class ReusableThreadingUDPServer(LimitedThreadingMixIn, socketserver.UDPServer):
     allow_reuse_address = True
@@ -5050,6 +5157,26 @@ class ReusableThreadingUDPServer(LimitedThreadingMixIn, socketserver.UDPServer):
 
 class ReusableThreadingTCPServer(LimitedThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
+    connection_semaphore = None
+
+    def process_request(self, request, client_address):
+        sem = self.connection_semaphore
+        if sem is not None and not sem.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            if sem is not None:
+                sem.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            if self.connection_semaphore is not None:
+                self.connection_semaphore.release()
 
 
 class ReusableThreadingTLSDNSServer(ReusableThreadingTCPServer):
@@ -5103,7 +5230,14 @@ def send_doh_response(handler, params=None):
                 handler.send_error(400, "invalid DNS message length")
                 return
             request = handler.rfile.read(length)
-        response = handle_dns_request(request, handler.client_address[0], "HTTPS")
+        if not dns_worker_limiter.acquire(timeout=DNS_WORKER_ACQUIRE_TIMEOUT):
+            bump_runtime_metric("dns_worker_rejected_total")
+            handler.send_error(503, "DNS service busy")
+            return
+        try:
+            response = handle_dns_request(request, handler.client_address[0], "HTTPS")
+        finally:
+            dns_worker_limiter.release()
         if response is None:
             handler.send_error(502, "DNS query failed")
             return
@@ -5145,9 +5279,20 @@ class DNSHTTPSHandler(BaseHTTPRequestHandler):
 class DNSUDPHandler(socketserver.BaseRequestHandler):
     def handle(self):
         data, sock = self.request
-        response = handle_dns_request(data, self.client_address[0], "UDP")
-        if response is not None:
-            sock.sendto(response, self.client_address)
+        if not dns_worker_limiter.acquire(timeout=DNS_WORKER_ACQUIRE_TIMEOUT):
+            bump_runtime_metric("dns_worker_rejected_total")
+            dns_worker_limiter.record_rejection("udp")
+            try:
+                sock.sendto(build_error_response(data, 2), self.client_address)
+            except Exception:
+                pass
+            return
+        try:
+            response = handle_dns_request(data, self.client_address[0], "UDP")
+            if response is not None:
+                sock.sendto(response, self.client_address)
+        finally:
+            dns_worker_limiter.release()
 
 
 def recv_exact(conn, length):
@@ -5164,7 +5309,9 @@ def recv_exact(conn, length):
 
 class DNSTCPHandler(socketserver.BaseRequestHandler):
     def handle(self):
-        self.request.settimeout(120)
+        is_tls = isinstance(self.server, ReusableThreadingTLSDNSServer)
+        idle_timeout = DOT_IDLE_TIMEOUT if is_tls else TCP_IDLE_TIMEOUT
+        self.request.settimeout(idle_timeout)
         while True:
             try:
                 header = recv_exact(self.request, 2)
@@ -5176,12 +5323,30 @@ class DNSTCPHandler(socketserver.BaseRequestHandler):
                 data = recv_exact(self.request, length)
                 if not data:
                     return
-                connection_type = "TLS" if isinstance(self.server, ReusableThreadingTLSDNSServer) else "TCP"
+            except (socket.timeout, OSError):
+                return
+
+            connection_type = "TLS" if is_tls else "TCP"
+            protocol_tag = "dot" if is_tls else "tcp"
+
+            if not dns_worker_limiter.acquire(timeout=DNS_WORKER_ACQUIRE_TIMEOUT):
+                bump_runtime_metric("dns_worker_rejected_total")
+                dns_worker_limiter.record_rejection(protocol_tag)
+                try:
+                    sf = build_error_response(data, 2)
+                    self.request.sendall(struct.pack("!H", len(sf)) + sf)
+                except Exception:
+                    return
+                continue
+
+            try:
                 response = handle_dns_request(data, self.client_address[0], connection_type)
                 if response is not None:
                     self.request.sendall(struct.pack("!H", len(response)) + response)
-            except socket.timeout:
+            except Exception:
                 return
+            finally:
+                dns_worker_limiter.release()
 
 
 def _svg(inner):
@@ -5197,6 +5362,7 @@ def icon_upstream(): return _svg('<circle cx="12" cy="12" r="10"/><line x1="2" y
 def icon_cache():    return _svg('<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v6c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 11v6c0 1.66 4.03 3 9 3s9-1.34 9-3v-6"/>')
 def icon_settings(): return _svg('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>')
 def icon_search():   return _svg('<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>')
+def icon_monitor():  return _svg('<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>')
 def icon_api():      return _svg('<polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>')
 def icon_profile():  return _svg('<path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/>')
 def icon_cosmetic(): return _svg('<path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>')
@@ -5474,6 +5640,7 @@ def template(content, title="Dashboard"):
   {nav_item("/cache", "Cache", icon_cache(), title)}
   {nav_item("/setup-wizard", "Setup Wizard", icon_settings(), title)}
   {nav_item("/settings", "Settings", icon_settings(), title)}
+  {nav_item("/system-monitor", "System Monitor", icon_monitor(), title)}
   {nav_item("/api-docs", "API", icon_api(), title)}
   {nav_item("/domain-test", "Domain Test", icon_search(), title)}
   <div class="sys-status">
@@ -5631,7 +5798,7 @@ def nav_item(path, label, icon="", current_title=""):
         "Dashboard": "/", "Query Log": "/querylog",
         "Blocklists": "/blocklists", "Rules": "/rules", "Cosmetic Lists": "/cosmeticlists",
         "DNS Rewrites": "/rewrites", "Clients": "/clients", "Profiles": "/profiles", "Upstreams": "/upstreams", "Cache": "/cache",
-        "Setup Wizard": "/setup-wizard", "Settings": "/settings", "API": "/api-docs", "Domain Test": "/domain-test",
+        "Setup Wizard": "/setup-wizard", "Settings": "/settings", "System Monitor": "/system-monitor", "API": "/api-docs", "Domain Test": "/domain-test",
     }
     active = " active" if _map.get(current_title) == path else ""
     return f'<a class="nav-link{active}" href="{path}">{icon}<span>{label}</span></a>'
@@ -8549,6 +8716,255 @@ relayInput.addEventListener('input', detectRelay);
 </script>{edit_modals}""", "Upstreams")
 
 
+def _system_monitor_api_summary():
+    snap = dns_worker_limiter.snapshot()
+    uptime = time.monotonic() - _app_start_monotonic if _app_start_monotonic else 0
+    try:
+        import psutil
+        proc = psutil.Process()
+        cpu_system = psutil.cpu_percent(interval=0)
+        cpu_process = proc.cpu_percent(interval=0)
+        mem = psutil.virtual_memory()
+        mem_info = proc.memory_info()
+        resources = {
+            "cpu": {"system_percent": cpu_system, "process_percent": cpu_process, "cores": psutil.cpu_count()},
+            "memory": {"total_bytes": mem.total, "available_bytes": mem.available, "process_rss_bytes": mem_info.rss, "process_percent": round(mem_info.rss / mem.total * 100, 1) if mem.total else 0},
+            "process": {"pid": os.getpid(), "threads": threading.active_count(), "uptime_seconds": round(uptime, 1)},
+        }
+    except Exception:
+        resources = {
+            "cpu": {"system_percent": None, "process_percent": None, "cores": os.cpu_count()},
+            "memory": {"total_bytes": None, "available_bytes": None, "process_rss_bytes": None, "process_percent": None},
+            "process": {"pid": os.getpid(), "threads": threading.active_count(), "uptime_seconds": round(uptime, 1)},
+        }
+    dns_running = bool(dns_servers)
+    return {
+        "server": {
+            "status": "running" if dns_running else "stopped",
+            "pid": os.getpid(),
+            "uptime_seconds": round(uptime, 1),
+            "python_version": sys.version.split()[0],
+            "hostname": socket.gethostname(),
+            "dns_port": DNS_PORT,
+            "dns_host": DNS_HOST,
+        },
+        "dns_workers": {
+            "base_limit": snap.base_limit,
+            "max_limit": snap.max_limit,
+            "current_limit": snap.current_limit,
+            "active": snap.active_workers,
+            "free": max(0, snap.current_limit - snap.active_workers),
+            "waiting": snap.waiters,
+            "peak": snap.peak_active_workers,
+            "rejected_total": snap.rejected_total,
+            "burst_expansions_total": snap.burst_expansions_total,
+            "shrink_total": snap.shrink_total,
+            "rejected_udp": snap.rejected_udp,
+            "rejected_tcp": snap.rejected_tcp,
+            "rejected_dot": snap.rejected_dot,
+        },
+        "resources": resources,
+        "dns_running": dns_running,
+    }
+
+
+_app_start_monotonic = 0.0
+
+
+def system_monitor_page():
+    return template("""
+<style>
+.sm-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}
+.sm-card{background:var(--card);border:1px solid var(--border);border-radius:.6rem;overflow:hidden}
+.sm-card-wide{grid-column:1/-1}
+.sm-head{display:flex;align-items:center;justify-content:space-between;padding:.85rem 1rem;border-bottom:1px solid var(--border);background:rgba(11,18,32,.38)}
+.sm-title{font-size:.92rem;font-weight:800}
+.sm-body{padding:1rem}
+.sm-metric{display:flex;justify-content:space-between;padding:.35rem 0;border-bottom:1px solid rgba(30,45,61,.3);font-size:.84rem}
+.sm-metric:last-child{border-bottom:none}
+.sm-label{color:var(--muted2)}
+.sm-value{font-weight:700;font-variant-numeric:tabular-nums}
+.sm-bar{height:22px;border-radius:4px;background:rgba(30,45,61,.4);overflow:hidden;margin-top:.35rem}
+.sm-bar-fill{height:100%;border-radius:4px;transition:width .4s ease}
+.sm-bar-green{background:#22c55e}
+.sm-bar-yellow{background:#eab308}
+.sm-bar-red{background:#ef4444}
+.sm-status{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:.4rem}
+.sm-status-green{background:#22c55e}
+.sm-status-red{background:#ef4444}
+.sm-status-gray{background:#64748b}
+.sm-actions{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.5rem}
+.sm-btn{padding:.4rem .8rem;border-radius:.4rem;border:1px solid var(--border);background:var(--card);color:var(--text);font-size:.82rem;cursor:pointer}
+.sm-btn:hover{background:rgba(30,45,61,.6)}
+.sm-btn-danger{border-color:rgba(239,68,68,.3);color:#f87171}
+.sm-btn-danger:hover{background:rgba(239,68,68,.08)}
+.sm-req-table{width:100%;border-collapse:collapse;font-size:.8rem}
+.sm-req-table th{text-align:left;padding:.4rem .5rem;border-bottom:1px solid var(--border);color:var(--muted2);font-weight:600;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em}
+.sm-req-table td{padding:.35rem .5rem;border-bottom:1px solid rgba(30,45,61,.2);font-variant-numeric:tabular-nums}
+.sm-warn{color:#eab308;font-size:.82rem;margin-top:.4rem}
+@media(max-width:980px){.sm-grid{grid-template-columns:1fr}}
+</style>
+<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:1rem">
+  <div>
+    <h1 class="page-title" style="margin-bottom:.1rem">System Monitor</h1>
+    <div class="small text-secondary">Live DNS worker, resource, and request diagnostics.</div>
+  </div>
+  <div style="display:flex;gap:.5rem;align-items:center">
+    <span id="sm-live" style="font-size:.78rem;color:var(--muted2)">Updating...</span>
+    <button class="sm-btn" onclick="smPause()" id="sm-pause-btn">Pause</button>
+    <a class="sm-btn" href="/settings">Edit Limits</a>
+  </div>
+</div>
+<div class="sm-grid">
+
+  <div class="sm-card">
+    <div class="sm-head"><span class="sm-title">Server Status</span><span id="sm-srv-status"></span></div>
+    <div class="sm-body" id="sm-server">Loading...</div>
+  </div>
+
+  <div class="sm-card">
+    <div class="sm-head"><span class="sm-title">DNS Workers</span></div>
+    <div class="sm-body" id="sm-dns-workers">Loading...</div>
+  </div>
+
+  <div class="sm-card">
+    <div class="sm-head"><span class="sm-title">System Resources</span></div>
+    <div class="sm-body" id="sm-resources">Loading...</div>
+  </div>
+
+  <div class="sm-card">
+    <div class="sm-head"><span class="sm-title">Diagnostics</span></div>
+    <div class="sm-body" id="sm-diagnostics">Loading...</div>
+  </div>
+
+  <div class="sm-card sm-card-wide">
+    <div class="sm-head"><span class="sm-title">Active Requests</span><span id="sm-req-count" style="font-size:.82rem;color:var(--muted2)"></span></div>
+    <div class="sm-body" id="sm-requests" style="max-height:400px;overflow-y:auto">Loading...</div>
+  </div>
+
+  <div class="sm-card sm-card-wide">
+    <div class="sm-head"><span class="sm-title">Server Control</span><span style="font-size:.78rem;color:var(--muted2)">Admin only</span></div>
+    <div class="sm-body">
+      <div class="sm-actions">
+        <button class="sm-btn" onclick="smAction('/api/system-monitor/dns/restart','Restart DNS service?')">Restart DNS</button>
+        <button class="sm-btn" onclick="smAction('/api/system-monitor/dns/stop','Stop DNS service?')">Stop DNS</button>
+        <button class="sm-btn" onclick="smAction('/api/system-monitor/dns/start','Start DNS service?')">Start DNS</button>
+        <button class="sm-btn" onclick="smAction('/api/system-monitor/cache/clear','Clear DNS cache?')">Clear Cache</button>
+        <button class="sm-btn" onclick="smAction('/api/system-monitor/statistics/reset','Reset worker statistics?')">Reset Stats</button>
+      </div>
+      <div id="sm-action-result" style="margin-top:.5rem;font-size:.84rem"></div>
+    </div>
+  </div>
+
+</div>
+<script>
+(function(){
+let paused=false, timer=null, abortCtl=null;
+const csrf=decodeURIComponent((document.cookie.match(/(?:^|;)\\s*csrf_token=([^;]*)/)||['',''])[1]);
+
+function m(l,v){return '<div class="sm-metric"><span class="sm-label">'+l+'</span><span class="sm-value">'+v+'</span></div>';}
+
+function bar(pct){
+  let c=pct<70?'sm-bar-green':pct<90?'sm-bar-yellow':'sm-bar-red';
+  return '<div class="sm-bar"><div class="sm-bar-fill '+c+'" style="width:'+Math.min(100,pct)+'%"></div></div>';
+}
+
+function fmt(s){return s!=null?s:'N/A';}
+function fmtBytes(b){if(b==null)return'N/A';if(b<1024)return b+' B';if(b<1048576)return(b/1024).toFixed(1)+' KB';if(b<1073741824)return(b/1048576).toFixed(1)+' MB';return(b/1073741824).toFixed(2)+' GB';}
+function fmtUptime(s){let d=Math.floor(s/86400),h=Math.floor(s%86400/3600),mi=Math.floor(s%3600/60);return(d?d+'d ':'')+(h?h+'h ':'')+(mi+'m');}
+
+function renderSummary(d){
+  let srv=d.server||{}, w=d.dns_workers||{}, r=d.resources||{};
+  let statusDot=d.dns_running?'sm-status-green':'sm-status-red';
+  let statusText=d.dns_running?'Running':'Stopped';
+  document.getElementById('sm-srv-status').innerHTML='<span class="sm-status '+statusDot+'"></span>'+statusText;
+  document.getElementById('sm-server').innerHTML=
+    m('PID',srv.pid)+m('Uptime',fmtUptime(srv.uptime_seconds||0))+
+    m('Python',fmt(srv.python_version))+m('Hostname',fmt(srv.hostname))+
+    m('DNS Endpoint',fmt(srv.dns_host)+':'+fmt(srv.dns_port));
+
+  let pct=w.current_limit?Math.round(w.active/w.current_limit*100):0;
+  document.getElementById('sm-dns-workers').innerHTML=
+    '<div style="font-size:.92rem;font-weight:800;margin-bottom:.3rem">'+w.active+' / '+w.current_limit+' ('+pct+'%)</div>'+
+    bar(pct)+
+    '<div style="font-size:.78rem;color:var(--muted2);margin:.3rem 0">Dynamic capacity: '+w.current_limit+' / '+w.max_limit+'</div>'+
+    m('Base Limit',w.base_limit)+m('Burst Limit',w.max_limit)+m('Current Limit',w.current_limit)+
+    m('Active',w.active)+m('Free',w.free)+m('Waiting',w.waiting)+
+    m('Peak',w.peak)+m('Rejected Total',w.rejected_total)+
+    m('Burst Expansions',w.burst_expansions_total)+m('Shrink Ops',w.shrink_total)+
+    m('Rejected UDP',w.rejected_udp)+m('Rejected TCP',w.rejected_tcp)+m('Rejected DoT',w.rejected_dot)+
+    (pct>=90?'<div class="sm-warn">Warning: DNS worker usage is above 90%</div>':'');
+
+  let cpu=r.cpu||{},mem=r.memory||{},proc=r.process||{};
+  document.getElementById('sm-resources').innerHTML=
+    m('System CPU',fmt(cpu.system_percent)!=null?cpu.system_percent+'%':'N/A')+
+    m('Process CPU',fmt(cpu.process_percent)!=null?cpu.process_percent+'%':'N/A')+
+    m('CPU Cores',fmt(cpu.cores))+
+    m('Total RAM',fmtBytes(mem.total_bytes))+m('Available RAM',fmtBytes(mem.available_bytes))+
+    m('Process RSS',fmtBytes(mem.process_rss_bytes))+m('Process Memory',mem.process_percent!=null?mem.process_percent+'%':'N/A')+
+    m('Threads',fmt(proc.threads))+m('Process Uptime',fmtUptime(proc.uptime_seconds||0));
+
+  let warns=[];
+  if(pct>=90)warns.push('DNS worker usage: '+pct+'%');
+  if(proc.threads&&proc.threads>200)warns.push('High thread count: '+proc.threads);
+  document.getElementById('sm-diagnostics').innerHTML=
+    (warns.length?warns.map(function(w){return '<div class="sm-warn">'+w+'</div>';}).join(''):'<div style="color:#22c55e;font-size:.84rem">No warnings</div>')+
+    m('Active Requests',d._active_total||0);
+}
+
+function renderRequests(d){
+  let reqs=d.requests||[];
+  document.getElementById('sm-req-count').textContent=d.total_active+' active'+(d.truncated?' (showing '+d.returned+')':'');
+  if(!reqs.length){document.getElementById('sm-requests').innerHTML='<div style="color:var(--muted2);font-size:.84rem">No active requests</div>';return;}
+  let h='<table class="sm-req-table"><thead><tr><th>ID</th><th>Protocol</th><th>Client</th><th>Domain</th><th>Type</th><th>Stage</th><th>Runtime</th></tr></thead><tbody>';
+  reqs.sort(function(a,b){return b.runtime_ms-a.runtime_ms;});
+  reqs.forEach(function(r){
+    h+='<tr><td>'+r.request_id+'</td><td>'+r.protocol+'</td><td>'+r.client_ip+'</td><td>'+(r.domain||'-')+'</td><td>'+(r.query_type||'-')+'</td><td>'+r.stage+'</td><td>'+r.runtime_ms.toFixed(1)+' ms</td></tr>';
+  });
+  h+='</tbody></table>';
+  document.getElementById('sm-requests').innerHTML=h;
+}
+
+function poll(){
+  if(paused||document.hidden)return;
+  if(abortCtl)abortCtl.abort();
+  abortCtl=new AbortController();
+  fetch('/api/system-monitor/summary',{signal:abortCtl.signal,headers:{'X-CSRF-Token':csrf}})
+    .then(function(r){return r.json();})
+    .then(function(d){renderSummary(d);document.getElementById('sm-live').textContent='Updated '+new Date().toLocaleTimeString();})
+    .catch(function(){});
+  fetch('/api/system-monitor/active-requests',{signal:abortCtl.signal,headers:{'X-CSRF-Token':csrf}})
+    .then(function(r){return r.json();})
+    .then(function(d){renderRequests(d);})
+    .catch(function(){});
+}
+
+function schedule(){timer=setInterval(poll,2000);}
+poll();
+schedule();
+document.addEventListener('visibilitychange',function(){if(document.hidden){clearInterval(timer);}else if(!paused){poll();schedule();}});
+
+window.smPause=function(){
+  paused=!paused;
+  document.getElementById('sm-pause-btn').textContent=paused?'Resume':'Pause';
+  if(paused){clearInterval(timer);}else{poll();schedule();}
+};
+
+window.smAction=function(url,msg){
+  if(!confirm(msg))return;
+  fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-CSRF-Token':csrf},body:'csrf_token='+encodeURIComponent(csrf)})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      document.getElementById('sm-action-result').innerHTML='<span style="color:#22c55e">'+(d.ok?'Done':'')+(d.error||'')+(d.message||'')+'</span>';
+      setTimeout(poll,500);
+    })
+    .catch(function(e){document.getElementById('sm-action-result').innerHTML='<span style="color:#f87171">Error: '+e.message+'</span>';});
+};
+})();
+</script>
+""", "System Monitor")
+
+
 def settings_page(message="", is_error=False, values=None):
     values = values or {}
     def value(name, default=""):
@@ -8689,12 +9105,27 @@ def settings_page(message="", is_error=False, values=None):
           <div><label class="form-label">DoH/3 Total Timeout</label><input class="form-control" name="doh3_total_timeout" type="number" min="0.1" step="0.1" value="{html_escape(value('doh3_total_timeout', '2.2'))}"></div>
         </div>
 
-        <div class="settings-subhead">Concurrency Limits</div>
+        <div class="settings-subhead">DNS Worker Limits</div>
         <div class="settings-field-grid">
-          <div><label class="form-label">Max DNS Workers</label><input class="form-control" name="max_dns_workers" type="number" min="1" max="512" value="{html_escape(value('max_dns_workers', '8'))}"></div>
-          <div><label class="form-label">Max Upstream Workers</label><input class="form-control" name="max_upstream_workers" type="number" min="1" max="512" value="{html_escape(value('max_upstream_workers', '16'))}"></div>
+          <div><label class="form-label">DNS Worker Base Limit</label><input class="form-control" name="max_dns_workers" type="number" min="1" max="4096" value="{html_escape(value('max_dns_workers', '32'))}"><div class="settings-help">Normal concurrency limit for DNS request processing.</div></div>
+          <div><label class="form-label">DNS Worker Burst Limit</label><input class="form-control" name="max_dns_workers_burst" type="number" min="1" max="4096" value="{html_escape(value('max_dns_workers_burst', '64'))}"><div class="settings-help">Temporary upper limit during traffic spikes. Must be &gt;= base limit.</div></div>
+          <div><label class="form-label">Burst Cooldown (sec)</label><input class="form-control" name="dns_worker_shrink_seconds" type="number" min="1" max="3600" value="{html_escape(value('dns_worker_shrink_seconds', '60'))}"><div class="settings-help">Seconds without overload before limit returns to base.</div></div>
+          <div><label class="form-label">Acquire Timeout (sec)</label><input class="form-control" name="dns_worker_acquire_timeout" type="number" min="0" max="10" step="0.01" value="{html_escape(value('dns_worker_acquire_timeout', '0.05'))}"><div class="settings-help">Max wait for a worker slot. 0 = reject immediately.</div></div>
+        </div>
+
+        <div class="settings-subhead">Upstream &amp; Pool Limits</div>
+        <div class="settings-field-grid">
+          <div><label class="form-label">Max Upstream Workers</label><input class="form-control" name="max_upstream_workers" type="number" min="1" max="1024" value="{html_escape(value('max_upstream_workers', '16'))}"><div class="settings-help">Fixed upstream concurrency limit. More workers = more external DNS traffic.</div></div>
           <div><label class="form-label">DoT Pool Size</label><input class="form-control" name="dot_pool_size" type="number" min="1" max="64" value="{html_escape(value('dot_pool_size', '4'))}"></div>
           <div><label class="form-label">DoH Pool Size</label><input class="form-control" name="doh_pool_size" type="number" min="1" max="64" value="{html_escape(value('doh_pool_size', '4'))}"></div>
+        </div>
+
+        <div class="settings-subhead">Client Connection Limits</div>
+        <div class="settings-field-grid">
+          <div><label class="form-label">Max TCP Connections</label><input class="form-control" name="max_tcp_connections" type="number" min="1" max="8192" value="{html_escape(value('max_tcp_connections', '128'))}"><div class="settings-help">Max concurrent TCP client connections. Separate from DNS worker slots.</div></div>
+          <div><label class="form-label">Max DoT Connections</label><input class="form-control" name="max_dot_connections" type="number" min="1" max="8192" value="{html_escape(value('max_dot_connections', '128'))}"><div class="settings-help">Max concurrent DNS-over-TLS client connections.</div></div>
+          <div><label class="form-label">TCP Idle Timeout (sec)</label><input class="form-control" name="tcp_idle_timeout" type="number" min="1" max="3600" value="{html_escape(value('tcp_idle_timeout', '30'))}"></div>
+          <div><label class="form-label">DoT Idle Timeout (sec)</label><input class="form-control" name="dot_idle_timeout" type="number" min="1" max="3600" value="{html_escape(value('dot_idle_timeout', '30'))}"></div>
         </div>
 
         <div class="settings-subhead">Encrypted DNS Endpoints</div>
@@ -9831,6 +10262,7 @@ class WebHandler(BaseHTTPRequestHandler):
             "/setup-wizard": setup_wizard_page,
             "/upstreams": upstreams_page,
             "/settings": settings_page,
+            "/system-monitor": system_monitor_page,
             "/api-docs": api_docs_page,
             "/domain-test": domain_test_page,
         }
@@ -10376,7 +10808,9 @@ class WebHandler(BaseHTTPRequestHandler):
                 "localdnsguard_dns_host", "localdnsguard_dns_port", "encrypted_dns_host", "encrypted_dns_domain",
                 "upstream_timeout", "tcp_connect_timeout", "tls_handshake_timeout", "dns_query_timeout",
                 "dnssec_validation_timeout", "doq_total_timeout", "doh3_total_timeout",
-                "max_dns_workers", "max_upstream_workers", "dot_pool_size", "doh_pool_size",
+                "max_dns_workers", "max_dns_workers_burst", "dns_worker_shrink_seconds", "dns_worker_acquire_timeout",
+                "max_upstream_workers", "dot_pool_size", "doh_pool_size",
+                "max_tcp_connections", "max_dot_connections", "tcp_idle_timeout", "dot_idle_timeout",
                 "dns_over_tls_enabled", "dns_over_tls_port", "dns_over_https_enabled", "dns_over_https_port",
                 "dns_over_quic_enabled", "dns_over_quic_port",
                 "encrypted_dns_certificate_pem", "encrypted_dns_private_key_pem",
@@ -10386,12 +10820,33 @@ class WebHandler(BaseHTTPRequestHandler):
             try:
                 parse_port(form.get("localdnsguard_web_port", WEB_PORT), WEB_PORT, "LOCALDNSGUARD_WEB_PORT")
                 parse_port(form.get("localdnsguard_dns_port", DNS_PORT), DNS_PORT, "LOCALDNSGUARD_DNS_PORT")
-                dns_w_val = int(form.get("max_dns_workers", "8") or "8")
-                if dns_w_val < 1 or dns_w_val > 512:
-                    raise ValueError("Max DNS Workers must be between 1 and 512")
+                dns_w_val = int(form.get("max_dns_workers", "32") or "32")
+                if dns_w_val < 1 or dns_w_val > 4096:
+                    raise ValueError("DNS Worker Base Limit must be between 1 and 4096")
+                burst_val = int(form.get("max_dns_workers_burst", "64") or "64")
+                if burst_val < dns_w_val or burst_val > 4096:
+                    raise ValueError("DNS Worker Burst Limit must be between base limit and 4096")
+                shrink_val = float(form.get("dns_worker_shrink_seconds", "60") or "60")
+                if shrink_val < 1 or shrink_val > 3600:
+                    raise ValueError("Burst Cooldown must be between 1 and 3600 seconds")
+                acquire_val = float(form.get("dns_worker_acquire_timeout", "0.05") or "0.05")
+                if acquire_val < 0 or acquire_val > 10:
+                    raise ValueError("Acquire Timeout must be between 0 and 10 seconds")
                 up_w_val = int(form.get("max_upstream_workers", "16") or "16")
-                if up_w_val < 1 or up_w_val > 512:
-                    raise ValueError("Max Upstream Workers must be between 1 and 512")
+                if up_w_val < 1 or up_w_val > 1024:
+                    raise ValueError("Max Upstream Workers must be between 1 and 1024")
+                tcp_conn_val = int(form.get("max_tcp_connections", "128") or "128")
+                if tcp_conn_val < 1 or tcp_conn_val > 8192:
+                    raise ValueError("Max TCP Connections must be between 1 and 8192")
+                dot_conn_val = int(form.get("max_dot_connections", "128") or "128")
+                if dot_conn_val < 1 or dot_conn_val > 8192:
+                    raise ValueError("Max DoT Connections must be between 1 and 8192")
+                tcp_idle_val = int(form.get("tcp_idle_timeout", "30") or "30")
+                if tcp_idle_val < 1 or tcp_idle_val > 3600:
+                    raise ValueError("TCP Idle Timeout must be between 1 and 3600 seconds")
+                dot_idle_val = int(form.get("dot_idle_timeout", "30") or "30")
+                if dot_idle_val < 1 or dot_idle_val > 3600:
+                    raise ValueError("DoT Idle Timeout must be between 1 and 3600 seconds")
                 dot_ps_val = int(form.get("dot_pool_size", "4") or "4")
                 if dot_ps_val < 1 or dot_ps_val > 64:
                     raise ValueError("DoT Pool Size must be between 1 and 64")
@@ -11423,6 +11878,37 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_json(collect_metrics())
         elif path == "/api/runtime_metrics":
             self.send_json(get_runtime_metrics())
+        elif path == "/api/system-monitor/summary":
+            data = _system_monitor_api_summary()
+            ar = get_active_requests_snapshot()
+            data["_active_total"] = ar["total_active"]
+            self.send_json(data)
+        elif path == "/api/system-monitor/workers":
+            snap = dns_worker_limiter.snapshot()
+            self.send_json({
+                "dns_workers": {
+                    "base_limit": snap.base_limit, "max_limit": snap.max_limit,
+                    "current_limit": snap.current_limit, "active": snap.active_workers,
+                    "free": max(0, snap.current_limit - snap.active_workers),
+                    "waiting": snap.waiters, "peak": snap.peak_active_workers,
+                    "rejected_total": snap.rejected_total,
+                    "burst_expansions_total": snap.burst_expansions_total,
+                    "shrink_total": snap.shrink_total,
+                },
+            })
+        elif path == "/api/system-monitor/active-requests":
+            self.send_json(get_active_requests_snapshot())
+        elif path == "/api/system-monitor/resources":
+            self.send_json(_system_monitor_api_summary().get("resources", {}))
+        elif path == "/api/system-monitor/diagnostics":
+            snap = dns_worker_limiter.snapshot()
+            pct = round(snap.active_workers / snap.current_limit * 100, 1) if snap.current_limit else 0
+            warnings = []
+            if pct >= 90:
+                warnings.append(f"DNS worker usage at {pct}% ({snap.active_workers}/{snap.current_limit})")
+            if snap.waiters > 0:
+                warnings.append(f"{snap.waiters} request(s) waiting for DNS worker slots")
+            self.send_json({"warnings": warnings, "thread_count": threading.active_count()})
         else:
             self.send_json({"error": "not found"}, 404)
 
@@ -11663,6 +12149,35 @@ class WebHandler(BaseHTTPRequestHandler):
                 db.commit()
             log_admin_action(self.session_user(), "audit_log_clear", "Audit log cleared", self.client_address[0])
             self.send_json({"ok": True})
+        elif path == "/api/system-monitor/dns/restart":
+            with runtime_restart_lock:
+                log_admin_action(self.session_user(), "dns_restart", "DNS service restart requested", self.client_address[0])
+                schedule_dns_runtime_restart()
+            self.send_json({"ok": True, "message": "DNS restart scheduled"})
+        elif path == "/api/system-monitor/dns/stop":
+            with runtime_restart_lock:
+                log_admin_action(self.session_user(), "dns_stop", "DNS service stop requested", self.client_address[0])
+                shutdown_dns_runtime_servers()
+                set_runtime_status("DNS stopped", ready=True)
+            self.send_json({"ok": True, "message": "DNS service stopped"})
+        elif path == "/api/system-monitor/dns/start":
+            with runtime_restart_lock:
+                log_admin_action(self.session_user(), "dns_start", "DNS service start requested", self.client_address[0])
+                load_runtime_network_settings()
+                started = start_dns_servers()
+                dns_servers.extend(started)
+                enc_started = start_encrypted_dns_servers()
+                encrypted_dns_servers.extend(enc_started)
+                set_runtime_status("DNS server ready", ready=True)
+            self.send_json({"ok": True, "message": "DNS service started"})
+        elif path == "/api/system-monitor/cache/clear":
+            result = clear_dns_cache()
+            log_admin_action(self.session_user(), "cache_clear_monitor", "DNS cache cleared via System Monitor", self.client_address[0])
+            self.send_json(result)
+        elif path == "/api/system-monitor/statistics/reset":
+            dns_worker_limiter.reset_statistics()
+            log_admin_action(self.session_user(), "stats_reset", "Worker statistics reset", self.client_address[0])
+            self.send_json({"ok": True, "message": "Statistics reset"})
         else:
             self.send_json({"error": "not found"}, 404)
 
@@ -11684,6 +12199,7 @@ def start_dns_servers():
         try:
             udp = ReusableThreadingUDPServer((DNS_HOST, port), DNSUDPHandler)
             tcp = ReusableThreadingTCPServer((DNS_HOST, port), DNSTCPHandler)
+            tcp.connection_semaphore = tcp_connection_semaphore
             DNS_PORT = port
             break
         except OSError as exc:
@@ -11879,6 +12395,7 @@ def start_encrypted_dns_servers():
     if get_setting("dns_over_tls_enabled", "0") == "1":
         try:
             dot = ReusableThreadingTLSDNSServer((ENCRYPTED_DNS_HOST, DNS_TLS_PORT), DNSTCPHandler, ssl_context())
+            dot.connection_semaphore = dot_connection_semaphore
             threading.Thread(target=dot.serve_forever, name="dns-over-tls-server", daemon=True).start()
             servers.append(dot)
         except Exception as exc:
@@ -12515,7 +13032,8 @@ def ensure_requirements():
 
 
 def main():
-    global dns_servers, encrypted_dns_servers, _active_engine, _filter_engine_generation
+    global dns_servers, encrypted_dns_servers, _active_engine, _filter_engine_generation, _app_start_monotonic
+    _app_start_monotonic = time.monotonic()
     threading.Thread(target=ensure_requirements, name="ensure-reqs", daemon=True).start()
     install_crash_handlers()
     if not acquire_instance_lock():
@@ -12552,6 +13070,9 @@ def main():
         log.flush()
         threading.Thread(target=_healthcheck_worker, name="healthcheck", daemon=True).start()
         log.write(f"{now_iso()} healthcheck worker ready\n")
+        log.flush()
+        threading.Thread(target=_worker_limiter_maintenance_loop, name="worker-limiter-maintenance", daemon=True).start()
+        log.write(f"{now_iso()} worker limiter maintenance ready\n")
         log.flush()
         start_update_checker()
         log.write(f"{now_iso()} update checker ready (checks every 1 hour)\n")
