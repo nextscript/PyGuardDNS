@@ -8959,8 +8959,9 @@ def system_monitor_page():
 </div>
 <script>
 (function(){
-var paused=false, timer=null, abortCtl=null, errEl=document.getElementById('sm-action-result');
+var paused=false, timer=null, abortCtl=null, pollCount=0;
 var csrf=decodeURIComponent((document.cookie.match(/(?:^|;)[ ]*csrf_token=([^;]*)/) || ['',''])[1]);
+var liveEl=document.getElementById('sm-live');
 
 function m(l,v){ return '<div class="sm-metric"><span class="sm-label">'+l+'</span><span class="sm-value">'+(v!=null?v:'N/A')+'</span></div>'; }
 function bar(pct){
@@ -8972,7 +8973,8 @@ function fb(b){ if(b==null) return 'N/A'; if(b<1024) return b+' B'; if(b<1048576
 function fu(s){ var d=Math.floor(s/86400), h=Math.floor(s%86400/3600), mi=Math.floor(s%3600/60); return (d?d+'d ':'')+(h?h+'h ':'')+(mi+'m'); }
 function ls(s){ return s==='active' ? '<span class="sm-status sm-status-green"></span>Active' : '<span class="sm-status sm-status-red"></span>Stopped'; }
 
-function renderSummary(d){
+function render(d){
+  try{
   var srv = d.server || {};
   var w   = d.dns_workers || {};
   var uw  = d.upstream_workers || {};
@@ -8982,6 +8984,8 @@ function renderSummary(d){
   var mem = r.memory || {};
   var proc = r.process || {};
   var rm  = d.runtime_metrics || {};
+  var ar  = d.active_requests || {};
+  var reqs = ar.requests || [];
 
   /* Server Status */
   var statusDot = d.dns_running ? 'sm-status-green' : 'sm-status-red';
@@ -8998,10 +9002,11 @@ function renderSummary(d){
 
   /* DNS Workers */
   var pct = w.current_limit ? Math.round(w.active / w.current_limit * 100) : 0;
+  var totalReqs = rm.dns_requests_total || 0;
   document.getElementById('sm-dns-workers').innerHTML =
     '<div style="font-size:.95rem;font-weight:800;margin-bottom:.35rem">' + w.active + ' / ' + w.current_limit + '  (' + pct + '%)</div>' +
     bar(pct) +
-    '<div style="font-size:.78rem;color:var(--muted2);margin:.35rem 0">Dynamic capacity: ' + w.current_limit + ' / ' + w.max_limit + '</div>' +
+    '<div style="font-size:.78rem;color:var(--muted2);margin:.35rem 0">Dynamic capacity: ' + w.current_limit + ' / ' + w.max_limit + '  |  Total processed: ' + totalReqs + '</div>' +
     m('Base Limit', w.base_limit) + m('Burst Limit', w.max_limit) + m('Current Limit', w.current_limit) +
     m('Active', w.active) + m('Free', w.free) + m('Waiting', w.waiting) +
     m('Peak', w.peak) + m('Rejected Total', w.rejected_total) +
@@ -9039,55 +9044,52 @@ function renderSummary(d){
   var dh = warns.length
     ? warns.map(function(x){ return '<div class="sm-warn">' + x + '</div>'; }).join('')
     : '<div style="color:#22c55e;font-size:.84rem">No warnings</div>';
-  dh += m('Total DNS Requests', rm.dns_requests_total || 0) +
+  dh += m('Total DNS Requests', totalReqs) +
     m('Cache Hits', rm.dns_cache_hits_total || 0) +
     m('Cache Misses', rm.dns_cache_misses_total || 0) +
     m('Filter Blocks', rm.dns_filter_blocks_total || 0) +
+    m('Filter Allows', rm.dns_filter_allows_total || 0) +
     m('Upstream Errors', rm.dns_upstream_errors_total || 0) +
-    m('Active Requests (now)', d._active_total || 0);
+    m('Active Requests (now)', ar.total_active || 0);
   document.getElementById('sm-diagnostics').innerHTML = dh;
-}
 
-function renderRequests(d){
-  var reqs = d.requests || [];
-  document.getElementById('sm-req-count').textContent = d.total_active + ' active' + (d.truncated ? ' (showing ' + d.returned + ')' : '');
-  if(!reqs.length){ document.getElementById('sm-requests').innerHTML = '<div style="color:var(--muted2);font-size:.84rem">No active requests</div>'; return; }
-  var h = '<table class="sm-req-table"><thead><tr><th>ID</th><th>Protocol</th><th>Client</th><th>Domain</th><th>Type</th><th>Stage</th><th>Runtime</th></tr></thead><tbody>';
-  reqs.sort(function(a,b){ return b.runtime_ms - a.runtime_ms; });
-  for(var i = 0; i < reqs.length; i++){
-    var rr = reqs[i];
-    h += '<tr><td>' + rr.request_id + '</td><td>' + rr.protocol + '</td><td>' + rr.client_ip + '</td><td>' + (rr.domain||'-') + '</td><td>' + (rr.query_type||'-') + '</td><td>' + rr.stage + '</td><td>' + rr.runtime_ms.toFixed(1) + ' ms</td></tr>';
+  /* Active Requests */
+  document.getElementById('sm-req-count').textContent = (ar.total_active||0) + ' active' + (ar.truncated ? ' (showing ' + ar.returned + ')' : '');
+  if(!reqs.length){
+    document.getElementById('sm-requests').innerHTML = '<div style="color:var(--muted2);font-size:.84rem">No active requests right now. DNS requests complete in milliseconds and are only visible here during processing.</div>';
+  } else {
+    var h = '<table class="sm-req-table"><thead><tr><th>ID</th><th>Protocol</th><th>Client</th><th>Domain</th><th>Type</th><th>Stage</th><th>Runtime</th></tr></thead><tbody>';
+    reqs.sort(function(a,b){ return b.runtime_ms - a.runtime_ms; });
+    for(var i = 0; i < reqs.length; i++){
+      var rr = reqs[i];
+      h += '<tr><td>' + rr.request_id + '</td><td>' + rr.protocol + '</td><td>' + rr.client_ip + '</td><td>' + (rr.domain||'-') + '</td><td>' + (rr.query_type||'-') + '</td><td>' + rr.stage + '</td><td>' + rr.runtime_ms.toFixed(1) + ' ms</td></tr>';
+    }
+    h += '</tbody></table>';
+    document.getElementById('sm-requests').innerHTML = h;
   }
-  h += '</tbody></table>';
-  document.getElementById('sm-requests').innerHTML = h;
+  }catch(ex){ console.error('[SystemMonitor] render error:', ex); liveEl.textContent='Render error: '+ex.message; }
 }
-
-function showErr(msg){ document.getElementById('sm-live').textContent = 'Error: ' + msg; console.error('[SystemMonitor]', msg); }
 
 function poll(){
   if(paused || document.hidden) return;
   if(abortCtl) try { abortCtl.abort(); } catch(e){}
   abortCtl = new AbortController();
+  pollCount++;
   fetch('/api/system-monitor/summary', {signal: abortCtl.signal})
     .then(function(r){
-      if(!r.ok) throw new Error('HTTP ' + r.status);
+      if(!r.ok) throw new Error('HTTP ' + r.status + ' ' + r.statusText);
       return r.json();
     })
     .then(function(d){
-      renderSummary(d);
-      document.getElementById('sm-live').textContent = 'Updated ' + new Date().toLocaleTimeString();
+      if(pollCount <= 2) console.log('[SystemMonitor] API response:', JSON.stringify(d).substring(0, 500));
+      render(d);
+      liveEl.textContent = 'Updated ' + new Date().toLocaleTimeString();
     })
     .catch(function(e){
-      if(e.name !== 'AbortError') showErr(e.message);
-    });
-  fetch('/api/system-monitor/active-requests', {signal: abortCtl.signal})
-    .then(function(r){
-      if(!r.ok) throw new Error('HTTP ' + r.status);
-      return r.json();
-    })
-    .then(function(d){ renderRequests(d); })
-    .catch(function(e){
-      if(e.name !== 'AbortError') console.error('[SystemMonitor] active-requests:', e.message);
+      if(e.name !== 'AbortError'){
+        console.error('[SystemMonitor] fetch error:', e);
+        liveEl.textContent = 'Fetch error: ' + e.message;
+      }
     });
 }
 
@@ -11466,6 +11468,7 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
@@ -12089,8 +12092,7 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_json(get_runtime_metrics())
         elif path == "/api/system-monitor/summary":
             data = _system_monitor_api_summary()
-            ar = get_active_requests_snapshot()
-            data["_active_total"] = ar["total_active"]
+            data["active_requests"] = get_active_requests_snapshot()
             data["runtime_metrics"] = get_runtime_metrics()
             self.send_json(data)
         elif path == "/api/system-monitor/workers":
