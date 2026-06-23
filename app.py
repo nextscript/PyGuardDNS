@@ -4922,6 +4922,21 @@ def start_db_writer():
     threading.Thread(target=db_writer_loop, name="db-writer", daemon=True).start()
 
 
+_last_exhausted_proto_log = 0.0
+
+def _log_worker_exhausted(protocol):
+    global _last_exhausted_proto_log
+    now = time.monotonic()
+    if now - _last_exhausted_proto_log < 10.0:
+        return
+    _last_exhausted_proto_log = now
+    snap = dns_worker_limiter.snapshot()
+    logger.warning(
+        "DNS worker capacity exhausted: active=%d current=%d max=%d protocol=%s",
+        snap.active_workers, snap.current_limit, snap.max_limit, protocol,
+    )
+
+
 def _worker_limiter_maintenance_loop():
     while not server_shutdown_event.wait(5):
         try:
@@ -5018,10 +5033,12 @@ def _handle_dns_request_inner(request, client_ip, connection_type, started, requ
         dp = decision.get("profile_name", "")
 
         if decision["action"] == "refuse":
+            update_active_request(request_id, stage="access_control", blocked=True)
             response = build_error_response(request, 5)
             log_query(client_ip, domain, normalized, qtype_name, "refused", matched_rule=decision["rule"], blocked=1, reason=decision["reason"], duration_ms=(time.perf_counter() - started) * 1000, matched_list=decision.get("filter_list", ""), client_name=dc, profile_name=dp, connection_type=connection_type, resolver_mode=resolver_mode)
             return response
         if decision["action"] == "block":
+            update_active_request(request_id, stage="access_control", blocked=True)
             bump_runtime_metric("dns_filter_blocks_total")
             response = build_block_response(request, qtype_name, question)
             log_query(client_ip, domain, normalized, qtype_name, "blocked", matched_rule=decision["rule"], blocked=1, reason=decision["reason"], duration_ms=(time.perf_counter() - started) * 1000, matched_list=decision.get("filter_list", ""), client_name=dc, profile_name=dp, connection_type=connection_type, resolver_mode=resolver_mode)
@@ -5041,6 +5058,7 @@ def _handle_dns_request_inner(request, client_ip, connection_type, started, requ
         update_active_request(request_id, stage="cache_lookup")
         cached = get_cached(normalized, qtype_name)
         if cached:
+            update_active_request(request_id, stage="cache_hit", cache_status="hit")
             bump_runtime_metric("dns_cache_hits_total")
             cached = request[:2] + cached[2:]
             cached = apply_ipv6_disabled_policy(cached)
@@ -5077,6 +5095,7 @@ def _handle_dns_request_inner(request, client_ip, connection_type, started, requ
 
         dnssec_status = ""
         if _dnssec_available and get_setting("dnssec_validation_enabled", "0") == "1" and not client_cd_flag:
+            update_active_request(request_id, stage="dnssec_validation")
             try:
                 import dns.message
                 import dns.flags
@@ -5282,6 +5301,7 @@ class DNSUDPHandler(socketserver.BaseRequestHandler):
         if not dns_worker_limiter.acquire(timeout=DNS_WORKER_ACQUIRE_TIMEOUT):
             bump_runtime_metric("dns_worker_rejected_total")
             dns_worker_limiter.record_rejection("udp")
+            _log_worker_exhausted("udp")
             try:
                 sock.sendto(build_error_response(data, 2), self.client_address)
             except Exception:
@@ -5332,6 +5352,7 @@ class DNSTCPHandler(socketserver.BaseRequestHandler):
             if not dns_worker_limiter.acquire(timeout=DNS_WORKER_ACQUIRE_TIMEOUT):
                 bump_runtime_metric("dns_worker_rejected_total")
                 dns_worker_limiter.record_rejection(protocol_tag)
+                _log_worker_exhausted(protocol_tag)
                 try:
                     sf = build_error_response(data, 2)
                     self.request.sendall(struct.pack("!H", len(sf)) + sf)
@@ -8738,15 +8759,23 @@ def _system_monitor_api_summary():
             "process": {"pid": os.getpid(), "threads": threading.active_count(), "uptime_seconds": round(uptime, 1)},
         }
     dns_running = bool(dns_servers)
+    up_max = max(1, int(get_setting("max_upstream_workers", "16") or "16"))
+    runtime_m = get_runtime_metrics()
+    enc_runtime = encrypted_dns_runtime_state()
     return {
         "server": {
             "status": "running" if dns_running else "stopped",
             "pid": os.getpid(),
             "uptime_seconds": round(uptime, 1),
             "python_version": sys.version.split()[0],
+            "os": f"{sys.platform}",
             "hostname": socket.gethostname(),
             "dns_port": DNS_PORT,
             "dns_host": DNS_HOST,
+            "dot_port": DNS_TLS_PORT if get_setting("dns_over_tls_enabled", "0") == "1" else None,
+            "doh_port": DNS_HTTPS_PORT if get_setting("dns_over_https_enabled", "0") == "1" else None,
+            "doq_port": DNS_QUIC_PORT if get_setting("dns_over_quic_enabled", "0") == "1" else None,
+            "app_version": "1.0",
         },
         "dns_workers": {
             "base_limit": snap.base_limit,
@@ -8762,6 +8791,19 @@ def _system_monitor_api_summary():
             "rejected_udp": snap.rejected_udp,
             "rejected_tcp": snap.rejected_tcp,
             "rejected_dot": snap.rejected_dot,
+        },
+        "upstream_workers": {
+            "max_limit": up_max,
+            "active": runtime_m.get("dns_upstream_errors_total", 0),
+            "errors_total": runtime_m.get("dns_upstream_errors_total", 0),
+        },
+        "network": {
+            "udp_listener": "active" if dns_running else "stopped",
+            "tcp_listener": "active" if dns_running else "stopped",
+            "dot_listener": "active" if enc_runtime.get("tls_running") else "stopped",
+            "doh_listener": "active" if enc_runtime.get("https_running") else "stopped",
+            "doq_listener": "active" if enc_runtime.get("quic_running") else "stopped",
+            "thread_count": threading.active_count(),
         },
         "resources": resources,
         "dns_running": dns_running,
@@ -8828,8 +8870,18 @@ def system_monitor_page():
   </div>
 
   <div class="sm-card">
+    <div class="sm-head"><span class="sm-title">Upstream Workers</span></div>
+    <div class="sm-body" id="sm-upstream-workers">Loading...</div>
+  </div>
+
+  <div class="sm-card">
     <div class="sm-head"><span class="sm-title">System Resources</span></div>
     <div class="sm-body" id="sm-resources">Loading...</div>
+  </div>
+
+  <div class="sm-card">
+    <div class="sm-head"><span class="sm-title">Network and Connections</span></div>
+    <div class="sm-body" id="sm-network">Loading...</div>
   </div>
 
   <div class="sm-card">
@@ -8878,10 +8930,15 @@ function renderSummary(d){
   let statusDot=d.dns_running?'sm-status-green':'sm-status-red';
   let statusText=d.dns_running?'Running':'Stopped';
   document.getElementById('sm-srv-status').innerHTML='<span class="sm-status '+statusDot+'"></span>'+statusText;
+  let ports=fmt(srv.dns_host)+':'+fmt(srv.dns_port);
+  if(srv.dot_port)ports+=' | DoT:'+srv.dot_port;
+  if(srv.doh_port)ports+=' | DoH:'+srv.doh_port;
+  if(srv.doq_port)ports+=' | DoQ:'+srv.doq_port;
   document.getElementById('sm-server').innerHTML=
     m('PID',srv.pid)+m('Uptime',fmtUptime(srv.uptime_seconds||0))+
-    m('Python',fmt(srv.python_version))+m('Hostname',fmt(srv.hostname))+
-    m('DNS Endpoint',fmt(srv.dns_host)+':'+fmt(srv.dns_port));
+    m('Python',fmt(srv.python_version))+m('OS',fmt(srv.os))+
+    m('Hostname',fmt(srv.hostname))+m('Version',fmt(srv.app_version))+
+    m('DNS Endpoints',ports);
 
   let pct=w.current_limit?Math.round(w.active/w.current_limit*100):0;
   document.getElementById('sm-dns-workers').innerHTML=
@@ -8894,6 +8951,18 @@ function renderSummary(d){
     m('Burst Expansions',w.burst_expansions_total)+m('Shrink Ops',w.shrink_total)+
     m('Rejected UDP',w.rejected_udp)+m('Rejected TCP',w.rejected_tcp)+m('Rejected DoT',w.rejected_dot)+
     (pct>=90?'<div class="sm-warn">Warning: DNS worker usage is above 90%</div>':'');
+
+  let uw=d.upstream_workers||{};
+  document.getElementById('sm-upstream-workers').innerHTML=
+    m('Max Limit',uw.max_limit||'-')+
+    m('Upstream Errors',uw.errors_total||0);
+
+  let net=d.network||{};
+  function ls(s){return s==='active'?'<span class="sm-status sm-status-green"></span>Active':'<span class="sm-status sm-status-red"></span>Stopped';}
+  document.getElementById('sm-network').innerHTML=
+    m('UDP Listener',ls(net.udp_listener))+m('TCP Listener',ls(net.tcp_listener))+
+    m('DoT Listener',ls(net.dot_listener))+m('DoH Listener',ls(net.doh_listener))+
+    m('DoQ Listener',ls(net.doq_listener))+m('Threads',net.thread_count||'-');
 
   let cpu=r.cpu||{},mem=r.memory||{},proc=r.process||{};
   document.getElementById('sm-resources').innerHTML=
@@ -9105,7 +9174,7 @@ def settings_page(message="", is_error=False, values=None):
           <div><label class="form-label">DoH/3 Total Timeout</label><input class="form-control" name="doh3_total_timeout" type="number" min="0.1" step="0.1" value="{html_escape(value('doh3_total_timeout', '2.2'))}"></div>
         </div>
 
-        <div class="settings-subhead">DNS Worker Limits</div>
+        <div class="settings-subhead">DNS Worker Limits <a href="/system-monitor" style="font-size:.72rem;font-weight:400;text-transform:none;letter-spacing:0;color:var(--accent);margin-left:.5rem">View current usage</a></div>
         <div class="settings-field-grid">
           <div><label class="form-label">DNS Worker Base Limit</label><input class="form-control" name="max_dns_workers" type="number" min="1" max="4096" value="{html_escape(value('max_dns_workers', '32'))}"><div class="settings-help">Normal concurrency limit for DNS request processing.</div></div>
           <div><label class="form-label">DNS Worker Burst Limit</label><input class="form-control" name="max_dns_workers_burst" type="number" min="1" max="4096" value="{html_escape(value('max_dns_workers_burst', '64'))}"><div class="settings-help">Temporary upper limit during traffic spikes. Must be &gt;= base limit.</div></div>
@@ -11554,6 +11623,57 @@ class WebHandler(BaseHTTPRequestHandler):
             "# TYPE pyguarddns_filter_engine_generation counter",
             f"pyguarddns_filter_engine_generation {m['filter_engine_generation']}",
         ]
+        snap = dns_worker_limiter.snapshot()
+        lines += [
+            "",
+            "# HELP pyguarddns_dns_workers_base_limit DNS worker base concurrency limit",
+            "# TYPE pyguarddns_dns_workers_base_limit gauge",
+            f"pyguarddns_dns_workers_base_limit {snap.base_limit}",
+            "",
+            "# HELP pyguarddns_dns_workers_max_limit DNS worker hard burst maximum",
+            "# TYPE pyguarddns_dns_workers_max_limit gauge",
+            f"pyguarddns_dns_workers_max_limit {snap.max_limit}",
+            "",
+            "# HELP pyguarddns_dns_workers_current_limit DNS worker current dynamic limit",
+            "# TYPE pyguarddns_dns_workers_current_limit gauge",
+            f"pyguarddns_dns_workers_current_limit {snap.current_limit}",
+            "",
+            "# HELP pyguarddns_dns_workers_active Currently active DNS workers",
+            "# TYPE pyguarddns_dns_workers_active gauge",
+            f"pyguarddns_dns_workers_active {snap.active_workers}",
+            "",
+            "# HELP pyguarddns_dns_workers_peak Peak active DNS workers since last reset",
+            "# TYPE pyguarddns_dns_workers_peak gauge",
+            f"pyguarddns_dns_workers_peak {snap.peak_active_workers}",
+            "",
+            "# HELP pyguarddns_dns_workers_waiters Requests waiting for a DNS worker slot",
+            "# TYPE pyguarddns_dns_workers_waiters gauge",
+            f"pyguarddns_dns_workers_waiters {snap.waiters}",
+            "",
+            "# HELP pyguarddns_dns_workers_rejected_total DNS requests rejected due to capacity exhaustion",
+            "# TYPE pyguarddns_dns_workers_rejected_total counter",
+            f"pyguarddns_dns_workers_rejected_total {snap.rejected_total}",
+            "",
+            "# HELP pyguarddns_dns_workers_burst_expansions_total Dynamic limit expansions during burst",
+            "# TYPE pyguarddns_dns_workers_burst_expansions_total counter",
+            f"pyguarddns_dns_workers_burst_expansions_total {snap.burst_expansions_total}",
+            "",
+            "# HELP pyguarddns_dns_workers_shrink_total Limit shrink-back operations to base",
+            "# TYPE pyguarddns_dns_workers_shrink_total counter",
+            f"pyguarddns_dns_workers_shrink_total {snap.shrink_total}",
+            "",
+            "# HELP pyguarddns_dns_worker_rejected_udp_total UDP DNS requests rejected",
+            "# TYPE pyguarddns_dns_worker_rejected_udp_total counter",
+            f"pyguarddns_dns_worker_rejected_udp_total {snap.rejected_udp}",
+            "",
+            "# HELP pyguarddns_dns_worker_rejected_tcp_total TCP DNS requests rejected",
+            "# TYPE pyguarddns_dns_worker_rejected_tcp_total counter",
+            f"pyguarddns_dns_worker_rejected_tcp_total {snap.rejected_tcp}",
+            "",
+            "# HELP pyguarddns_dns_worker_rejected_dot_total DoT DNS requests rejected",
+            "# TYPE pyguarddns_dns_worker_rejected_dot_total counter",
+            f"pyguarddns_dns_worker_rejected_dot_total {snap.rejected_dot}",
+        ]
         body = "\n".join(lines).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -11885,6 +12005,7 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_json(data)
         elif path == "/api/system-monitor/workers":
             snap = dns_worker_limiter.snapshot()
+            up_max = max(1, int(get_setting("max_upstream_workers", "16") or "16"))
             self.send_json({
                 "dns_workers": {
                     "base_limit": snap.base_limit, "max_limit": snap.max_limit,
@@ -11894,6 +12015,11 @@ class WebHandler(BaseHTTPRequestHandler):
                     "rejected_total": snap.rejected_total,
                     "burst_expansions_total": snap.burst_expansions_total,
                     "shrink_total": snap.shrink_total,
+                    "rejected_udp": snap.rejected_udp, "rejected_tcp": snap.rejected_tcp, "rejected_dot": snap.rejected_dot,
+                },
+                "upstream_workers": {
+                    "max_limit": up_max,
+                    "errors_total": get_runtime_metrics().get("dns_upstream_errors_total", 0),
                 },
             })
         elif path == "/api/system-monitor/active-requests":
@@ -12156,12 +12282,18 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, "message": "DNS restart scheduled"})
         elif path == "/api/system-monitor/dns/stop":
             with runtime_restart_lock:
+                if not dns_servers and not encrypted_dns_servers:
+                    self.send_json({"ok": False, "error": "DNS service is already stopped"}, 409)
+                    return
                 log_admin_action(self.session_user(), "dns_stop", "DNS service stop requested", self.client_address[0])
                 shutdown_dns_runtime_servers()
                 set_runtime_status("DNS stopped", ready=True)
             self.send_json({"ok": True, "message": "DNS service stopped"})
         elif path == "/api/system-monitor/dns/start":
             with runtime_restart_lock:
+                if dns_servers:
+                    self.send_json({"ok": False, "error": "DNS service is already running"}, 409)
+                    return
                 log_admin_action(self.session_user(), "dns_start", "DNS service start requested", self.client_address[0])
                 load_runtime_network_settings()
                 started = start_dns_servers()
