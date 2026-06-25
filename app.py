@@ -9274,8 +9274,7 @@ function render(d){
   var barVal = Math.max(w.active, rp);
   var pct = w.current_limit ? Math.round(barVal / w.current_limit * 100) : 0;
   var totalReqs = rm.dns_requests_total || 0;
-  var headerText = w.active + ' / ' + w.current_limit;
-  if(rp > w.active) headerText += '  (recent peak: ' + rp + ')';
+  var headerText = barVal + ' / ' + w.current_limit;
   document.getElementById('sm-dns-workers').innerHTML =
     '<div style="font-size:.95rem;font-weight:800;margin-bottom:.35rem">' + headerText + '  (' + pct + '%)</div>' +
     bar(pct) +
