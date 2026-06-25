@@ -9270,15 +9270,19 @@ function render(d){
     m('DNS Endpoints', ports);
 
   /* DNS Workers */
-  var pct = w.current_limit ? Math.round(w.active / w.current_limit * 100) : 0;
+  var rp = w.recent_peak || 0;
+  var barVal = Math.max(w.active, rp);
+  var pct = w.current_limit ? Math.round(barVal / w.current_limit * 100) : 0;
   var totalReqs = rm.dns_requests_total || 0;
+  var headerText = w.active + ' / ' + w.current_limit;
+  if(rp > w.active) headerText += '  (recent peak: ' + rp + ')';
   document.getElementById('sm-dns-workers').innerHTML =
-    '<div style="font-size:.95rem;font-weight:800;margin-bottom:.35rem">' + w.active + ' / ' + w.current_limit + '  (' + pct + '%)</div>' +
+    '<div style="font-size:.95rem;font-weight:800;margin-bottom:.35rem">' + headerText + '  (' + pct + '%)</div>' +
     bar(pct) +
     '<div style="font-size:.78rem;color:var(--muted2);margin:.35rem 0">Dynamic capacity: ' + w.current_limit + ' / ' + w.max_limit + '  |  Total processed: ' + totalReqs + '</div>' +
     m('Base Limit', w.base_limit) + m('Burst Limit', w.max_limit) + m('Current Limit', w.current_limit) +
     m('Active', w.active) + m('Free', w.free) + m('Waiting', w.waiting) +
-    m('Recent Peak', w.recent_peak) + m('Peak', w.peak) + m('Rejected Total', w.rejected_total) +
+    m('Recent Peak', rp) + m('Peak', w.peak) + m('Rejected Total', w.rejected_total) +
     m('Burst Expansions', w.burst_expansions_total) + m('Shrink Ops', w.shrink_total) +
     m('Rejected UDP', w.rejected_udp) + m('Rejected TCP', w.rejected_tcp) + m('Rejected DoT', w.rejected_dot) +
     (pct >= 90 ? '<div class="sm-warn">Warning: DNS worker usage above 90%</div>' : '');
