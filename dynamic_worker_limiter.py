@@ -17,6 +17,7 @@ class WorkerLimiterSnapshot:
     current_limit: int
     active_workers: int
     peak_active_workers: int
+    recent_peak: int
     waiters: int
     rejected_total: int
     burst_expansions_total: int
@@ -49,6 +50,7 @@ class DynamicDNSWorkerLimiter:
 
         self.active_workers = 0
         self.peak_active_workers = 0
+        self._recent_peak = 0
         self.waiters = 0
 
         self.rejected_total = 0
@@ -114,6 +116,8 @@ class DynamicDNSWorkerLimiter:
 
             if self.active_workers > self.peak_active_workers:
                 self.peak_active_workers = self.active_workers
+            if self.active_workers > self._recent_peak:
+                self._recent_peak = self.active_workers
 
             return True
 
@@ -132,15 +136,19 @@ class DynamicDNSWorkerLimiter:
         with self._condition:
             self._shrink_locked()
 
-    def snapshot(self) -> WorkerLimiterSnapshot:
+    def snapshot(self, reset_recent_peak: bool = False) -> WorkerLimiterSnapshot:
         with self._condition:
             self._shrink_locked()
+            recent = max(self._recent_peak, self.active_workers)
+            if reset_recent_peak:
+                self._recent_peak = self.active_workers
             return WorkerLimiterSnapshot(
                 base_limit=self.base_limit,
                 max_limit=self.max_limit,
                 current_limit=self.current_limit,
                 active_workers=self.active_workers,
                 peak_active_workers=self.peak_active_workers,
+                recent_peak=recent,
                 waiters=self.waiters,
                 rejected_total=self.rejected_total,
                 burst_expansions_total=self.burst_expansions_total,
@@ -188,6 +196,7 @@ class DynamicDNSWorkerLimiter:
     def reset_statistics(self) -> None:
         with self._condition:
             self.peak_active_workers = self.active_workers
+            self._recent_peak = self.active_workers
             self.rejected_total = 0
             self.burst_expansions_total = 0
             self.shrink_total = 0

@@ -9025,7 +9025,7 @@ def _collect_system_resources():
 
 
 def _system_monitor_api_summary():
-    snap = dns_worker_limiter.snapshot()
+    snap = dns_worker_limiter.snapshot(reset_recent_peak=True)
     uptime = time.monotonic() - _app_start_monotonic if _app_start_monotonic else 0
     resources = _collect_system_resources()
     dns_running = bool(dns_servers)
@@ -9055,6 +9055,7 @@ def _system_monitor_api_summary():
             "free": max(0, snap.current_limit - snap.active_workers),
             "waiting": snap.waiters,
             "peak": snap.peak_active_workers,
+            "recent_peak": snap.recent_peak,
             "rejected_total": snap.rejected_total,
             "burst_expansions_total": snap.burst_expansions_total,
             "shrink_total": snap.shrink_total,
@@ -9277,7 +9278,7 @@ function render(d){
     '<div style="font-size:.78rem;color:var(--muted2);margin:.35rem 0">Dynamic capacity: ' + w.current_limit + ' / ' + w.max_limit + '  |  Total processed: ' + totalReqs + '</div>' +
     m('Base Limit', w.base_limit) + m('Burst Limit', w.max_limit) + m('Current Limit', w.current_limit) +
     m('Active', w.active) + m('Free', w.free) + m('Waiting', w.waiting) +
-    m('Peak', w.peak) + m('Rejected Total', w.rejected_total) +
+    m('Recent Peak', w.recent_peak) + m('Peak', w.peak) + m('Rejected Total', w.rejected_total) +
     m('Burst Expansions', w.burst_expansions_total) + m('Shrink Ops', w.shrink_total) +
     m('Rejected UDP', w.rejected_udp) + m('Rejected TCP', w.rejected_tcp) + m('Rejected DoT', w.rejected_dot) +
     (pct >= 90 ? '<div class="sm-warn">Warning: DNS worker usage above 90%</div>' : '');
