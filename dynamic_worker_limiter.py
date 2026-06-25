@@ -178,10 +178,12 @@ class DynamicDNSWorkerLimiter:
             self.base_limit = int(base_limit)
             self.max_limit = int(max_limit)
             self.shrink_after = float(shrink_after)
-            if self.current_limit < self.base_limit:
-                self.current_limit = self.base_limit
             if self.current_limit > self.max_limit:
                 self.current_limit = self.max_limit
+            if self.current_limit < self.base_limit:
+                self.current_limit = self.base_limit
+            if self.current_limit > self.base_limit and self.active_workers <= self.base_limit:
+                self.current_limit = self.base_limit
 
     def reset_statistics(self) -> None:
         with self._condition:
