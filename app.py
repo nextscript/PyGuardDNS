@@ -326,6 +326,48 @@ def get_runtime_metrics():
 _monitor_log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "system-monitor.log")
 _monitor_log_lock = threading.Lock()
 
+_MONITOR_LOG_BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "log-backups")
+_MONITOR_LOG_BACKUP_INTERVAL = 86400
+
+_VALID_MONITOR_LOG_LEVELS = {"minimal", "normal", "debug"}
+
+_MONITOR_LOG_DEFAULTS = {
+    "system_monitor_log_level": "normal",
+    "system_monitor_log_max_bytes": "10485760",
+    "system_monitor_log_retention_days": "7",
+    "system_monitor_log_view_max_bytes": "2097152",
+    "system_monitor_slow_request_ms": "1000",
+}
+
+_monitor_settings_snapshot = dict(_MONITOR_LOG_DEFAULTS)
+_monitor_settings_snapshot_lock = threading.Lock()
+
+
+def _refresh_monitor_settings_snapshot():
+    snap = {}
+    for key, default in _MONITOR_LOG_DEFAULTS.items():
+        snap[key] = get_setting(key, default)
+    with _monitor_settings_snapshot_lock:
+        _monitor_settings_snapshot.update(snap)
+
+
+def _get_monitor_log_level():
+    raw = _monitor_settings_snapshot.get("system_monitor_log_level", "normal").strip().lower()
+    return raw if raw in _VALID_MONITOR_LOG_LEVELS else "normal"
+
+
+def _get_monitor_int(key):
+    try:
+        return max(0, int(_monitor_settings_snapshot.get(key, _MONITOR_LOG_DEFAULTS[key])))
+    except (ValueError, TypeError):
+        return int(_MONITOR_LOG_DEFAULTS[key])
+
+
+def _sanitize_monitor_value(val):
+    if not isinstance(val, str):
+        val = str(val)
+    return val.replace("\n", " ").replace("\r", " ").replace("\x00", "")
+
 
 def _monitor_log(msg):
     try:
@@ -333,17 +375,59 @@ def _monitor_log(msg):
         with _monitor_log_lock:
             with open(_monitor_log_path, "a", encoding="utf-8") as f:
                 f.write(line)
+            _rotate_if_size_exceeded()
     except Exception:
         pass
 
 
-_MONITOR_LOG_BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "log-backups")
-_MONITOR_LOG_BACKUP_INTERVAL = 86400
-_MONITOR_LOG_BACKUP_RETENTION_DAYS = 30
+def _rotate_monitor_log_now():
+    os.makedirs(_MONITOR_LOG_BACKUP_DIR, exist_ok=True)
+    try:
+        if not os.path.isfile(_monitor_log_path) or os.path.getsize(_monitor_log_path) == 0:
+            return False
+        stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+        base_name = f"system-monitor_{stamp}"
+        gz_path = os.path.join(_MONITOR_LOG_BACKUP_DIR, f"{base_name}.log.gz")
+        seq = 0
+        while os.path.exists(gz_path):
+            seq += 1
+            gz_path = os.path.join(_MONITOR_LOG_BACKUP_DIR, f"{base_name}_{seq}.log.gz")
+        tmp_path = _monitor_log_path + ".rotating"
+        try:
+            os.replace(_monitor_log_path, tmp_path)
+        except OSError:
+            return False
+        with open(_monitor_log_path, "w", encoding="utf-8"):
+            pass
+    except Exception:
+        return False
+    try:
+        with open(tmp_path, "rb") as src, gzip.open(gz_path, "wb") as dst:
+            while True:
+                chunk = src.read(1 << 20)
+                if not chunk:
+                    break
+                dst.write(chunk)
+        os.remove(tmp_path)
+    except Exception:
+        pass
+    return True
+
+
+def _rotate_if_size_exceeded():
+    max_bytes = _get_monitor_int("system_monitor_log_max_bytes")
+    if max_bytes <= 0:
+        return
+    try:
+        if os.path.isfile(_monitor_log_path) and os.path.getsize(_monitor_log_path) >= max_bytes:
+            _rotate_monitor_log_now()
+    except Exception:
+        pass
 
 
 def _purge_old_backups():
-    cutoff = time.time() - _MONITOR_LOG_BACKUP_RETENTION_DAYS * 86400
+    retention_days = _get_monitor_int("system_monitor_log_retention_days")
+    cutoff = time.time() - retention_days * 86400
     try:
         for name in os.listdir(_MONITOR_LOG_BACKUP_DIR):
             if not name.endswith(".log.gz"):
@@ -356,29 +440,47 @@ def _purge_old_backups():
 
 
 def _rotate_monitor_log():
-    """Compress system-monitor.log into a dated .gz backup every 24 h."""
     os.makedirs(_MONITOR_LOG_BACKUP_DIR, exist_ok=True)
     while not server_shutdown_event.is_set():
         server_shutdown_event.wait(_MONITOR_LOG_BACKUP_INTERVAL)
         if server_shutdown_event.is_set():
             break
-        _purge_old_backups()
         with _monitor_log_lock:
-            try:
-                if not os.path.isfile(_monitor_log_path) or os.path.getsize(_monitor_log_path) == 0:
-                    continue
-                stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-                gz_name = os.path.join(_MONITOR_LOG_BACKUP_DIR, f"system-monitor_{stamp}.log.gz")
-                with open(_monitor_log_path, "rb") as src, gzip.open(gz_name, "wb") as dst:
-                    while True:
-                        chunk = src.read(1 << 20)
-                        if not chunk:
-                            break
-                        dst.write(chunk)
-                with open(_monitor_log_path, "w", encoding="utf-8") as f:
-                    f.truncate(0)
-            except Exception:
-                pass
+            rotated = _rotate_monitor_log_now()
+        if rotated:
+            _purge_old_backups()
+
+
+def _read_monitor_log_tail():
+    max_bytes = _get_monitor_int("system_monitor_log_view_max_bytes")
+    if max_bytes <= 0:
+        max_bytes = int(_MONITOR_LOG_DEFAULTS["system_monitor_log_view_max_bytes"])
+    try:
+        file_size = os.path.getsize(_monitor_log_path) if os.path.isfile(_monitor_log_path) else 0
+    except OSError:
+        return {"content": "", "file_size": 0, "returned_bytes": 0, "truncated": False}
+    if file_size == 0:
+        return {"content": "", "file_size": 0, "returned_bytes": 0, "truncated": False}
+    truncated = file_size > max_bytes
+    try:
+        with open(_monitor_log_path, "rb") as f:
+            if truncated:
+                f.seek(file_size - max_bytes)
+                data = f.read()
+                nl = data.find(b"\n")
+                if nl != -1 and nl < len(data) - 1:
+                    data = data[nl + 1:]
+            else:
+                data = f.read()
+        content = data.decode("utf-8", errors="replace")
+    except Exception as exc:
+        return {"content": f"Error reading log: {exc}", "file_size": file_size, "returned_bytes": 0, "truncated": False}
+    return {
+        "content": content,
+        "file_size": file_size,
+        "returned_bytes": len(data),
+        "truncated": truncated,
+    }
 
 
 def register_active_request(client_ip, domain, qtype, protocol):
@@ -399,8 +501,9 @@ def register_active_request(client_ip, domain, qtype, protocol):
             "upstream_name": "",
             "blocked": False,
         }
-    snap = dns_worker_limiter.snapshot()
-    _monitor_log(f"[REQ #{rid}] START  proto={protocol} client={client_ip} | workers active={snap.active_workers}/{snap.current_limit} peak={snap.peak_active_workers} burst={snap.burst_expansions_total} rejected={snap.rejected_total}")
+    if _get_monitor_log_level() == "debug":
+        snap = dns_worker_limiter.snapshot()
+        _monitor_log(f"[REQ #{rid}] START  proto={protocol} client={_sanitize_monitor_value(client_ip)} | workers active={snap.active_workers}/{snap.current_limit} peak={snap.peak_active_workers} burst={snap.burst_expansions_total} rejected={snap.rejected_total}")
     return rid
 
 
@@ -409,17 +512,55 @@ def update_active_request(request_id, **kwargs):
         entry = _active_requests.get(request_id)
         if entry:
             entry.update(kwargs)
-            if "domain" in kwargs or "stage" in kwargs:
-                _monitor_log(f"[REQ #{request_id}] STAGE  {entry.get('stage','?'):20s} domain={entry.get('domain','')} type={entry.get('query_type','')} cache={entry.get('cache_status','')}")
+            if _get_monitor_log_level() == "debug" and ("domain" in kwargs or "stage" in kwargs):
+                _monitor_log(f"[REQ #{request_id}] STAGE  {entry.get('stage','?'):20s} domain={_sanitize_monitor_value(entry.get('domain',''))} type={entry.get('query_type','')} cache={entry.get('cache_status','')}")
 
 
 def unregister_active_request(request_id):
     with _active_requests_lock:
         entry = _active_requests.pop(request_id, None)
-    if entry:
-        duration_ms = (time.monotonic() - entry["started_monotonic"]) * 1000
-        snap = dns_worker_limiter.snapshot()
-        _monitor_log(f"[REQ #{request_id}] END    {duration_ms:8.2f}ms proto={entry['protocol']} domain={entry.get('domain','')} type={entry.get('query_type','')} stage={entry.get('stage','')} cache={entry.get('cache_status','')} blocked={entry.get('blocked',False)} | workers active={snap.active_workers}/{snap.current_limit}")
+    if not entry:
+        return
+    duration_ms = (time.monotonic() - entry["started_monotonic"]) * 1000
+    level = _get_monitor_log_level()
+    blocked = entry.get("blocked", False)
+    stage = entry.get("stage", "")
+    is_error = stage in ("timeout", "error", "upstream_error", "rejected")
+
+    slow_threshold = _get_monitor_int("system_monitor_slow_request_ms")
+    is_slow = duration_ms >= slow_threshold
+
+    if level == "minimal" and not blocked and not is_error and not is_slow:
+        return
+
+    snap = dns_worker_limiter.snapshot()
+    parts = [f"[REQ #{request_id}]"]
+    if is_slow and not is_error:
+        parts.append(f"SLOW   {duration_ms:8.2f}ms")
+    else:
+        parts.append(f"END    {duration_ms:8.2f}ms")
+    parts.append(f"proto={entry['protocol']}")
+    client = entry.get("client_ip", "")
+    if client:
+        parts.append(f"client={_sanitize_monitor_value(client)}")
+    domain = entry.get("domain", "")
+    if domain:
+        parts.append(f"domain={_sanitize_monitor_value(domain)}")
+    qtype = entry.get("query_type", "")
+    if qtype:
+        parts.append(f"type={qtype}")
+    if stage:
+        parts.append(f"stage={stage}")
+    cache = entry.get("cache_status", "")
+    if cache:
+        parts.append(f"cache={cache}")
+    upstream = entry.get("upstream_name", "")
+    if upstream:
+        parts.append(f"upstream={_sanitize_monitor_value(upstream)}")
+    if blocked:
+        parts.append("blocked=True")
+    parts.append(f"workers={snap.active_workers}/{snap.current_limit}")
+    _monitor_log(" ".join(parts))
 
 
 def get_active_requests_snapshot(limit=500):
@@ -9024,6 +9165,7 @@ def system_monitor_page():
       </div>
     </div>
     <div class="sm-log-body">
+      <div id="sm-log-truncated" style="display:none;padding:.45rem .8rem;margin:0 .6rem .3rem;background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.25);border-radius:.4rem;font-size:.78rem;color:#eab308"></div>
       <pre id="sm-log-content" class="sm-log-pre">Loading...</pre>
     </div>
     <div class="sm-modal-footer">
@@ -9251,10 +9393,17 @@ window.smAction = function(url, msg){
     .catch(function(e){ document.getElementById('sm-action-result').innerHTML = '<span style="color:#f87171">Error: ' + e.message + '</span>'; });
 };
 
+function formatBytes(b){
+  if(b>=1048576) return (b/1048576).toFixed(1)+' MiB';
+  if(b>=1024) return (b/1024).toFixed(1)+' KiB';
+  return b+' B';
+}
 function loadLog(){
   var content = document.getElementById('sm-log-content');
   var badge = document.getElementById('sm-log-lines');
+  var notice = document.getElementById('sm-log-truncated');
   content.textContent = 'Loading...';
+  if(notice) notice.style.display = 'none';
   fetch('/api/system-monitor/log', {credentials: 'same-origin'})
     .then(function(r){
       if(!r.ok) throw new Error('HTTP ' + r.status);
@@ -9272,6 +9421,10 @@ function loadLog(){
         if(document.getElementById('sm-log-autoscroll').checked){
           content.scrollTop = content.scrollHeight;
         }
+      }
+      if(notice && d.truncated){
+        notice.textContent = 'Only the newest ' + formatBytes(d.returned_bytes) + ' of ' + formatBytes(d.file_size) + ' are displayed.';
+        notice.style.display = 'block';
       }
     })
     .catch(function(e){ content.textContent = 'Error: ' + e.message; badge.textContent = 'error'; });
@@ -9666,6 +9819,35 @@ def settings_page(message="", is_error=False, values=None):
         <div class="settings-field-grid two">
           <div><label class="form-label">Blocked Response TTL</label><input class="form-control" name="block_response_ttl" type="number" min="0" value="{get_setting('block_response_ttl','60')}"></div>
           <div class="settings-help" style="display:flex;align-items:center">Number of seconds clients should cache a filtered response.</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="settings-section settings-section-wide">
+      <div class="settings-section-head">
+        <div>
+          <div class="settings-section-title">System Monitor Logging</div>
+          <div class="settings-section-subtitle">Log verbosity, rotation, retention, and viewer limits for system-monitor.log.</div>
+        </div>
+      </div>
+      <div class="settings-section-body settings-stack">
+        <div>
+          <label class="form-label">Log Level</label>
+          <div class="settings-field-grid two">
+            {radio_group("system_monitor_log_level", [
+                ("minimal", "Minimal", "Errors, rejected requests, timeouts, and slow requests only."),
+                ("normal", "Normal", "One summary line per DNS request plus all minimal events."),
+                ("debug", "Debug", "Full START, STAGE, and END tracing for every request."),
+            ], "normal")}
+          </div>
+        </div>
+        <div class="settings-field-grid">
+          <div><label class="form-label">Maximum Log Size (MiB)</label><input class="form-control" name="system_monitor_log_max_mib" type="number" min="1" max="1024" value="{html_escape(str(int(_get_monitor_int('system_monitor_log_max_bytes') / 1048576) or 10))}"><div class="settings-help">Rotate when the log reaches this size. Default: 10 MiB.</div></div>
+          <div><label class="form-label">Log Retention (days)</label><input class="form-control" name="system_monitor_log_retention_days" type="number" min="0" max="365" value="{html_escape(get_setting('system_monitor_log_retention_days', '7'))}"><div class="settings-help">Delete compressed backups older than this. 0 = delete immediately after rotation.</div></div>
+          <div><label class="form-label">Log Viewer Limit (MiB)</label><input class="form-control" name="system_monitor_log_view_max_mib" type="number" min="0" max="50" step="0.1" value="{html_escape(str(round(_get_monitor_int('system_monitor_log_view_max_bytes') / 1048576, 1) or 2))}"><div class="settings-help">Maximum amount loaded for the log viewer. Default: 2 MiB.</div></div>
+        </div>
+        <div class="settings-field-grid two">
+          <div><label class="form-label">Slow Request Threshold (ms)</label><input class="form-control" name="system_monitor_slow_request_ms" type="number" min="1" max="60000" value="{html_escape(get_setting('system_monitor_slow_request_ms', '1000'))}"><div class="settings-help">Requests slower than this are logged even in minimal mode. Default: 1000 ms.</div></div>
         </div>
       </div>
     </section>
@@ -11286,6 +11468,11 @@ class WebHandler(BaseHTTPRequestHandler):
                 "encrypted_dns_certificate_pem", "encrypted_dns_private_key_pem",
                 "db_in_memory",
                 "db_memory_sync_interval",
+                "system_monitor_log_level",
+                "system_monitor_log_max_bytes",
+                "system_monitor_log_retention_days",
+                "system_monitor_log_view_max_bytes",
+                "system_monitor_slow_request_ms",
             ]
             try:
                 parse_port(form.get("localdnsguard_web_port", WEB_PORT), WEB_PORT, "LOCALDNSGUARD_WEB_PORT")
@@ -11374,6 +11561,26 @@ class WebHandler(BaseHTTPRequestHandler):
                     ok, err = ensure_root_trust_anchor()
                     if not ok:
                         raise ValueError(f"DNSSEC trust anchor bootstrap failed: {err}")
+                ml_level = form.get("system_monitor_log_level", "normal").strip().lower()
+                if ml_level not in _VALID_MONITOR_LOG_LEVELS:
+                    ml_level = "normal"
+                form["system_monitor_log_level"] = ml_level
+                ml_max_mib = float(form.get("system_monitor_log_max_mib", "10") or "10")
+                if ml_max_mib < 1 or ml_max_mib > 1024:
+                    raise ValueError("Maximum Log Size must be between 1 and 1024 MiB")
+                form["system_monitor_log_max_bytes"] = str(int(ml_max_mib * 1048576))
+                ml_retention = int(form.get("system_monitor_log_retention_days", "7") or "7")
+                if ml_retention < 0 or ml_retention > 365:
+                    raise ValueError("Log Retention must be between 0 and 365 days")
+                form["system_monitor_log_retention_days"] = str(ml_retention)
+                ml_view_mib = float(form.get("system_monitor_log_view_max_mib", "2") or "2")
+                if ml_view_mib * 1048576 < 65536 or ml_view_mib > 50:
+                    raise ValueError("Log Viewer Limit must be between 64 KiB and 50 MiB")
+                form["system_monitor_log_view_max_bytes"] = str(int(ml_view_mib * 1048576))
+                ml_slow = int(form.get("system_monitor_slow_request_ms", "1000") or "1000")
+                if ml_slow < 1 or ml_slow > 60000:
+                    raise ValueError("Slow Request Threshold must be between 1 and 60000 ms")
+                form["system_monitor_slow_request_ms"] = str(ml_slow)
             except ValueError as exc:
                 self.send_html(settings_page(str(exc), True, form), 400)
                 return
@@ -11381,6 +11588,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 set_setting(key, form.get(key, ""))
             if dnssec_will_be_enabled or dnssec_was_enabled:
                 clear_dnssec_validator()
+            _refresh_monitor_settings_snapshot()
             load_runtime_network_settings()
             set_runtime_status("Reboot DNS ...", ready=False)
             schedule_dns_runtime_restart()
@@ -12587,14 +12795,9 @@ class WebHandler(BaseHTTPRequestHandler):
                 warnings.append(f"{snap.waiters} request(s) waiting for DNS worker slots")
             self.send_json({"warnings": warnings, "thread_count": threading.active_count()})
         elif path == "/api/system-monitor/log":
-            try:
-                with open(_monitor_log_path, "r", encoding="utf-8") as f:
-                    content = f.read()
-            except FileNotFoundError:
-                content = ""
-            except Exception as exc:
-                content = f"Error reading log: {exc}"
-            self.send_json({"ok": True, "content": content})
+            result = _read_monitor_log_tail()
+            result["ok"] = True
+            self.send_json(result)
         else:
             self.send_json({"error": "not found"}, 404)
 
@@ -12872,8 +13075,9 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, "message": "Statistics reset"})
         elif path == "/api/system-monitor/log/clear":
             try:
-                with open(_monitor_log_path, "w", encoding="utf-8") as f:
-                    f.write("")
+                with _monitor_log_lock:
+                    with open(_monitor_log_path, "w", encoding="utf-8") as f:
+                        f.truncate(0)
                 log_admin_action(self.session_user(), "monitor_log_clear", "System monitor log cleared", self.client_address[0])
                 self.send_json({"ok": True, "message": "Log cleared"})
             except Exception as exc:
@@ -13784,8 +13988,10 @@ def main():
         threading.Thread(target=_worker_limiter_maintenance_loop, name="worker-limiter-maintenance", daemon=True).start()
         log.write(f"{now_iso()} worker limiter maintenance ready\n")
         log.flush()
+        _refresh_monitor_settings_snapshot()
+        _purge_old_backups()
         threading.Thread(target=_rotate_monitor_log, name="monitor-log-rotate", daemon=True).start()
-        log.write(f"{now_iso()} monitor log rotation ready (every 24h -> log-backups/)\n")
+        log.write(f"{now_iso()} monitor log rotation ready (every 24h + size-based, level={_get_monitor_log_level()})\n")
         log.flush()
         start_update_checker()
         log.write(f"{now_iso()} update checker ready (checks every 1 hour)\n")
