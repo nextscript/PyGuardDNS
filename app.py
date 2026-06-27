@@ -259,6 +259,292 @@ cache_bytes_used = [0] * CACHE_SHARDS
 _upstream_rr_index = 0
 _upstream_rr_lock = threading.Lock()
 
+
+class WorkerDetailTracker:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._workers = {}
+        self._recent_workers = []
+        self._total_busy_time = 0.0
+        self._total_requests = 0
+        self._wait_samples = []
+        self._max_wait_time = 0.0
+        self._total_wait_time = 0.0
+        self._total_wait_count = 0
+        self._qps_timestamps = []
+        self._max_qps = 0.0
+        self._peak_active = 0
+        self._peak_time = None
+        self._peak_workers = []
+        self._utilization_samples = []
+        self._protocol_counts = {"UDP": 0, "TCP": 0, "DoT": 0, "DoH": 0, "DoQ": 0}
+        self._start_time = time.time()
+        self._snapshot_history = []
+        self._last_snapshot_time = 0.0
+        self._worker_numbers = {}
+
+    def worker_start(self, protocol, wait_time=0.0, is_burst=False):
+        tid = threading.get_ident()
+        now = time.monotonic()
+        with self._lock:
+            if tid not in self._worker_numbers:
+                used = set(self._worker_numbers.values())
+                n = 1
+                while n in used:
+                    n += 1
+                self._worker_numbers[tid] = n
+            self._workers[tid] = {
+                "thread_id": tid,
+                "number": self._worker_numbers[tid],
+                "status": "Processing",
+                "protocol": protocol,
+                "start_time": now,
+                "wait_time": wait_time,
+                "is_burst": is_burst,
+            }
+            self._total_requests += 1
+            self._total_wait_time += wait_time
+            self._total_wait_count += 1
+            if wait_time > self._max_wait_time:
+                self._max_wait_time = wait_time
+            active = len(self._workers)
+            if active > self._peak_active:
+                self._peak_active = active
+                self._peak_time = time.time()
+                self._peak_workers = [
+                    {"number": w["number"], "protocol": w["protocol"]}
+                    for w in self._workers.values()
+                ]
+            proto_label = {"UDP": "UDP", "TCP": "TCP", "TLS": "DoT", "HTTPS": "DoH", "QUIC": "DoQ"}.get(protocol, protocol)
+            if proto_label in self._protocol_counts:
+                self._protocol_counts[proto_label] += 1
+            now_ts = time.time()
+            self._qps_timestamps.append(now_ts)
+            cutoff = now_ts - 1.0
+            self._qps_timestamps = [t for t in self._qps_timestamps if t > cutoff]
+            current_qps = len(self._qps_timestamps)
+            if current_qps > self._max_qps:
+                self._max_qps = current_qps
+            limit = dns_worker_limiter.current_limit if dns_worker_limiter else 1
+            util_pct = (active / max(1, limit)) * 100
+            self._utilization_samples.append((now_ts, util_pct))
+            max_age = now_ts - 960
+            self._utilization_samples = [(t, v) for t, v in self._utilization_samples if t > max_age]
+            self._maybe_record_snapshot()
+
+    def _maybe_record_snapshot(self):
+        now = time.time()
+        if now - self._last_snapshot_time < 2.0:
+            return
+        self._last_snapshot_time = now
+        now_mono = time.monotonic()
+        active_count = len(self._workers)
+        workers_at_time = []
+        snap = dns_worker_limiter.snapshot()
+        used_numbers = set()
+        for w in self._workers.values():
+            workers_at_time.append({
+                "number": w["number"],
+                "status": "Processing",
+                "protocol": w["protocol"],
+                "busy_seconds": round(now_mono - w["start_time"], 3),
+                "wait_time_ms": round(w["wait_time"] * 1000, 2),
+                "is_burst": w.get("is_burst", False),
+            })
+            used_numbers.add(w["number"])
+        recent_cutoff = now - 30
+        recent_by_number = {}
+        for rw in self._recent_workers:
+            if rw["ended_at"] > recent_cutoff and rw["number"] is not None and rw["number"] not in used_numbers:
+                if rw["number"] not in recent_by_number or rw["ended_at"] > recent_by_number[rw["number"]]["ended_at"]:
+                    recent_by_number[rw["number"]] = rw
+        total_slots = max(self._peak_active, snap.current_limit)
+        for i in range(1, total_slots + 1):
+            if i not in used_numbers:
+                if i in recent_by_number:
+                    rw = recent_by_number[i]
+                    workers_at_time.append({
+                        "number": i,
+                        "status": "Completed",
+                        "protocol": rw["protocol"],
+                        "busy_seconds": rw["busy_seconds"],
+                        "wait_time_ms": rw["wait_time_ms"],
+                        "is_burst": i > snap.base_limit,
+                    })
+                else:
+                    workers_at_time.append({
+                        "number": i,
+                        "status": "Idle",
+                        "protocol": "-",
+                        "busy_seconds": 0,
+                        "wait_time_ms": 0,
+                        "is_burst": i > snap.base_limit,
+                    })
+        for i in range(snap.waiters):
+            workers_at_time.append({
+                "number": None,
+                "status": "Waiting",
+                "protocol": "-",
+                "busy_seconds": 0,
+                "wait_time_ms": 0,
+                "is_burst": False,
+            })
+        self._snapshot_history.append({
+            "timestamp": now,
+            "active": active_count,
+            "peak": self._peak_active,
+            "workers": workers_at_time,
+        })
+        if len(self._snapshot_history) > 150:
+            self._snapshot_history = self._snapshot_history[-150:]
+
+    def worker_end(self):
+        tid = threading.get_ident()
+        now = time.monotonic()
+        with self._lock:
+            w = self._workers.pop(tid, None)
+            if w:
+                duration = now - w["start_time"]
+                self._total_busy_time += duration
+                number = self._worker_numbers.pop(tid, None)
+                self._recent_workers.append({
+                    "thread_id": w["thread_id"],
+                    "number": number,
+                    "protocol": w["protocol"],
+                    "busy_seconds": round(duration, 3),
+                    "wait_time_ms": round(w["wait_time"] * 1000, 2),
+                    "ended_at": time.time(),
+                })
+                if len(self._recent_workers) > 50:
+                    self._recent_workers = self._recent_workers[-50:]
+
+    def get_snapshot(self):
+        now_mono = time.monotonic()
+        now_wall = time.time()
+        snap = dns_worker_limiter.snapshot()
+        with self._lock:
+            active_list = []
+            used_numbers = set()
+            for w in self._workers.values():
+                active_list.append({
+                    "number": w["number"],
+                    "status": "Processing",
+                    "protocol": w["protocol"],
+                    "busy_seconds": round(now_mono - w["start_time"], 3),
+                    "wait_time_ms": round(w["wait_time"] * 1000, 2),
+                    "is_burst": w.get("is_burst", False),
+                })
+                used_numbers.add(w["number"])
+            waiting_count = snap.waiters
+            total_slots = max(self._peak_active, snap.current_limit)
+            recent_cutoff = now_wall - 30
+            recent = [rw for rw in self._recent_workers if rw["ended_at"] > recent_cutoff]
+            recent_by_number = {}
+            for rw in recent:
+                if rw["number"] is not None and rw["number"] not in used_numbers:
+                    if rw["number"] not in recent_by_number or rw["ended_at"] > recent_by_number[rw["number"]]["ended_at"]:
+                        recent_by_number[rw["number"]] = rw
+            workers_list = []
+            for aw in active_list:
+                workers_list.append({
+                    "number": aw["number"],
+                    "status": aw["status"],
+                    "protocol": aw["protocol"],
+                    "busy_seconds": aw["busy_seconds"],
+                    "wait_time_ms": aw["wait_time_ms"],
+                    "is_burst": aw["is_burst"],
+                })
+            for i in range(1, total_slots + 1):
+                if i not in used_numbers:
+                    if i in recent_by_number:
+                        rw = recent_by_number[i]
+                        workers_list.append({
+                            "number": i,
+                            "status": "Completed",
+                            "protocol": rw["protocol"],
+                            "busy_seconds": rw["busy_seconds"],
+                            "wait_time_ms": rw["wait_time_ms"],
+                            "is_burst": i > snap.base_limit,
+                        })
+                    else:
+                        workers_list.append({
+                            "number": i,
+                            "status": "Idle",
+                            "protocol": "-",
+                            "busy_seconds": 0,
+                            "wait_time_ms": 0,
+                            "is_burst": i > snap.base_limit,
+                        })
+            for i in range(waiting_count):
+                workers_list.append({
+                    "number": None,
+                    "status": "Waiting",
+                    "protocol": "-",
+                    "busy_seconds": 0,
+                    "wait_time_ms": 0,
+                    "is_burst": False,
+                })
+            avg_wait = (self._total_wait_time / self._total_wait_count * 1000) if self._total_wait_count > 0 else 0
+            cutoff_1m = now_wall - 60
+            cutoff_5m = now_wall - 300
+            cutoff_15m = now_wall - 900
+            samples_1m = [v for t, v in self._utilization_samples if t > cutoff_1m]
+            samples_5m = [v for t, v in self._utilization_samples if t > cutoff_5m]
+            samples_15m = [v for t, v in self._utilization_samples if t > cutoff_15m]
+            avg_util_1m = round(sum(samples_1m) / len(samples_1m), 1) if samples_1m else 0
+            avg_util_5m = round(sum(samples_5m) / len(samples_5m), 1) if samples_5m else 0
+            avg_util_15m = round(sum(samples_15m) / len(samples_15m), 1) if samples_15m else 0
+            ts_1s = now_wall - 1.0
+            current_qps = len([t for t in self._qps_timestamps if t > ts_1s])
+            peak_time_str = ""
+            if self._peak_time:
+                peak_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self._peak_time))
+            proto_active = {"UDP": 0, "TCP": 0, "DoT": 0, "DoH": 0, "DoQ": 0}
+            for w in self._workers.values():
+                label = {"UDP": "UDP", "TCP": "TCP", "TLS": "DoT", "HTTPS": "DoH", "QUIC": "DoQ"}.get(w["protocol"], "")
+                if label in proto_active:
+                    proto_active[label] += 1
+            return {
+                "workers": workers_list,
+                "total_workers": snap.current_limit,
+                "base_limit": snap.base_limit,
+                "max_limit": snap.max_limit,
+                "active": snap.active_workers,
+                "idle": snap.current_limit - snap.active_workers,
+                "waiting": waiting_count,
+                "blocked": snap.rejected_total,
+                "avg_utilization_1m": avg_util_1m,
+                "avg_utilization_5m": avg_util_5m,
+                "avg_utilization_15m": avg_util_15m,
+                "peak_active": self._peak_active,
+                "recent_peak": snap.recent_peak,
+                "peak_time": peak_time_str,
+                "protocol_total": dict(self._protocol_counts),
+                "protocol_active": proto_active,
+                "total_busy_time": round(self._total_busy_time, 2),
+                "avg_wait_ms": round(avg_wait, 2),
+                "max_wait_ms": round(self._max_wait_time * 1000, 2),
+                "current_qps": current_qps,
+                "max_qps": int(self._max_qps),
+                "total_requests": self._total_requests,
+                "history": [{"timestamp": h["timestamp"], "active": h["active"], "peak": h.get("peak", 0)} for h in self._snapshot_history],
+            }
+
+    def get_snapshot_at(self, timestamp):
+        with self._lock:
+            for h in self._snapshot_history:
+                if abs(h["timestamp"] - timestamp) < 1.0:
+                    return {
+                        "timestamp": h["timestamp"],
+                        "active": h["active"],
+                        "peak": h.get("peak", 0),
+                        "workers": h["workers"],
+                    }
+            return None
+
+
+_worker_tracker = WorkerDetailTracker()
+
 _login_attempts: dict[str, list[float]] = {}
 _login_rate_limit_lock = threading.Lock()
 LOGIN_RATE_LIMIT = 5
@@ -5481,13 +5767,17 @@ def send_doh_response(handler, params=None):
                 handler.send_error(400, "invalid DNS message length")
                 return
             request = handler.rfile.read(length)
+        _wt0 = time.monotonic()
         if not dns_worker_limiter.acquire(timeout=DNS_WORKER_ACQUIRE_TIMEOUT):
             bump_runtime_metric("dns_worker_rejected_total")
             handler.send_error(503, "DNS service busy")
             return
+        _is_burst = dns_worker_limiter.active_workers > dns_worker_limiter.base_limit
+        _worker_tracker.worker_start("HTTPS", time.monotonic() - _wt0, is_burst=_is_burst)
         try:
             response = handle_dns_request(request, handler.client_address[0], "HTTPS")
         finally:
+            _worker_tracker.worker_end()
             dns_worker_limiter.release()
         if response is None:
             handler.send_error(502, "DNS query failed")
@@ -5530,6 +5820,7 @@ class DNSHTTPSHandler(BaseHTTPRequestHandler):
 class DNSUDPHandler(socketserver.BaseRequestHandler):
     def handle(self):
         data, sock = self.request
+        _wt0 = time.monotonic()
         if not dns_worker_limiter.acquire(timeout=DNS_WORKER_ACQUIRE_TIMEOUT):
             bump_runtime_metric("dns_worker_rejected_total")
             dns_worker_limiter.record_rejection("udp")
@@ -5539,11 +5830,14 @@ class DNSUDPHandler(socketserver.BaseRequestHandler):
             except Exception:
                 pass
             return
+        _is_burst = dns_worker_limiter.active_workers > dns_worker_limiter.base_limit
+        _worker_tracker.worker_start("UDP", time.monotonic() - _wt0, is_burst=_is_burst)
         try:
             response = handle_dns_request(data, self.client_address[0], "UDP")
             if response is not None:
                 sock.sendto(response, self.client_address)
         finally:
+            _worker_tracker.worker_end()
             dns_worker_limiter.release()
 
 
@@ -5581,6 +5875,7 @@ class DNSTCPHandler(socketserver.BaseRequestHandler):
             connection_type = "TLS" if is_tls else "TCP"
             protocol_tag = "dot" if is_tls else "tcp"
 
+            _wt0 = time.monotonic()
             if not dns_worker_limiter.acquire(timeout=DNS_WORKER_ACQUIRE_TIMEOUT):
                 bump_runtime_metric("dns_worker_rejected_total")
                 dns_worker_limiter.record_rejection(protocol_tag)
@@ -5592,6 +5887,8 @@ class DNSTCPHandler(socketserver.BaseRequestHandler):
                     return
                 continue
 
+            _is_burst = dns_worker_limiter.active_workers > dns_worker_limiter.base_limit
+            _worker_tracker.worker_start(connection_type, time.monotonic() - _wt0, is_burst=_is_burst)
             try:
                 response = handle_dns_request(data, self.client_address[0], connection_type)
                 if response is not None:
@@ -5599,6 +5896,7 @@ class DNSTCPHandler(socketserver.BaseRequestHandler):
             except Exception:
                 return
             finally:
+                _worker_tracker.worker_end()
                 dns_worker_limiter.release()
 
 
@@ -9175,6 +9473,75 @@ def system_monitor_page():
     </div>
   </div>
 </div>
+<div id="sm-worker-modal" class="sm-modal-backdrop">
+  <div class="sm-modal" style="width:min(92vw,1040px)">
+    <div class="sm-modal-header">
+      <div class="sm-modal-title-row">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="opacity:.6"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+        <span class="sm-modal-title">DNS Worker Details</span>
+        <span id="sm-wd-badge" class="sm-modal-badge">0 workers</span>
+      </div>
+      <div class="sm-modal-actions">
+        <button class="sm-modal-btn sm-modal-btn-ghost" onclick="smRefreshWorkerDetails()" title="Refresh"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg></button>
+        <button class="sm-modal-btn" onclick="smCloseWorkerDetails()"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+      </div>
+    </div>
+    <div style="flex:1;overflow-y:auto;padding:1rem 1.1rem">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:.75rem;margin-bottom:1rem">
+        <div style="background:rgba(15,22,38,.5);border:1px solid rgba(55,75,100,.3);border-radius:.5rem;padding:.75rem">
+          <div style="font-size:.72rem;color:var(--muted2);text-transform:uppercase;letter-spacing:.04em;margin-bottom:.4rem">Worker Utilization</div>
+          <div style="font-size:.84rem"><span class="sm-label">1 min:</span> <span class="sm-value" id="sm-wd-util1">-</span></div>
+          <div style="font-size:.84rem"><span class="sm-label">5 min:</span> <span class="sm-value" id="sm-wd-util5">-</span></div>
+          <div style="font-size:.84rem"><span class="sm-label">15 min:</span> <span class="sm-value" id="sm-wd-util15">-</span></div>
+        </div>
+        <div style="background:rgba(15,22,38,.5);border:1px solid rgba(55,75,100,.3);border-radius:.5rem;padding:.75rem">
+          <div style="font-size:.72rem;color:var(--muted2);text-transform:uppercase;letter-spacing:.04em;margin-bottom:.4rem">Peak Load</div>
+          <div style="font-size:.84rem"><span class="sm-label">Peak Workers:</span> <span class="sm-value" id="sm-wd-peak">-</span></div>
+          <div style="font-size:.84rem"><span class="sm-label">Peak Time:</span> <span class="sm-value" id="sm-wd-peaktime">-</span></div>
+        </div>
+        <div style="background:rgba(15,22,38,.5);border:1px solid rgba(55,75,100,.3);border-radius:.5rem;padding:.75rem">
+          <div style="font-size:.72rem;color:var(--muted2);text-transform:uppercase;letter-spacing:.04em;margin-bottom:.4rem">Active by Protocol</div>
+          <div id="sm-wd-proto-active" style="font-size:.84rem">-</div>
+        </div>
+        <div style="background:rgba(15,22,38,.5);border:1px solid rgba(55,75,100,.3);border-radius:.5rem;padding:.75rem">
+          <div style="font-size:.72rem;color:var(--muted2);text-transform:uppercase;letter-spacing:.04em;margin-bottom:.4rem">Requests / Second</div>
+          <div style="font-size:.84rem"><span class="sm-label">Current QPS:</span> <span class="sm-value" id="sm-wd-qps">-</span></div>
+          <div style="font-size:.84rem"><span class="sm-label">Max QPS:</span> <span class="sm-value" id="sm-wd-maxqps">-</span></div>
+        </div>
+        <div style="background:rgba(15,22,38,.5);border:1px solid rgba(55,75,100,.3);border-radius:.5rem;padding:.75rem">
+          <div style="font-size:.72rem;color:var(--muted2);text-transform:uppercase;letter-spacing:.04em;margin-bottom:.4rem">Wait Times</div>
+          <div style="font-size:.84rem"><span class="sm-label">Avg Wait:</span> <span class="sm-value" id="sm-wd-avgwait">-</span></div>
+          <div style="font-size:.84rem"><span class="sm-label">Max Wait:</span> <span class="sm-value" id="sm-wd-maxwait">-</span></div>
+        </div>
+        <div style="background:rgba(15,22,38,.5);border:1px solid rgba(55,75,100,.3);border-radius:.5rem;padding:.75rem">
+          <div style="font-size:.72rem;color:var(--muted2);text-transform:uppercase;letter-spacing:.04em;margin-bottom:.4rem">Busy Time</div>
+          <div style="font-size:.84rem"><span class="sm-label">Total Busy:</span> <span class="sm-value" id="sm-wd-busy">-</span></div>
+          <div style="font-size:.84rem"><span class="sm-label">Total Requests:</span> <span class="sm-value" id="sm-wd-total">-</span></div>
+        </div>
+      </div>
+      <div style="font-size:.72rem;color:var(--muted2);text-transform:uppercase;letter-spacing:.04em;margin-bottom:.5rem">Protocol Totals (All Time)</div>
+      <div id="sm-wd-proto-totals" style="display:flex;gap:.75rem;flex-wrap:wrap;margin-bottom:1rem">-</div>
+      <div style="font-size:.72rem;color:var(--muted2);text-transform:uppercase;letter-spacing:.04em;margin-bottom:.5rem">Activity Timeline <span id="sm-wd-hist-hint" style="font-size:.7rem;opacity:.7;text-transform:none;letter-spacing:0">(click a point to view snapshot)</span></div>
+      <div style="position:relative;background:rgba(15,22,38,.5);border:1px solid rgba(55,75,100,.3);border-radius:.5rem;padding:.5rem;margin-bottom:.5rem">
+        <canvas id="sm-wd-histogram" width="900" height="120" style="width:100%;height:120px;cursor:crosshair"></canvas>
+        <div id="sm-wd-hist-tooltip" style="display:none;position:absolute;background:rgba(10,15,25,.95);border:1px solid rgba(80,120,180,.5);border-radius:.4rem;padding:.35rem .6rem;font-size:.75rem;color:#c8d4e4;pointer-events:none;white-space:nowrap;z-index:10"></div>
+      </div>
+      <div style="display:flex;gap:1rem;font-size:.7rem;color:var(--muted2);margin-bottom:.75rem">
+        <span><span style="display:inline-block;width:12px;height:2px;background:#3b82f6;vertical-align:middle;margin-right:.3rem"></span>Active</span>
+        <span style="margin-left:.75rem"><span style="display:inline-block;width:12px;height:2px;background:#eab308;vertical-align:middle;margin-right:.3rem"></span>Peak</span>
+        <span style="margin-left:.75rem"><span style="display:inline-block;width:12px;height:2px;background:#22c55e;vertical-align:middle;margin-right:.3rem;border-top:2px dashed #22c55e"></span>Recent Peak</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.5rem">
+        <div style="font-size:.72rem;color:var(--muted2);text-transform:uppercase;letter-spacing:.04em">
+          <span id="sm-wd-list-title">Live Worker List</span>
+          <span id="sm-wd-snapshot-time" style="color:#3b82f6;font-weight:700;margin-left:.5rem"></span>
+        </div>
+        <button id="sm-wd-back-to-live" class="sm-btn" onclick="smBackToLive()" style="display:none;padding:.25rem .5rem;font-size:.75rem">Back to Live</button>
+      </div>
+      <div id="sm-wd-worker-list" style="font-size:.84rem;color:var(--muted2)">Loading...</div>
+    </div>
+  </div>
+</div>
 <div class="sm-grid">
 
   <div class="sm-card">
@@ -9183,7 +9550,7 @@ def system_monitor_page():
   </div>
 
   <div class="sm-card">
-    <div class="sm-head"><span class="sm-title">DNS Workers</span></div>
+    <div class="sm-head"><span class="sm-title">DNS Workers</span><button class="sm-btn" onclick="smOpenWorkerDetails()" title="Worker details" style="padding:.3rem .45rem;line-height:1"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg></button></div>
     <div class="sm-body" id="sm-dns-workers">Loading...</div>
   </div>
 
@@ -9462,7 +9829,329 @@ document.getElementById('sm-log-modal').addEventListener('click', function(e){
   if(e.target === this) smCloseLog();
 });
 document.addEventListener('keydown', function(e){
-  if(e.key === 'Escape' && document.getElementById('sm-log-modal').style.display === 'flex') smCloseLog();
+  if(e.key === 'Escape'){
+    if(document.getElementById('sm-log-modal').style.display === 'flex') smCloseLog();
+    if(document.getElementById('sm-worker-modal').style.display === 'flex') smCloseWorkerDetails();
+  }
+});
+
+var _wdTimer = null;
+var _wdHistory = [];
+var _wdHistPoints = [];
+var _wdViewingSnapshot = false;
+var _wdRecentPeak = 0;
+
+function drawHistogram(history, recentPeak){
+  _wdRecentPeak = recentPeak || 0;
+  var canvas = document.getElementById('sm-wd-histogram');
+  if(!canvas) return;
+  var ctx = canvas.getContext('2d');
+  var dpr = window.devicePixelRatio || 1;
+  var rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  ctx.scale(dpr, dpr);
+  var W = rect.width, H = rect.height;
+  ctx.clearRect(0, 0, W, H);
+  if(!history || !history.length){
+    ctx.fillStyle = 'rgba(100,130,180,.3)';
+    ctx.font = '12px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Waiting for data...', W/2, H/2);
+    _wdHistPoints = [];
+    return;
+  }
+  var maxVal = 1;
+  for(var i=0;i<history.length;i++){
+    if(history[i].peak > maxVal) maxVal = history[i].peak;
+    if(history[i].active > maxVal) maxVal = history[i].active;
+  }
+  if(recentPeak > maxVal) maxVal = recentPeak;
+  maxVal = Math.max(maxVal, 5);
+  var padL = 35, padR = 10, padT = 10, padB = 25;
+  var chartW = W - padL - padR;
+  var chartH = H - padT - padB;
+  ctx.strokeStyle = 'rgba(55,75,100,.3)';
+  ctx.lineWidth = 1;
+  for(var g=0; g<=4; g++){
+    var gy = padT + chartH - (g/4)*chartH;
+    ctx.beginPath();
+    ctx.moveTo(padL, gy);
+    ctx.lineTo(padL+chartW, gy);
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(100,130,180,.5)';
+    ctx.font = '10px sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText(Math.round(maxVal*g/4), padL-5, gy+3);
+  }
+  var tMin = history[0].timestamp;
+  var tMax = history[history.length-1].timestamp;
+  var tRange = tMax - tMin;
+  if(tRange < 1) tRange = 1;
+  _wdHistPoints = [];
+  ctx.beginPath();
+  ctx.strokeStyle = 'rgba(234,179,8,.6)';
+  ctx.lineWidth = 2;
+  for(var i=0;i<history.length;i++){
+    var x = padL + ((history[i].timestamp - tMin)/tRange)*chartW;
+    var y = padT + chartH - (history[i].peak/maxVal)*chartH;
+    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    var ay = padT + chartH - (history[i].active/maxVal)*chartH;
+    _wdHistPoints.push({x:x, y:y, ay:ay, ts:history[i].timestamp, peak:history[i].peak, active:history[i].active});
+  }
+  ctx.stroke();
+  ctx.lineTo(padL + chartW, padT + chartH);
+  ctx.lineTo(padL, padT + chartH);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(234,179,8,.06)';
+  ctx.fill();
+  ctx.beginPath();
+  ctx.strokeStyle = 'rgba(59,130,246,.8)';
+  ctx.lineWidth = 2;
+  for(var i=0;i<history.length;i++){
+    var x = padL + ((history[i].timestamp - tMin)/tRange)*chartW;
+    var y = padT + chartH - (history[i].active/maxVal)*chartH;
+    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }
+  ctx.stroke();
+  ctx.lineTo(padL + chartW, padT + chartH);
+  ctx.lineTo(padL, padT + chartH);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(59,130,246,.08)';
+  ctx.fill();
+  if(recentPeak > 0){
+    var rpy = padT + chartH - (recentPeak/maxVal)*chartH;
+    ctx.save();
+    ctx.setLineDash([5,4]);
+    ctx.strokeStyle = 'rgba(34,197,94,.7)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(padL, rpy);
+    ctx.lineTo(padL+chartW, rpy);
+    ctx.stroke();
+    ctx.restore();
+    ctx.beginPath();
+    ctx.arc(padL, rpy, 3, 0, Math.PI*2);
+    ctx.fillStyle = '#22c55e';
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(padL+chartW, rpy, 3, 0, Math.PI*2);
+    ctx.fillStyle = '#22c55e';
+    ctx.fill();
+    ctx.fillStyle = 'rgba(34,197,94,.85)';
+    ctx.font = '9px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText('▶ ' + recentPeak, padL+8, rpy-3);
+  }
+  for(var i=0;i<_wdHistPoints.length;i++){
+    var p = _wdHistPoints[i];
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 3, 0, Math.PI*2);
+    ctx.fillStyle = p.peak > 0 ? '#eab308' : 'rgba(100,130,180,.4)';
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(p.x, p.ay, 3, 0, Math.PI*2);
+    ctx.fillStyle = p.active > 0 ? '#3b82f6' : 'rgba(100,130,180,.4)';
+    ctx.fill();
+  }
+  ctx.fillStyle = 'rgba(100,130,180,.5)';
+  ctx.font = '10px sans-serif';
+  ctx.textAlign = 'left';
+  var d0 = new Date(tMin*1000);
+  var d1 = new Date(tMax*1000);
+  function fmt(d){ return ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)+':'+('0'+d.getSeconds()).slice(-2); }
+  ctx.fillText(fmt(d0), padL, H-5);
+  ctx.textAlign = 'right';
+  ctx.fillText(fmt(d1), padL+chartW, H-5);
+  ctx.textAlign = 'center';
+  if(tRange > 10){
+    var mid = new Date((tMin+tRange/2)*1000);
+    ctx.fillText(fmt(mid), padL+chartW/2, H-5);
+  }
+}
+
+var _wdCanvas = document.getElementById('sm-wd-histogram');
+_wdCanvas.addEventListener('mousemove', function(e){
+  if(!_wdHistPoints.length) return;
+  var rect = _wdCanvas.getBoundingClientRect();
+  var mx = e.clientX - rect.left;
+  var my = e.clientY - rect.top;
+  var closest = null, minDist = 999, closestY = 0;
+  for(var i=0;i<_wdHistPoints.length;i++){
+    var p = _wdHistPoints[i];
+    var dx = mx - p.x;
+    var dpeak = Math.sqrt(dx*dx + (my-p.y)*(my-p.y));
+    var dact  = Math.sqrt(dx*dx + (my-p.ay)*(my-p.ay));
+    var d = Math.min(dpeak, dact);
+    if(d < minDist){ minDist = d; closest = p; closestY = dpeak < dact ? p.y : p.ay; }
+  }
+  var tip = document.getElementById('sm-wd-hist-tooltip');
+  if(closest && minDist < 20){
+    var d = new Date(closest.ts*1000);
+    var ts = ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)+':'+('0'+d.getSeconds()).slice(-2);
+    tip.innerHTML =
+      '<div style="color:#c8d4e4;font-weight:600;margin-bottom:.2rem">' + ts + '</div>' +
+      '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#3b82f6;margin-right:.3rem"></span>Active: <b>' + closest.active + '</b></div>' +
+      '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#eab308;margin-right:.3rem"></span>Peak: <b>' + closest.peak + '</b></div>' +
+      (_wdRecentPeak > 0 ? '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e;margin-right:.3rem"></span>Recent Peak: <b>' + _wdRecentPeak + '</b></div>' : '') +
+      '<div style="margin-top:.2rem;font-size:.68rem;color:rgba(180,200,220,.5)">click to view snapshot</div>';
+    tip.style.display = 'block';
+    var tipW = 160;
+    tip.style.left = Math.min(closest.x + 12, rect.width - tipW) + 'px';
+    tip.style.top = Math.max(closestY - 75, 2) + 'px';
+  } else {
+    tip.style.display = 'none';
+  }
+});
+_wdCanvas.addEventListener('mouseleave', function(){
+  document.getElementById('sm-wd-hist-tooltip').style.display = 'none';
+});
+_wdCanvas.addEventListener('click', function(e){
+  if(!_wdHistPoints.length) return;
+  var rect = _wdCanvas.getBoundingClientRect();
+  var mx = e.clientX - rect.left;
+  var my = e.clientY - rect.top;
+  var closest = null, minDist = 999;
+  for(var i=0;i<_wdHistPoints.length;i++){
+    var p = _wdHistPoints[i];
+    var dx = mx - p.x;
+    var dpeak = Math.sqrt(dx*dx + (my-p.y)*(my-p.y));
+    var dact  = Math.sqrt(dx*dx + (my-p.ay)*(my-p.ay));
+    var d = Math.min(dpeak, dact);
+    if(d < minDist){ minDist = d; closest = p; }
+  }
+  if(closest && minDist < 25){
+    loadSnapshot(closest.ts);
+  }
+});
+
+function loadSnapshot(ts){
+  _wdViewingSnapshot = true;
+  document.getElementById('sm-wd-back-to-live').style.display = 'inline-block';
+  fetch('/api/system-monitor/worker-snapshot?t=' + ts, {credentials: 'same-origin'})
+    .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+    .then(function(snap){
+      var d = new Date(snap.timestamp*1000);
+      var ts = ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)+':'+('0'+d.getSeconds()).slice(-2);
+      document.getElementById('sm-wd-list-title').textContent = 'Snapshot at ' + ts;
+      document.getElementById('sm-wd-snapshot-time').textContent = '(peak ' + snap.peak + ')';
+      renderWorkerList(snap.workers || []);
+    })
+    .catch(function(e){
+      document.getElementById('sm-wd-worker-list').innerHTML = '<div style="color:#f87171">Snapshot not available: ' + e.message + '</div>';
+    });
+}
+
+window.smBackToLive = function(){
+  _wdViewingSnapshot = false;
+  document.getElementById('sm-wd-back-to-live').style.display = 'none';
+  document.getElementById('sm-wd-list-title').textContent = 'Live Worker List';
+  document.getElementById('sm-wd-snapshot-time').textContent = '';
+  loadWorkerDetails();
+};
+
+function renderWorkerList(wl, recentPeak){
+  if(!wl.length){
+    document.getElementById('sm-wd-worker-list').innerHTML = '<div style="color:var(--muted2)">No workers active.</div>';
+    return;
+  }
+  var numbered = [];
+  var unnumbered = [];
+  for(var i=0;i<wl.length;i++){
+    if(wl[i].number != null) numbered.push(wl[i]);
+    else unnumbered.push(wl[i]);
+  }
+  numbered.sort(function(a,b){ return a.number - b.number; });
+  var sorted = numbered.concat(unnumbered);
+  var statusColors = {Processing:'#22c55e',Completed:'#3b82f6',Idle:'#64748b',Waiting:'#eab308'};
+  var h = '<table class="sm-req-table"><thead><tr><th>#</th><th>Status</th><th>Protocol</th><th>Busy</th><th>Wait</th></tr></thead><tbody>';
+  for(var i=0;i<sorted.length;i++){
+    var w = sorted[i];
+    var atPeak = recentPeak > 0 && w.number != null && w.number <= recentPeak && w.status === 'Idle';
+    var sc = atPeak ? '#f59e0b' : (statusColors[w.status] || '#64748b');
+    var statusLabel = atPeak ? 'Peak' : w.status;
+    var numStr = w.number != null ? '#' + w.number : '-';
+    var burstMark = w.is_burst ? ' <span style="color:#eab308;font-size:.7rem">burst</span>' : '';
+    var busyStr = w.busy_seconds > 0 ? w.busy_seconds.toFixed(2) + ' s' : '-';
+    var waitStr = w.wait_time_ms > 0 ? w.wait_time_ms + ' ms' : '-';
+    var rowBg = atPeak ? 'opacity:.75;' : (w.status === 'Idle' ? 'opacity:.45;' : '');
+    h += '<tr style="' + rowBg + '"><td style="font-weight:700;font-size:.8rem">' + numStr + burstMark + '</td><td><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + sc + ';margin-right:.35rem"></span>' + statusLabel + '</td><td>' + w.protocol + '</td><td>' + busyStr + '</td><td>' + waitStr + '</td></tr>';
+  }
+  h += '</tbody></table>';
+  document.getElementById('sm-wd-worker-list').innerHTML = h;
+}
+
+function loadWorkerDetails(){
+  fetch('/api/system-monitor/worker-details', {credentials: 'same-origin'})
+    .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+    .then(function(d){
+      var badge = document.getElementById('sm-wd-badge');
+      var recentPeak = d.recent_peak || 0;
+      var barVal = Math.max(d.active, recentPeak);
+      var pct = d.total_workers ? Math.round(barVal / d.total_workers * 100) : 0;
+      badge.textContent = barVal + ' / ' + d.total_workers + ' (' + pct + '%)';
+      document.getElementById('sm-wd-util1').textContent = d.avg_utilization_1m + '%';
+      document.getElementById('sm-wd-util5').textContent = d.avg_utilization_5m + '%';
+      document.getElementById('sm-wd-util15').textContent = d.avg_utilization_15m + '%';
+      document.getElementById('sm-wd-peak').textContent = d.peak_active;
+      document.getElementById('sm-wd-peaktime').textContent = d.peak_time || 'N/A';
+      document.getElementById('sm-wd-qps').textContent = d.current_qps;
+      document.getElementById('sm-wd-maxqps').textContent = d.max_qps;
+      document.getElementById('sm-wd-avgwait').textContent = d.avg_wait_ms + ' ms';
+      document.getElementById('sm-wd-maxwait').textContent = d.max_wait_ms + ' ms';
+      document.getElementById('sm-wd-busy').textContent = d.total_busy_time + ' s';
+      document.getElementById('sm-wd-total').textContent = d.total_requests;
+      var pa = d.protocol_active || {};
+      var paHtml = '';
+      var protos = ['UDP','TCP','DoT','DoH','DoQ'];
+      for(var i=0;i<protos.length;i++){
+        var p = protos[i];
+        if(pa[p] > 0) paHtml += '<div style="font-size:.84rem"><span class="sm-label">' + p + ':</span> <span class="sm-value">' + pa[p] + '</span></div>';
+      }
+      if(!paHtml) paHtml = '<div style="font-size:.84rem;color:var(--muted2)">None active</div>';
+      document.getElementById('sm-wd-proto-active').innerHTML = paHtml;
+      var pt = d.protocol_total || {};
+      var ptHtml = '';
+      var colors = {UDP:'#22c55e',TCP:'#3b82f6',DoT:'#a855f7',DoH:'#eab308',DoQ:'#ef4444'};
+      for(var i=0;i<protos.length;i++){
+        var p = protos[i];
+        var v = pt[p] || 0;
+        ptHtml += '<div style="background:rgba(15,22,38,.5);border:1px solid rgba(55,75,100,.3);border-radius:.4rem;padding:.4rem .7rem;display:flex;align-items:center;gap:.4rem"><span style="width:8px;height:8px;border-radius:50%;background:' + (colors[p]||'#64748b') + '"></span><span style="font-size:.8rem">' + p + '</span><span style="font-weight:700;font-size:.84rem">' + v + '</span></div>';
+      }
+      document.getElementById('sm-wd-proto-totals').innerHTML = ptHtml;
+      _wdHistory = d.history || [];
+      drawHistogram(_wdHistory, recentPeak);
+      if(!_wdViewingSnapshot){
+        renderWorkerList(d.workers || [], recentPeak);
+      }
+    })
+    .catch(function(e){ document.getElementById('sm-wd-worker-list').innerHTML = '<div style="color:#f87171">Error: ' + e.message + '</div>'; });
+}
+
+window.smOpenWorkerDetails = function(){
+  document.getElementById('sm-worker-modal').style.display = 'flex';
+  _wdViewingSnapshot = false;
+  document.getElementById('sm-wd-back-to-live').style.display = 'none';
+  document.getElementById('sm-wd-list-title').textContent = 'Live Worker List';
+  document.getElementById('sm-wd-snapshot-time').textContent = '';
+  loadWorkerDetails();
+  if(_wdTimer) clearInterval(_wdTimer);
+  _wdTimer = setInterval(loadWorkerDetails, 2000);
+};
+
+window.smCloseWorkerDetails = function(){
+  document.getElementById('sm-worker-modal').style.display = 'none';
+  if(_wdTimer){ clearInterval(_wdTimer); _wdTimer = null; }
+  _wdViewingSnapshot = false;
+  document.getElementById('sm-wd-back-to-live').style.display = 'none';
+  document.getElementById('sm-wd-list-title').textContent = 'Live Worker List';
+  document.getElementById('sm-wd-snapshot-time').textContent = '';
+};
+
+window.smRefreshWorkerDetails = function(){ loadWorkerDetails(); };
+
+document.getElementById('sm-worker-modal').addEventListener('click', function(e){
+  if(e.target === this) smCloseWorkerDetails();
 });
 })();
 </script>
@@ -12802,6 +13491,15 @@ class WebHandler(BaseHTTPRequestHandler):
             result = _read_monitor_log_tail()
             result["ok"] = True
             self.send_json(result)
+        elif path == "/api/system-monitor/worker-details":
+            self.send_json(_worker_tracker.get_snapshot())
+        elif path == "/api/system-monitor/worker-snapshot":
+            ts = float(params.get("t", [0])[0]) if "t" in params else 0
+            snap = _worker_tracker.get_snapshot_at(ts)
+            if snap:
+                self.send_json(snap)
+            else:
+                self.send_json({"error": "snapshot not found"}, 404)
         else:
             self.send_json({"error": "not found"}, 404)
 
@@ -13208,6 +13906,7 @@ class DoQRuntimeServer:
                         peer = self._quic._network_paths[0].addr[0] if self._quic._network_paths else ""
                         update_doq_metric("queries")
                         update_doq_metric("last_peer", peer)
+                        _wt0 = time.monotonic()
                         if not dns_worker_limiter.acquire(timeout=DNS_WORKER_ACQUIRE_TIMEOUT):
                             bump_runtime_metric("dns_worker_rejected_total")
                             dns_worker_limiter.record_rejection("doq")
@@ -13215,6 +13914,8 @@ class DoQRuntimeServer:
                             err_resp = build_error_response(request, 2)
                             payload = struct.pack("!H", len(err_resp)) + err_resp
                         else:
+                            _is_burst = dns_worker_limiter.active_workers > dns_worker_limiter.base_limit
+                            _worker_tracker.worker_start("QUIC", time.monotonic() - _wt0, is_burst=_is_burst)
                             try:
                                 response = handle_dns_request(request, peer, "QUIC")
                                 payload = b"" if response is None else struct.pack("!H", len(response)) + response
@@ -13227,6 +13928,7 @@ class DoQRuntimeServer:
                                 except Exception:
                                     pass
                             finally:
+                                _worker_tracker.worker_end()
                                 dns_worker_limiter.release()
                     except Exception as exc:
                         update_doq_metric("errors")
