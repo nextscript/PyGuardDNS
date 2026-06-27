@@ -282,6 +282,7 @@ class WorkerDetailTracker:
         self._snapshot_history = []
         self._last_snapshot_time = 0.0
         self._worker_numbers = {}
+        self._slot_last_stats = {}
 
     def worker_start(self, protocol, wait_time=0.0, is_burst=False):
         tid = threading.get_ident()
@@ -372,12 +373,13 @@ class WorkerDetailTracker:
                         "is_burst": i > snap.base_limit,
                     })
                 else:
+                    last = self._slot_last_stats.get(i, {})
                     workers_at_time.append({
                         "number": i,
                         "status": "Idle",
-                        "protocol": "-",
-                        "busy_seconds": 0,
-                        "wait_time_ms": 0,
+                        "protocol": last.get("protocol", "-"),
+                        "busy_seconds": last.get("busy_seconds", 0),
+                        "wait_time_ms": last.get("wait_time_ms", 0),
                         "is_burst": i > snap.base_limit,
                     })
         for i in range(snap.waiters):
@@ -407,14 +409,23 @@ class WorkerDetailTracker:
                 duration = now - w["start_time"]
                 self._total_busy_time += duration
                 number = self._worker_numbers.pop(tid, None)
+                busy_s = round(duration, 3)
+                wait_ms = round(w["wait_time"] * 1000, 2)
                 self._recent_workers.append({
                     "thread_id": w["thread_id"],
                     "number": number,
                     "protocol": w["protocol"],
-                    "busy_seconds": round(duration, 3),
-                    "wait_time_ms": round(w["wait_time"] * 1000, 2),
+                    "busy_seconds": busy_s,
+                    "wait_time_ms": wait_ms,
                     "ended_at": time.time(),
                 })
+                if number is not None:
+                    prev = self._slot_last_stats.get(number, {})
+                    self._slot_last_stats[number] = {
+                        "protocol": w["protocol"],
+                        "busy_seconds": busy_s,
+                        "wait_time_ms": max(wait_ms, prev.get("wait_time_ms", 0)),
+                    }
                 if len(self._recent_workers) > 50:
                     self._recent_workers = self._recent_workers[-50:]
 
@@ -467,12 +478,13 @@ class WorkerDetailTracker:
                             "is_burst": i > snap.base_limit,
                         })
                     else:
+                        last = self._slot_last_stats.get(i, {})
                         workers_list.append({
                             "number": i,
                             "status": "Idle",
-                            "protocol": "-",
-                            "busy_seconds": 0,
-                            "wait_time_ms": 0,
+                            "protocol": last.get("protocol", "-"),
+                            "busy_seconds": last.get("busy_seconds", 0),
+                            "wait_time_ms": last.get("wait_time_ms", 0),
                             "is_burst": i > snap.base_limit,
                         })
             for i in range(waiting_count):
@@ -10072,8 +10084,8 @@ function renderWorkerList(wl, recentPeak){
     var statusLabel = atPeak ? 'Peak' : w.status;
     var numStr = w.number != null ? '#' + w.number : '-';
     var burstMark = w.is_burst ? ' <span style="color:#eab308;font-size:.7rem">burst</span>' : '';
-    var busyStr = w.busy_seconds > 0 ? w.busy_seconds.toFixed(2) + ' s' : '-';
-    var waitStr = w.wait_time_ms > 0 ? w.wait_time_ms + ' ms' : '-';
+    var busyStr = w.busy_seconds > 0 ? w.busy_seconds.toFixed(2) + ' s' : (w.protocol !== '-' ? '0 s' : '-');
+    var waitStr = w.wait_time_ms > 0 ? w.wait_time_ms + ' ms' : (w.protocol !== '-' ? '0 ms' : '-');
     var rowBg = atPeak ? 'opacity:.75;' : (w.status === 'Idle' ? 'opacity:.45;' : '');
     h += '<tr style="' + rowBg + '"><td style="font-weight:700;font-size:.8rem">' + numStr + burstMark + '</td><td><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + sc + ';margin-right:.35rem"></span>' + statusLabel + '</td><td>' + w.protocol + '</td><td>' + busyStr + '</td><td>' + waitStr + '</td></tr>';
   }
