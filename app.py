@@ -10035,7 +10035,7 @@ function loadSnapshot(ts){
       var ts = ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)+':'+('0'+d.getSeconds()).slice(-2);
       document.getElementById('sm-wd-list-title').textContent = 'Snapshot at ' + ts;
       document.getElementById('sm-wd-snapshot-time').textContent = '(peak ' + snap.peak + ')';
-      renderWorkerList(snap.workers || []);
+      renderWorkerList(snap.workers || [], snap.peak);
     })
     .catch(function(e){
       document.getElementById('sm-wd-worker-list').innerHTML = '<div style="color:#f87171">Snapshot not available: ' + e.message + '</div>';
