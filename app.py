@@ -36,6 +36,7 @@ import urllib.request
 import bcrypt
 
 import collections
+from collections import deque
 
 from dns_engine import FilterEngine, FilterResult
 from blocklist_manager import BlocklistManager, fetch_url_text as fetch_blocklist_url_text, parse_filter_list, set_dns_resolver as _set_blocklist_dns_resolver
@@ -283,11 +284,28 @@ class WorkerDetailTracker:
         self._last_snapshot_time = 0.0
         self._worker_numbers = {}
         self._slot_last_stats = {}
+        self._interval_peak_active = 0
+        self._completed_requests = 0
+        self._last_completed_snapshot = 0
+        self._snapshot_interval_seconds = 1.0
+        self._worker_timeline = deque(maxlen=900)
+        self._sampler_thread = None
+        self._sampler_shutdown_event = threading.Event()
+        self._active_worker_seconds = 0.0
+        self._last_active_change_time = time.monotonic()
+        self._interval_started_at = self._last_active_change_time
+
+    def _update_active_area_locked(self, now):
+        elapsed = max(0.0, now - self._last_active_change_time)
+        active = len(self._workers)
+        self._active_worker_seconds += (active * elapsed)
+        self._last_active_change_time = now
 
     def worker_start(self, protocol, wait_time=0.0, is_burst=False):
         tid = threading.get_ident()
         now = time.monotonic()
         with self._lock:
+            self._update_active_area_locked(now)
             if tid not in self._worker_numbers:
                 used = set(self._worker_numbers.values())
                 n = 1
@@ -316,6 +334,8 @@ class WorkerDetailTracker:
                     {"number": w["number"], "protocol": w["protocol"]}
                     for w in self._workers.values()
                 ]
+            if active > self._interval_peak_active:
+                self._interval_peak_active = active
             proto_label = {"UDP": "UDP", "TCP": "TCP", "TLS": "DoT", "HTTPS": "DoH", "QUIC": "DoQ"}.get(protocol, protocol)
             if proto_label in self._protocol_counts:
                 self._protocol_counts[proto_label] += 1
@@ -331,83 +351,130 @@ class WorkerDetailTracker:
             self._utilization_samples.append((now_ts, util_pct))
             max_age = now_ts - 960
             self._utilization_samples = [(t, v) for t, v in self._utilization_samples if t > max_age]
-            self._maybe_record_snapshot()
 
-    def _maybe_record_snapshot(self):
-        now = time.time()
-        if now - self._last_snapshot_time < 2.0:
-            return
-        self._last_snapshot_time = now
-        now_mono = time.monotonic()
-        active_count = len(self._workers)
-        workers_at_time = []
+    def _record_worker_snapshot(self):
+        monotonic_now = time.monotonic()
+        wall_clock_now = time.time()
         snap = dns_worker_limiter.snapshot()
-        used_numbers = set()
-        for w in self._workers.values():
-            workers_at_time.append({
-                "number": w["number"],
-                "status": "Processing",
-                "protocol": w["protocol"],
-                "busy_seconds": round(now_mono - w["start_time"], 3),
-                "wait_time_ms": round(w["wait_time"] * 1000, 2),
-                "is_burst": w.get("is_burst", False),
+        with self._lock:
+            self._update_active_area_locked(monotonic_now)
+            interval_duration = max(0.001, monotonic_now - self._interval_started_at)
+            average_active = self._active_worker_seconds / interval_duration
+            active_count = len(self._workers)
+            waiting_count = snap.waiters
+            capacity = snap.current_limit
+            interval_peak = self._interval_peak_active
+            completed_delta = self._completed_requests - self._last_completed_snapshot
+            self._worker_timeline.append({
+                "timestamp": wall_clock_now,
+                "active": active_count,
+                "average_active": round(average_active, 3),
+                "waiting": waiting_count,
+                "capacity": capacity,
+                "interval_peak": interval_peak,
+                "completed_delta": completed_delta,
             })
-            used_numbers.add(w["number"])
-        recent_cutoff = now - 30
-        recent_by_number = {}
-        for rw in self._recent_workers:
-            if rw["ended_at"] > recent_cutoff and rw["number"] is not None and rw["number"] not in used_numbers:
-                if rw["number"] not in recent_by_number or rw["ended_at"] > recent_by_number[rw["number"]]["ended_at"]:
-                    recent_by_number[rw["number"]] = rw
-        total_slots = max(self._peak_active, snap.current_limit)
-        for i in range(1, total_slots + 1):
-            if i not in used_numbers:
-                if i in recent_by_number:
-                    rw = recent_by_number[i]
-                    workers_at_time.append({
-                        "number": i,
-                        "status": "Completed",
-                        "protocol": rw["protocol"],
-                        "busy_seconds": rw["busy_seconds"],
-                        "wait_time_ms": rw["wait_time_ms"],
-                        "is_burst": i > snap.base_limit,
-                    })
-                else:
-                    last = self._slot_last_stats.get(i, {})
-                    workers_at_time.append({
-                        "number": i,
-                        "status": "Idle",
-                        "protocol": last.get("protocol", "-"),
-                        "busy_seconds": last.get("busy_seconds", 0),
-                        "wait_time_ms": last.get("wait_time_ms", 0),
-                        "is_burst": i > snap.base_limit,
-                    })
-        for i in range(snap.waiters):
-            workers_at_time.append({
-                "number": None,
-                "status": "Waiting",
-                "protocol": "-",
-                "busy_seconds": 0,
-                "wait_time_ms": 0,
-                "is_burst": False,
+            self._active_worker_seconds = 0.0
+            self._interval_started_at = monotonic_now
+            self._last_active_change_time = monotonic_now
+            self._interval_peak_active = active_count
+            self._last_completed_snapshot = self._completed_requests
+            workers_at_time = []
+            used_numbers = set()
+            for w in self._workers.values():
+                workers_at_time.append({
+                    "number": w["number"],
+                    "status": "Processing",
+                    "protocol": w["protocol"],
+                    "busy_seconds": round(monotonic_now - w["start_time"], 3),
+                    "wait_time_ms": round(w["wait_time"] * 1000, 2),
+                    "is_burst": w.get("is_burst", False),
+                })
+                used_numbers.add(w["number"])
+            recent_cutoff = wall_clock_now - 30
+            recent_by_number = {}
+            for rw in self._recent_workers:
+                if rw["ended_at"] > recent_cutoff and rw["number"] is not None and rw["number"] not in used_numbers:
+                    if rw["number"] not in recent_by_number or rw["ended_at"] > recent_by_number[rw["number"]]["ended_at"]:
+                        recent_by_number[rw["number"]] = rw
+            total_slots = max(self._peak_active, snap.current_limit)
+            for i in range(1, total_slots + 1):
+                if i not in used_numbers:
+                    if i in recent_by_number:
+                        rw = recent_by_number[i]
+                        workers_at_time.append({
+                            "number": i,
+                            "status": "Completed",
+                            "protocol": rw["protocol"],
+                            "busy_seconds": rw["busy_seconds"],
+                            "wait_time_ms": rw["wait_time_ms"],
+                            "is_burst": i > snap.base_limit,
+                        })
+                    else:
+                        last = self._slot_last_stats.get(i, {})
+                        workers_at_time.append({
+                            "number": i,
+                            "status": "Idle",
+                            "protocol": last.get("protocol", "-"),
+                            "busy_seconds": last.get("busy_seconds", 0),
+                            "wait_time_ms": last.get("wait_time_ms", 0),
+                            "is_burst": i > snap.base_limit,
+                        })
+            for i in range(snap.waiters):
+                workers_at_time.append({
+                    "number": None,
+                    "status": "Waiting",
+                    "protocol": "-",
+                    "busy_seconds": 0,
+                    "wait_time_ms": 0,
+                    "is_burst": False,
+                })
+            self._snapshot_history.append({
+                "timestamp": wall_clock_now,
+                "active": active_count,
+                "peak": self._peak_active,
+                "workers": workers_at_time,
             })
-        self._snapshot_history.append({
-            "timestamp": now,
-            "active": active_count,
-            "peak": self._peak_active,
-            "workers": workers_at_time,
-        })
-        if len(self._snapshot_history) > 150:
-            self._snapshot_history = self._snapshot_history[-150:]
+            if len(self._snapshot_history) > 150:
+                self._snapshot_history = self._snapshot_history[-150:]
+
+    def _worker_metrics_sampler(self):
+        while not self._sampler_shutdown_event.is_set():
+            self._sampler_shutdown_event.wait(self._snapshot_interval_seconds)
+            if self._sampler_shutdown_event.is_set():
+                break
+            try:
+                self._record_worker_snapshot()
+            except Exception:
+                pass
+
+    def start_sampler(self):
+        if self._sampler_thread is not None and self._sampler_thread.is_alive():
+            return
+        self._sampler_shutdown_event.clear()
+        self._sampler_thread = threading.Thread(
+            target=self._worker_metrics_sampler,
+            name="dns-worker-metrics-sampler",
+            daemon=True,
+        )
+        self._sampler_thread.start()
+
+    def stop_sampler(self):
+        self._sampler_shutdown_event.set()
+        if self._sampler_thread is not None:
+            self._sampler_thread.join(timeout=3.0)
+            self._sampler_thread = None
 
     def worker_end(self):
         tid = threading.get_ident()
         now = time.monotonic()
         with self._lock:
+            self._update_active_area_locked(now)
             w = self._workers.pop(tid, None)
             if w:
                 duration = now - w["start_time"]
                 self._total_busy_time += duration
+                self._completed_requests += 1
                 number = self._worker_numbers.pop(tid, None)
                 busy_s = round(duration, 3)
                 wait_ms = round(w["wait_time"] * 1000, 2)
@@ -500,12 +567,18 @@ class WorkerDetailTracker:
             cutoff_1m = now_wall - 60
             cutoff_5m = now_wall - 300
             cutoff_15m = now_wall - 900
-            samples_1m = [v for t, v in self._utilization_samples if t > cutoff_1m]
-            samples_5m = [v for t, v in self._utilization_samples if t > cutoff_5m]
-            samples_15m = [v for t, v in self._utilization_samples if t > cutoff_15m]
-            avg_util_1m = round(sum(samples_1m) / len(samples_1m), 1) if samples_1m else 0
-            avg_util_5m = round(sum(samples_5m) / len(samples_5m), 1) if samples_5m else 0
-            avg_util_15m = round(sum(samples_15m) / len(samples_15m), 1) if samples_15m else 0
+            timeline_list = list(self._worker_timeline)
+            samples_1m = [s for s in timeline_list if s["timestamp"] > cutoff_1m]
+            samples_5m = [s for s in timeline_list if s["timestamp"] > cutoff_5m]
+            samples_15m = [s for s in timeline_list if s["timestamp"] > cutoff_15m]
+            def calc_util(samples):
+                if not samples:
+                    return 0.0
+                total = sum(s.get("average_active", 0) / max(1, s.get("capacity", 1)) for s in samples)
+                return round((total / len(samples)) * 100.0, 1)
+            avg_util_1m = calc_util(samples_1m)
+            avg_util_5m = calc_util(samples_5m)
+            avg_util_15m = calc_util(samples_15m)
             ts_1s = now_wall - 1.0
             current_qps = len([t for t in self._qps_timestamps if t > ts_1s])
             peak_time_str = ""
@@ -539,6 +612,18 @@ class WorkerDetailTracker:
                 "current_qps": current_qps,
                 "max_qps": int(self._max_qps),
                 "total_requests": self._total_requests,
+                "current": {
+                    "active": snap.active_workers,
+                    "capacity": snap.current_limit,
+                    "utilization_percent": round((snap.active_workers / max(1, snap.current_limit)) * 100, 1),
+                    "waiting": waiting_count,
+                },
+                "peak_load": {
+                    "workers": self._peak_active,
+                    "timestamp": peak_time_str,
+                },
+                "timeline": list(self._worker_timeline),
+                "timeline_schema_version": 2,
                 "history": [{"timestamp": h["timestamp"], "active": h["active"], "peak": h.get("peak", 0)} for h in self._snapshot_history],
             }
 
@@ -9539,9 +9624,10 @@ def system_monitor_page():
         <div id="sm-wd-hist-tooltip" style="display:none;position:absolute;background:rgba(10,15,25,.95);border:1px solid rgba(80,120,180,.5);border-radius:.4rem;padding:.35rem .6rem;font-size:.75rem;color:#c8d4e4;pointer-events:none;white-space:nowrap;z-index:10"></div>
       </div>
       <div style="display:flex;gap:1rem;font-size:.7rem;color:var(--muted2);margin-bottom:.75rem">
-        <span><span style="display:inline-block;width:12px;height:2px;background:#3b82f6;vertical-align:middle;margin-right:.3rem"></span>Active</span>
-        <span style="margin-left:.75rem"><span style="display:inline-block;width:12px;height:2px;background:#eab308;vertical-align:middle;margin-right:.3rem"></span>Peak</span>
-        <span style="margin-left:.75rem"><span style="display:inline-block;width:12px;height:2px;background:#22c55e;vertical-align:middle;margin-right:.3rem;border-top:2px dashed #22c55e"></span>Recent Peak</span>
+        <span><span style="display:inline-block;width:12px;height:2px;background:#3b82f6;vertical-align:middle;margin-right:.3rem"></span>Average Active</span>
+        <span style="margin-left:.75rem"><span style="display:inline-block;width:12px;height:2px;background:#eab308;vertical-align:middle;margin-right:.3rem"></span>Interval Peak</span>
+        <span style="margin-left:.75rem"><span style="display:inline-block;width:12px;height:2px;background:#a855f7;vertical-align:middle;margin-right:.3rem;border-top:2px dashed #a855f7"></span>Capacity</span>
+        <span style="margin-left:.75rem"><span style="display:inline-block;width:12px;height:2px;background:#ef4444;vertical-align:middle;margin-right:.3rem"></span>Waiting</span>
       </div>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.5rem">
         <div style="font-size:.72rem;color:var(--muted2);text-transform:uppercase;letter-spacing:.04em">
@@ -9848,13 +9934,11 @@ document.addEventListener('keydown', function(e){
 });
 
 var _wdTimer = null;
-var _wdHistory = [];
+var _wdTimeline = [];
 var _wdHistPoints = [];
 var _wdViewingSnapshot = false;
-var _wdRecentPeak = 0;
 
-function drawHistogram(history, recentPeak){
-  _wdRecentPeak = recentPeak || 0;
+function drawHistogram(timeline){
   var canvas = document.getElementById('sm-wd-histogram');
   if(!canvas) return;
   var ctx = canvas.getContext('2d');
@@ -9865,7 +9949,7 @@ function drawHistogram(history, recentPeak){
   ctx.scale(dpr, dpr);
   var W = rect.width, H = rect.height;
   ctx.clearRect(0, 0, W, H);
-  if(!history || !history.length){
+  if(!timeline || !timeline.length){
     ctx.fillStyle = 'rgba(100,130,180,.3)';
     ctx.font = '12px sans-serif';
     ctx.textAlign = 'center';
@@ -9874,12 +9958,19 @@ function drawHistogram(history, recentPeak){
     return;
   }
   var maxVal = 1;
-  for(var i=0;i<history.length;i++){
-    if(history[i].peak > maxVal) maxVal = history[i].peak;
-    if(history[i].active > maxVal) maxVal = history[i].active;
+  for(var i=0;i<timeline.length;i++){
+    var p = timeline[i];
+    var avg = Number.isFinite(p.average_active) ? p.average_active : Number(p.active || 0);
+    var ip = p.interval_peak || 0;
+    var c = p.capacity || 0;
+    var w = p.waiting || 0;
+    if(avg > maxVal) maxVal = avg;
+    if(ip > maxVal) maxVal = ip;
+    if(c > maxVal) maxVal = c;
+    if(w > maxVal) maxVal = w;
   }
-  if(recentPeak > maxVal) maxVal = recentPeak;
-  maxVal = Math.max(maxVal, 5);
+  var suggestedMax = Math.ceil(maxVal * 1.1);
+  if(suggestedMax < 5) suggestedMax = 5;
   var padL = 35, padR = 10, padT = 10, padB = 25;
   var chartW = W - padL - padR;
   var chartH = H - padT - padB;
@@ -9894,22 +9985,46 @@ function drawHistogram(history, recentPeak){
     ctx.fillStyle = 'rgba(100,130,180,.5)';
     ctx.font = '10px sans-serif';
     ctx.textAlign = 'right';
-    ctx.fillText(Math.round(maxVal*g/4), padL-5, gy+3);
+    ctx.fillText(Math.round(suggestedMax*g/4), padL-5, gy+3);
   }
-  var tMin = history[0].timestamp;
-  var tMax = history[history.length-1].timestamp;
+  var tMin = timeline[0].timestamp;
+  var tMax = timeline[timeline.length-1].timestamp;
   var tRange = tMax - tMin;
   if(tRange < 1) tRange = 1;
   _wdHistPoints = [];
+  ctx.save();
+  ctx.setLineDash([5,4]);
+  ctx.strokeStyle = 'rgba(168,85,247,.6)';
+  ctx.lineWidth = 1.5;
   ctx.beginPath();
-  ctx.strokeStyle = 'rgba(234,179,8,.6)';
-  ctx.lineWidth = 2;
-  for(var i=0;i<history.length;i++){
-    var x = padL + ((history[i].timestamp - tMin)/tRange)*chartW;
-    var y = padT + chartH - (history[i].peak/maxVal)*chartH;
+  for(var i=0;i<timeline.length;i++){
+    var x = padL + ((timeline[i].timestamp - tMin)/tRange)*chartW;
+    var y = padT + chartH - ((timeline[i].capacity||0)/suggestedMax)*chartH;
     if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
-    var ay = padT + chartH - (history[i].active/maxVal)*chartH;
-    _wdHistPoints.push({x:x, y:y, ay:ay, ts:history[i].timestamp, peak:history[i].peak, active:history[i].active});
+  }
+  ctx.stroke();
+  ctx.restore();
+  ctx.beginPath();
+  ctx.strokeStyle = 'rgba(239,68,68,.7)';
+  ctx.lineWidth = 1.5;
+  for(var i=0;i<timeline.length;i++){
+    var x = padL + ((timeline[i].timestamp - tMin)/tRange)*chartW;
+    var y = padT + chartH - ((timeline[i].waiting||0)/suggestedMax)*chartH;
+    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }
+  ctx.stroke();
+  ctx.lineTo(padL + chartW, padT + chartH);
+  ctx.lineTo(padL, padT + chartH);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(239,68,68,.06)';
+  ctx.fill();
+  ctx.beginPath();
+  ctx.strokeStyle = 'rgba(234,179,8,.7)';
+  ctx.lineWidth = 2;
+  for(var i=0;i<timeline.length;i++){
+    var x = padL + ((timeline[i].timestamp - tMin)/tRange)*chartW;
+    var y = padT + chartH - ((timeline[i].interval_peak||0)/suggestedMax)*chartH;
+    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
   }
   ctx.stroke();
   ctx.lineTo(padL + chartW, padT + chartH);
@@ -9920,9 +10035,10 @@ function drawHistogram(history, recentPeak){
   ctx.beginPath();
   ctx.strokeStyle = 'rgba(59,130,246,.8)';
   ctx.lineWidth = 2;
-  for(var i=0;i<history.length;i++){
-    var x = padL + ((history[i].timestamp - tMin)/tRange)*chartW;
-    var y = padT + chartH - (history[i].active/maxVal)*chartH;
+  for(var i=0;i<timeline.length;i++){
+    var avg = Number.isFinite(timeline[i].average_active) ? timeline[i].average_active : Number(timeline[i].active || 0);
+    var x = padL + ((timeline[i].timestamp - tMin)/tRange)*chartW;
+    var y = padT + chartH - (avg/suggestedMax)*chartH;
     if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
   }
   ctx.stroke();
@@ -9931,39 +10047,22 @@ function drawHistogram(history, recentPeak){
   ctx.closePath();
   ctx.fillStyle = 'rgba(59,130,246,.08)';
   ctx.fill();
-  if(recentPeak > 0){
-    var rpy = padT + chartH - (recentPeak/maxVal)*chartH;
-    ctx.save();
-    ctx.setLineDash([5,4]);
-    ctx.strokeStyle = 'rgba(34,197,94,.7)';
-    ctx.lineWidth = 1.5;
+  for(var i=0;i<timeline.length;i++){
+    var p = timeline[i];
+    var avg = Number.isFinite(p.average_active) ? p.average_active : Number(p.active || 0);
+    var x = padL + ((p.timestamp - tMin)/tRange)*chartW;
+    var yAvg = padT + chartH - (avg/suggestedMax)*chartH;
+    var yPeak = padT + chartH - ((p.interval_peak||0)/suggestedMax)*chartH;
+    var yCap = padT + chartH - ((p.capacity||0)/suggestedMax)*chartH;
+    var yWait = padT + chartH - ((p.waiting||0)/suggestedMax)*chartH;
+    _wdHistPoints.push({x:x, yAvg:yAvg, yPeak:yPeak, yCap:yCap, yWait:yWait, ts:p.timestamp, active:p.active||0, average_active:avg, interval_peak:p.interval_peak||0, capacity:p.capacity||0, waiting:p.waiting||0, completed_delta:p.completed_delta||0});
     ctx.beginPath();
-    ctx.moveTo(padL, rpy);
-    ctx.lineTo(padL+chartW, rpy);
-    ctx.stroke();
-    ctx.restore();
-    ctx.beginPath();
-    ctx.arc(padL, rpy, 3, 0, Math.PI*2);
-    ctx.fillStyle = '#22c55e';
+    ctx.arc(x, yAvg, 2.5, 0, Math.PI*2);
+    ctx.fillStyle = avg > 0 ? '#3b82f6' : 'rgba(100,130,180,.4)';
     ctx.fill();
     ctx.beginPath();
-    ctx.arc(padL+chartW, rpy, 3, 0, Math.PI*2);
-    ctx.fillStyle = '#22c55e';
-    ctx.fill();
-    ctx.fillStyle = 'rgba(34,197,94,.85)';
-    ctx.font = '9px sans-serif';
-    ctx.textAlign = 'left';
-    ctx.fillText('▶ ' + recentPeak, padL+8, rpy-3);
-  }
-  for(var i=0;i<_wdHistPoints.length;i++){
-    var p = _wdHistPoints[i];
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, 3, 0, Math.PI*2);
-    ctx.fillStyle = p.peak > 0 ? '#eab308' : 'rgba(100,130,180,.4)';
-    ctx.fill();
-    ctx.beginPath();
-    ctx.arc(p.x, p.ay, 3, 0, Math.PI*2);
-    ctx.fillStyle = p.active > 0 ? '#3b82f6' : 'rgba(100,130,180,.4)';
+    ctx.arc(x, yPeak, 2.5, 0, Math.PI*2);
+    ctx.fillStyle = (p.interval_peak||0) > 0 ? '#eab308' : 'rgba(100,130,180,.4)';
     ctx.fill();
   }
   ctx.fillStyle = 'rgba(100,130,180,.5)';
@@ -9992,25 +10091,28 @@ _wdCanvas.addEventListener('mousemove', function(e){
   for(var i=0;i<_wdHistPoints.length;i++){
     var p = _wdHistPoints[i];
     var dx = mx - p.x;
-    var dpeak = Math.sqrt(dx*dx + (my-p.y)*(my-p.y));
-    var dact  = Math.sqrt(dx*dx + (my-p.ay)*(my-p.ay));
-    var d = Math.min(dpeak, dact);
-    if(d < minDist){ minDist = d; closest = p; closestY = dpeak < dact ? p.y : p.ay; }
+    var dAvg = Math.sqrt(dx*dx + (my-p.yAvg)*(my-p.yAvg));
+    var dPeak = Math.sqrt(dx*dx + (my-p.yPeak)*(my-p.yPeak));
+    var d = Math.min(dAvg, dPeak);
+    if(d < minDist){ minDist = d; closest = p; closestY = dAvg < dPeak ? p.yAvg : p.yPeak; }
   }
   var tip = document.getElementById('sm-wd-hist-tooltip');
-  if(closest && minDist < 20){
+  if(closest && minDist < 25){
     var d = new Date(closest.ts*1000);
     var ts = ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2)+':'+('0'+d.getSeconds()).slice(-2);
     tip.innerHTML =
       '<div style="color:#c8d4e4;font-weight:600;margin-bottom:.2rem">' + ts + '</div>' +
-      '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#3b82f6;margin-right:.3rem"></span>Active: <b>' + closest.active + '</b></div>' +
-      '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#eab308;margin-right:.3rem"></span>Peak: <b>' + closest.peak + '</b></div>' +
-      (_wdRecentPeak > 0 ? '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#22c55e;margin-right:.3rem"></span>Recent Peak: <b>' + _wdRecentPeak + '</b></div>' : '') +
+      '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#64748b;margin-right:.3rem"></span>Current active: <b>' + closest.active + '</b></div>' +
+      '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#3b82f6;margin-right:.3rem"></span>Average active: <b>' + closest.average_active.toFixed(2) + '</b></div>' +
+      '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#eab308;margin-right:.3rem"></span>Interval peak: <b>' + closest.interval_peak + '</b></div>' +
+      '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#a855f7;margin-right:.3rem"></span>Capacity: <b>' + closest.capacity + '</b></div>' +
+      '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#ef4444;margin-right:.3rem"></span>Waiting: <b>' + closest.waiting + '</b></div>' +
+      '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#64748b;margin-right:.3rem"></span>Completed: <b>' + closest.completed_delta + '</b></div>' +
       '<div style="margin-top:.2rem;font-size:.68rem;color:rgba(180,200,220,.5)">click to view snapshot</div>';
     tip.style.display = 'block';
-    var tipW = 160;
+    var tipW = 200;
     tip.style.left = Math.min(closest.x + 12, rect.width - tipW) + 'px';
-    tip.style.top = Math.max(closestY - 75, 2) + 'px';
+    tip.style.top = Math.max(closestY - 110, 2) + 'px';
   } else {
     tip.style.display = 'none';
   }
@@ -10027,12 +10129,12 @@ _wdCanvas.addEventListener('click', function(e){
   for(var i=0;i<_wdHistPoints.length;i++){
     var p = _wdHistPoints[i];
     var dx = mx - p.x;
-    var dpeak = Math.sqrt(dx*dx + (my-p.y)*(my-p.y));
-    var dact  = Math.sqrt(dx*dx + (my-p.ay)*(my-p.ay));
-    var d = Math.min(dpeak, dact);
+    var dAvg = Math.sqrt(dx*dx + (my-p.yAvg)*(my-p.yAvg));
+    var dPeak = Math.sqrt(dx*dx + (my-p.yPeak)*(my-p.yPeak));
+    var d = Math.min(dAvg, dPeak);
     if(d < minDist){ minDist = d; closest = p; }
   }
-  if(closest && minDist < 25){
+  if(closest && minDist < 30){
     loadSnapshot(closest.ts);
   }
 });
@@ -10131,8 +10233,8 @@ function loadWorkerDetails(){
         ptHtml += '<div style="background:rgba(15,22,38,.5);border:1px solid rgba(55,75,100,.3);border-radius:.4rem;padding:.4rem .7rem;display:flex;align-items:center;gap:.4rem"><span style="width:8px;height:8px;border-radius:50%;background:' + (colors[p]||'#64748b') + '"></span><span style="font-size:.8rem">' + p + '</span><span style="font-weight:700;font-size:.84rem">' + v + '</span></div>';
       }
       document.getElementById('sm-wd-proto-totals').innerHTML = ptHtml;
-      _wdHistory = d.history || [];
-      drawHistogram(_wdHistory, recentPeak);
+      _wdTimeline = d.timeline || [];
+      drawHistogram(_wdTimeline);
       if(!_wdViewingSnapshot){
         renderWorkerList(d.workers || [], recentPeak);
       }
@@ -14060,6 +14162,7 @@ def start_web_server():
 
 def shutdown_runtime_servers():
     global web_server, dns_servers, encrypted_dns_servers
+    _worker_tracker.stop_sampler()
     if web_server is not None:
         try:
             web_server.shutdown()
@@ -14737,6 +14840,9 @@ def main():
             )
         else:
             log.write(f"{now_iso()} encrypted dns disabled\n")
+        log.flush()
+        _worker_tracker.start_sampler()
+        log.write(f"{now_iso()} worker metrics sampler started (interval={_worker_tracker._snapshot_interval_seconds}s)\n")
         log.flush()
         set_runtime_status("DNS server ready", ready=True)
         console_event("ok", f"{APP_NAME} is ready")
