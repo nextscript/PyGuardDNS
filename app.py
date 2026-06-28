@@ -435,8 +435,8 @@ class WorkerDetailTracker:
                 "peak": self._peak_active,
                 "workers": workers_at_time,
             })
-            if len(self._snapshot_history) > 150:
-                self._snapshot_history = self._snapshot_history[-150:]
+            if len(self._snapshot_history) > 900:
+                self._snapshot_history = self._snapshot_history[-900:]
 
     def _worker_metrics_sampler(self):
         while not self._sampler_shutdown_event.is_set():
