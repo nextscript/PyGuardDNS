@@ -76,15 +76,17 @@ class RegexIndex:
         tokens = labels | self._domain_ngrams(domain)
 
         seen: set[int] = set()
+        bucket_get = self.literal_buckets.get
+        rules = self.rules
         for token in tokens:
-            for idx in self.literal_buckets.get(token, ()):
+            for idx in bucket_get(token, ()):
                 if idx not in seen:
                     seen.add(idx)
-                    yield self.rules[idx]
+                    yield rules[idx]
 
         for idx in self.fallback:
             if idx not in seen:
-                yield self.rules[idx]
+                yield rules[idx]
 
     def fallback_ratio(self) -> float:
         return len(self.fallback) / max(1, len(self))
@@ -157,6 +159,9 @@ class RegexIndex:
 
         return set(sorted(literals, key=len, reverse=True)[:3])
 
+
+_domain_norm_cache: dict[str, str] = {}
+_domain_norm_cache_max = 65536
 
 class FilterEngine:
     def __init__(self):
@@ -267,18 +272,28 @@ class FilterEngine:
         }
 
     def normalize_domain(self, domain: str) -> str:
+        cached = _domain_norm_cache.get(domain)
+        if cached is not None:
+            return cached
         domain = domain.strip().lower()
         if domain.endswith("."):
             domain = domain[:-1]
         if not domain:
+            _domain_norm_cache[domain] = ""
             return ""
         if idna and any(ord(c) >= 128 for c in domain):
             try:
                 domain = idna.encode(domain).decode("ascii")
             except Exception:
+                _domain_norm_cache[domain] = ""
                 return ""
         if not re.match(r"^[a-z0-9._-]+$", domain):
+            _domain_norm_cache[domain] = ""
             return ""
+        if len(_domain_norm_cache) >= _domain_norm_cache_max:
+            del _domain_norm_cache[next(iter(_domain_norm_cache))
+]
+        _domain_norm_cache[domain] = domain
         return domain
 
     def add_rule(self, raw_rule: str, rule_type: str = "block", list_name: str = "", profile_id: Optional[int] = None) -> None:

@@ -1873,13 +1873,17 @@ _settings_cache = {}
 _settings_cache_lock = threading.RLock()
 _SETTING_MISSING = object()
 
-
-def _invalidate_settings_cache(key=None):
-    with _settings_cache_lock:
-        if key is None:
-            _settings_cache.clear()
-        else:
-            _settings_cache.pop(key, None)
+# L1 hot-path cache for settings read from the DNS request handling path.
+# These keys are accessed on every DNS query and rarely change at runtime.
+_hot_settings = {}
+_hot_settings_lock = threading.Lock()
+_HOT_KEYS = frozenset({
+    "cache_enabled", "serve_stale_enabled", "serve_stale_max_age",
+    "cache_optimistic", "negative_cache_enabled",
+    "filtering_enabled", "disable_ipv6", "dnssec_validation_enabled",
+    "upstream_mode", "upstream_timeout", "cache_ttl", "cache_min_ttl",
+    "cache_max_ttl", "cache_size", "block_mode", "block_response_ttl",
+})
 
 
 def get_setting(key, default=""):
@@ -1900,6 +1904,31 @@ def get_setting(key, default=""):
     return value
 
 
+def _hot_get(key, default=""):
+    val = _hot_settings.get(key)
+    if val is not None:
+        return val
+    with _hot_settings_lock:
+        val = _hot_settings.get(key)
+        if val is not None:
+            return val
+        val = get_setting(key, default)
+        if key in _HOT_KEYS:
+            _hot_settings[key] = val
+    return val
+
+
+def _invalidate_settings_cache(key=None):
+    with _settings_cache_lock:
+        if key is None:
+            _settings_cache.clear()
+        else:
+            _settings_cache.pop(key, None)
+    if key in _HOT_KEYS:
+        with _hot_settings_lock:
+            _hot_settings.pop(key, None)
+
+
 def set_setting(key, value):
     value = str(value)
     with db_lock:
@@ -1910,6 +1939,9 @@ def set_setting(key, value):
         db.commit()
     with _settings_cache_lock:
         _settings_cache[key] = value
+    if key in _HOT_KEYS:
+        with _hot_settings_lock:
+            _hot_settings[key] = value
 
 
 def parse_port(value, default, name):
@@ -4804,11 +4836,21 @@ def decide(domain, qtype_name, client_ip, client_info=None):
 
 
 def cache_key(domain, qtype_name):
-    return f"{normalize_domain(domain)}|{qtype_name}"
+    return f"{domain}|{qtype_name}"
 
+
+_shard_cache = {}
+_shard_cache_lock = threading.Lock()
 
 def _shard_for(key):
-    return hash(key) % CACHE_SHARDS
+    cached = _shard_cache.get(key)
+    if cached is not None:
+        return cached
+    h = hash(key) % CACHE_SHARDS
+    with _shard_cache_lock:
+        if key not in _shard_cache:
+            _shard_cache[key] = h
+    return h
 
 
 def extract_negative_ttl(response):
@@ -4828,8 +4870,27 @@ def extract_negative_ttl(response):
     return None
 
 
+_neg_cache_enabled = None
+_filtering_enabled_cache_val = None
+
+def _is_neg_cache_enabled():
+    global _neg_cache_enabled
+    if _neg_cache_enabled is None:
+        with _cache_enabled_lock:
+            if _neg_cache_enabled is None:
+                _neg_cache_enabled = _hot_get("negative_cache_enabled", "1") == "1"
+    return _neg_cache_enabled
+
+def _filtering_enabled_cache():
+    global _filtering_enabled_cache_val
+    if _filtering_enabled_cache_val is None:
+        with _cache_enabled_lock:
+            if _filtering_enabled_cache_val is None:
+                _filtering_enabled_cache_val = _hot_get("filtering_enabled", "1") == "1"
+    return _filtering_enabled_cache_val
+
 def get_negative_cached(domain, qtype_name):
-    if get_setting("negative_cache_enabled", "1") != "1":
+    if not _is_neg_cache_enabled():
         return None
     key = cache_key(domain, qtype_name)
     shard = _shard_for(key)
@@ -4845,10 +4906,10 @@ def get_negative_cached(domain, qtype_name):
 
 
 def set_negative_cached(domain, qtype_name, response, neg_type="nxdomain"):
-    if get_setting("negative_cache_enabled", "1") != "1":
+    if not _is_neg_cache_enabled():
         return
-    max_ttl = int(get_setting("negative_cache_max_ttl", "300") or "300")
-    min_ttl = int(get_setting("negative_cache_min_ttl", "30") or "30")
+    max_ttl = int(_hot_get("negative_cache_max_ttl", "300") or "300")
+    min_ttl = int(_hot_get("negative_cache_min_ttl", "30") or "30")
     ttl = extract_negative_ttl(response)
     if ttl is None:
         ttl = min_ttl
@@ -4917,8 +4978,19 @@ def _prefetch_refresh(domain, qtype_name, key):
             prefetch_in_progress.discard(key)
 
 
+_cache_enabled = None
+_cache_enabled_lock = threading.Lock()
+
+def _is_cache_enabled():
+    global _cache_enabled
+    if _cache_enabled is None:
+        with _cache_enabled_lock:
+            if _cache_enabled is None:
+                _cache_enabled = _hot_get("cache_enabled", "1") == "1"
+    return _cache_enabled
+
 def get_cached(domain, qtype_name):
-    if get_setting("cache_enabled", "1") != "1":
+    if not _is_cache_enabled():
         return None
     key = cache_key(domain, qtype_name)
     shard = _shard_for(key)
@@ -4930,9 +5002,9 @@ def get_cached(domain, qtype_name):
         if item["expires"] > time.time():
             _maybe_prefetch(domain, qtype_name, key, item)
             return item["response"]
-        stale_enabled = get_setting("serve_stale_enabled", "0") == "1"
+        stale_enabled = _hot_get("serve_stale_enabled", "0") == "1"
         if stale_enabled:
-            max_stale = int(get_setting("serve_stale_max_age", "86400") or "86400")
+            max_stale = int(_hot_get("serve_stale_max_age", "86400") or "86400")
             age = time.time() - item["expires"]
             if age <= max_stale and not item.get("stale_refresh"):
                 item["stale_refresh"] = True
@@ -4943,7 +5015,7 @@ def get_cached(domain, qtype_name):
                 if evicted:
                     cache_bytes_used[shard] -= len(evicted.get("response", b""))
                 return None
-        if get_setting("cache_optimistic", "0") == "1" and not item.get("stale_refresh"):
+        if _hot_get("cache_optimistic", "0") == "1" and not item.get("stale_refresh"):
             item["stale_refresh"] = True
             threading.Thread(target=_refresh_stale_cache_entry, args=(domain, qtype_name, key), daemon=True).start()
             return item["response"]
@@ -4969,17 +5041,30 @@ def _refresh_stale_cache_entry(domain, qtype_name, key):
                 item.pop("stale_refresh", None)
 
 
+_cache_ttl = None
+_cache_min_ttl = None
+_cache_max_ttl = None
+_cache_size = None
+
+def _get_cached_ttl_and_size():
+    global _cache_ttl, _cache_min_ttl, _cache_max_ttl, _cache_size
+    if _cache_ttl is None:
+        with _cache_enabled_lock:
+            if _cache_ttl is None:
+                _cache_ttl = int(_hot_get("cache_ttl", "300") or "300")
+                _cache_min_ttl = int(_hot_get("cache_min_ttl", "0") or "0")
+                _cache_max_ttl = int(_hot_get("cache_max_ttl", "0") or "0")
+                _cache_size = int(_hot_get("cache_size", "4194304") or "4194304")
+    return _cache_ttl, _cache_min_ttl, _cache_max_ttl, _cache_size
+
 def set_cached(domain, qtype_name, response):
-    if get_setting("cache_enabled", "1") != "1":
+    if not _is_cache_enabled():
         return
-    ttl = int(get_setting("cache_ttl", "300") or "300")
-    min_ttl_v = int(get_setting("cache_min_ttl", "0") or "0")
-    max_ttl_v = int(get_setting("cache_max_ttl", "0") or "0")
+    ttl, min_ttl_v, max_ttl_v, max_bytes = _get_cached_ttl_and_size()
     if min_ttl_v > 0:
         ttl = max(ttl, min_ttl_v)
     if max_ttl_v > 0:
         ttl = min(ttl, max_ttl_v)
-    max_bytes = int(get_setting("cache_size", "4194304") or "4194304")
     max_bytes_per_shard = max(1, max_bytes // CACHE_SHARDS)
     key = cache_key(domain, qtype_name)
     shard = _shard_for(key)
@@ -5627,7 +5712,9 @@ def _handle_dns_request_inner(request, client_ip, connection_type, started, requ
     client_info = lookup_client_snapshot(client_ip)
     client_log_name = client_info.get("name", "") if client_info else ""
     client_profile_name = (client_info.get("profile_name", "") or "") if client_info else ""
-    resolver_mode = get_setting("upstream_mode", "sequential")
+    resolver_mode = _hot_get("upstream_mode", "sequential")
+    disable_ipv6 = _hot_get("disable_ipv6", "0") == "1"
+    dnssec_enabled = _hot_get("dnssec_validation_enabled", "0") == "1"
     try:
         question = parse_dns_question(request)
         domain = question["domain"]
@@ -5635,7 +5722,7 @@ def _handle_dns_request_inner(request, client_ip, connection_type, started, requ
         qtype_name = question["qtype_name"]
         update_active_request(request_id, domain=domain, query_type=qtype_name, stage="filtering")
 
-        if get_setting("disable_ipv6", "0") == "1" and qtype_name == "AAAA":
+        if disable_ipv6 and qtype_name == "AAAA":
             response = build_empty_response(request)
             return response
 
@@ -5697,20 +5784,20 @@ def _handle_dns_request_inner(request, client_ip, connection_type, started, requ
         update_active_request(request_id, stage="upstream", cache_status="miss")
 
         forwarding_request = request
-        if get_setting("dnssec_validation_enabled", "0") == "1":
+        if dnssec_enabled:
             forwarding_request = add_do_bit_to_query(request)
         upstream_start = time.perf_counter()
         response, upstream = forward_query(forwarding_request)
         upstream_query_time_ms = (time.perf_counter() - upstream_start) * 1000
         response = apply_ipv6_disabled_policy(response)
-        filtering_on = get_setting("filtering_enabled", "1") == "1" and client_filtering_enabled(client_ip, client_info=client_info)
+        filtering_on = _filtering_enabled_cache() and client_filtering_enabled(client_ip, client_info=client_info)
         profile_id = decision.get("profile_id")
         engine = get_filter_engine()
 
         client_cd_flag = bool(question.get("flags", 0) & 0x0100)
 
         dnssec_status = ""
-        if _dnssec_available and get_setting("dnssec_validation_enabled", "0") == "1" and not client_cd_flag:
+        if _dnssec_available and dnssec_enabled and not client_cd_flag:
             update_active_request(request_id, stage="dnssec_validation")
             try:
                 import dns.message
