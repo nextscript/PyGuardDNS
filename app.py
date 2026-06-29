@@ -9467,7 +9467,7 @@ def _system_monitor_api_summary():
             "udp_listener": "active" if dns_running else "stopped",
             "tcp_listener": "active" if dns_running else "stopped",
             "dot_listener": "active" if enc_runtime.get("tls_running") else "stopped",
-            "doh_listener": "active" if enc_runtime.get("https_running") else "stopped",
+            "doh_listener": "active" if (enc_runtime.get("https_running") or web_server is not None) else "stopped",
             "doq_listener": "active" if enc_runtime.get("quic_running") else "stopped",
             "thread_count": threading.active_count(),
         },
