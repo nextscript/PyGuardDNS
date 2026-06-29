@@ -10234,7 +10234,7 @@ function loadWorkerDetails(){
       }
       document.getElementById('sm-wd-proto-totals').innerHTML = ptHtml;
       _wdTimeline = d.timeline || [];
-      drawHistogram(_wdTimeline);
+      drawHistogram(_wdTimeline.slice(-100));
       if(!_wdViewingSnapshot){
         renderWorkerList(d.workers || [], recentPeak);
       }
