@@ -372,6 +372,7 @@ class WorkerDetailTracker:
                 "waiting": waiting_count,
                 "capacity": capacity,
                 "interval_peak": interval_peak,
+                "recent_peak": snap.recent_peak,
                 "completed_delta": completed_delta,
             })
             self._active_worker_seconds = 0.0
@@ -9625,7 +9626,7 @@ def system_monitor_page():
       </div>
       <div style="display:flex;gap:1rem;font-size:.7rem;color:var(--muted2);margin-bottom:.75rem">
         <span><span style="display:inline-block;width:12px;height:2px;background:#3b82f6;vertical-align:middle;margin-right:.3rem"></span>Average Active</span>
-        <span style="margin-left:.75rem"><span style="display:inline-block;width:12px;height:2px;background:#eab308;vertical-align:middle;margin-right:.3rem"></span>Interval Peak</span>
+        <span style="margin-left:.75rem"><span style="display:inline-block;width:12px;height:2px;background:#eab308;vertical-align:middle;margin-right:.3rem"></span>Recent Peak</span>
         <span style="margin-left:.75rem"><span style="display:inline-block;width:12px;height:2px;background:#a855f7;vertical-align:middle;margin-right:.3rem;border-top:2px dashed #a855f7"></span>Capacity</span>
         <span style="margin-left:.75rem"><span style="display:inline-block;width:12px;height:2px;background:#ef4444;vertical-align:middle;margin-right:.3rem"></span>Waiting</span>
       </div>
@@ -9961,7 +9962,7 @@ function drawHistogram(timeline){
   for(var i=0;i<timeline.length;i++){
     var p = timeline[i];
     var avg = Number.isFinite(p.average_active) ? p.average_active : Number(p.active || 0);
-    var ip = p.interval_peak || 0;
+    var ip = p.recent_peak || 0;
     var c = p.capacity || 0;
     var w = p.waiting || 0;
     if(avg > maxVal) maxVal = avg;
@@ -10023,7 +10024,7 @@ function drawHistogram(timeline){
   ctx.lineWidth = 2;
   for(var i=0;i<timeline.length;i++){
     var x = padL + ((timeline[i].timestamp - tMin)/tRange)*chartW;
-    var y = padT + chartH - ((timeline[i].interval_peak||0)/suggestedMax)*chartH;
+    var y = padT + chartH - ((timeline[i].recent_peak||0)/suggestedMax)*chartH;
     if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
   }
   ctx.stroke();
@@ -10052,17 +10053,17 @@ function drawHistogram(timeline){
     var avg = Number.isFinite(p.average_active) ? p.average_active : Number(p.active || 0);
     var x = padL + ((p.timestamp - tMin)/tRange)*chartW;
     var yAvg = padT + chartH - (avg/suggestedMax)*chartH;
-    var yPeak = padT + chartH - ((p.interval_peak||0)/suggestedMax)*chartH;
+    var yPeak = padT + chartH - ((p.recent_peak||0)/suggestedMax)*chartH;
     var yCap = padT + chartH - ((p.capacity||0)/suggestedMax)*chartH;
     var yWait = padT + chartH - ((p.waiting||0)/suggestedMax)*chartH;
-    _wdHistPoints.push({x:x, yAvg:yAvg, yPeak:yPeak, yCap:yCap, yWait:yWait, ts:p.timestamp, active:p.active||0, average_active:avg, interval_peak:p.interval_peak||0, capacity:p.capacity||0, waiting:p.waiting||0, completed_delta:p.completed_delta||0});
+    _wdHistPoints.push({x:x, yAvg:yAvg, yPeak:yPeak, yCap:yCap, yWait:yWait, ts:p.timestamp, active:p.active||0, average_active:avg, recent_peak:p.recent_peak||0, capacity:p.capacity||0, waiting:p.waiting||0, completed_delta:p.completed_delta||0});
     ctx.beginPath();
     ctx.arc(x, yAvg, 2.5, 0, Math.PI*2);
     ctx.fillStyle = avg > 0 ? '#3b82f6' : 'rgba(100,130,180,.4)';
     ctx.fill();
     ctx.beginPath();
     ctx.arc(x, yPeak, 2.5, 0, Math.PI*2);
-    ctx.fillStyle = (p.interval_peak||0) > 0 ? '#eab308' : 'rgba(100,130,180,.4)';
+    ctx.fillStyle = (p.recent_peak||0) > 0 ? '#eab308' : 'rgba(100,130,180,.4)';
     ctx.fill();
   }
   ctx.fillStyle = 'rgba(100,130,180,.5)';
@@ -10104,7 +10105,7 @@ _wdCanvas.addEventListener('mousemove', function(e){
       '<div style="color:#c8d4e4;font-weight:600;margin-bottom:.2rem">' + ts + '</div>' +
       '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#64748b;margin-right:.3rem"></span>Current active: <b>' + closest.active + '</b></div>' +
       '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#3b82f6;margin-right:.3rem"></span>Average active: <b>' + closest.average_active.toFixed(2) + '</b></div>' +
-      '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#eab308;margin-right:.3rem"></span>Interval peak: <b>' + closest.interval_peak + '</b></div>' +
+      '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#eab308;margin-right:.3rem"></span>Recent peak: <b>' + closest.recent_peak + '</b></div>' +
       '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#a855f7;margin-right:.3rem"></span>Capacity: <b>' + closest.capacity + '</b></div>' +
       '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#ef4444;margin-right:.3rem"></span>Waiting: <b>' + closest.waiting + '</b></div>' +
       '<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#64748b;margin-right:.3rem"></span>Completed: <b>' + closest.completed_delta + '</b></div>' +
