@@ -12747,7 +12747,7 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(b"{}")
+        self.safe_write(b"{}")
 
     def csrf_token(self):
         session = self.current_session()
@@ -13009,7 +13009,7 @@ class WebHandler(BaseHTTPRequestHandler):
         if csrf:
             self.send_header("Set-Cookie", f"{CSRF_COOKIE}={csrf}; Max-Age={SESSION_TTL_SECONDS}; SameSite=Lax; Path=/")
         self.end_headers()
-        self.wfile.write(body)
+        self.safe_write(body)
 
     def send_favicon(self):
         try:
@@ -13023,7 +13023,7 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "public, max-age=86400")
         self.end_headers()
-        self.wfile.write(body)
+        self.safe_write(body)
 
     def send_json(self, obj, status=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -13033,7 +13033,7 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
-        self.wfile.write(body)
+        self.safe_write(body)
 
     def _send_cors_json(self, obj, status=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -13045,7 +13045,13 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-API-Token, Authorization")
         self.end_headers()
-        self.wfile.write(body)
+        self.safe_write(body)
+
+    def safe_write(self, data):
+        try:
+            self.wfile.write(data)
+        except OSError:
+            pass
 
     def do_OPTIONS(self):
         path = urlparse(self.path).path
@@ -13333,7 +13339,7 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        self.safe_write(body)
 
     def api_get(self, path, params):
         if path == "/api/status":
@@ -13458,7 +13464,7 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Disposition", "attachment; filename=querylog.csv")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            self.safe_write(body)
         elif path == "/api/rules":
             rules_text = read_rules()
             parsed = []
@@ -13545,7 +13551,7 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Disposition", "attachment; filename=pyguarddns-cosmetic.user.js")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            self.safe_write(body)
         elif path == "/api/clients":
             if client_manager is not None:
                 self.send_json(client_manager.get_clients())
@@ -13639,7 +13645,7 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Disposition", f'attachment; filename="localdnsguard_backup_{stamp}.json"')
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            self.safe_write(body)
         elif path == "/api/services":
             self.send_json(sorted(SERVICE_DOMAINS.keys()))
         elif re.search(r"/api/profiles/\d+/services$", path):
@@ -14081,7 +14087,7 @@ class DoQRuntimeServer:
                     if isinstance(event, HandshakeCompleted):
                         update_doq_metric("handshakes")
                         update_doq_metric("last_peer", peer)
-                        log_doq_event(f"HANDSHAKE_COMPLETED alpn={self._quic.alpn_protocol} resumed={event.session_resumed}")
+                        log_doq_event(f"HANDSHAKE_COMPLETED alpn={event.alpn_protocol} resumed={event.session_resumed}")
                         return
                     if isinstance(event, ConnectionTerminated):
                         error_msg = f"code={event.error_code} (0x{event.error_code:x}) reason={event.reason_phrase}" if event.error_code else "no error code"
