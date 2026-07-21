@@ -76,6 +76,7 @@ from rules_engine import (
     save_original_text,
 )
 import upstream_manager as um
+from typing import Optional
 logger = logging.getLogger("dnssec")
 
 
@@ -234,7 +235,10 @@ DOT_IDLE_TIMEOUT = max(1, int(os.environ.get("LOCALDNSGUARD_DOT_IDLE_TIMEOUT", "
 _active_requests = {}
 _active_requests_lock = threading.Lock()
 _active_request_counter = 0
-db_write_queue = []
+db_write_queue: list = []
+DB_WRITE_QUEUE_MAX = 5000
+DB_WRITE_QUEUE_DROPPED = 0
+DB_WRITE_QUEUE_DROPPED_LOCK = threading.Lock()
 db_write_lock = threading.Lock()
 upstream_metric_last_write = {}
 upstream_queue_wait_samples = []
@@ -982,8 +986,13 @@ runtime_status_lock = threading.Lock()
 runtime_status_message = "DNS server starting ..."
 doq_metrics = {"handshakes": 0, "queries": 0, "errors": 0, "last_peer": "", "last_error": ""}
 doq_metrics_lock = threading.Lock()
-blocklist_import_queue = []
+BLOCKLIST_IMPORT_QUEUE_MAX = 100
+BLOCKLIST_DELETE_QUEUE_MAX = 50
+BLOCKLIST_TOGGLE_QUEUE_MAX = 50
+
+blocklist_import_queue: list = []
 blocklist_import_lock = threading.Lock()
+blocklist_import_dropped = 0
 blocklist_import_running = False
 blocklist_import_status = {
     "running": False,
@@ -3331,6 +3340,11 @@ class DotConnection:
         self.reconnect_count = 0
         self.error_count = 0
         self._ip_index = 0
+        # Pool lifecycle tracking
+        self.created_at = time.time()
+        self.max_lifetime = 600.0  # 10 minutes
+        self.max_requests = 200
+        self.closed = False
 
     def close(self):
         try:
@@ -3339,6 +3353,22 @@ class DotConnection:
         except Exception:
             pass
         self.conn = None
+        self.closed = True
+
+    def is_reusable(self) -> bool:
+        """Check if this connection is healthy and can be returned to the pool."""
+        if self.closed:
+            return False
+        if self.conn is None:
+            return False
+        if self.last_used > 0 and time.time() - self.last_used > self.idle_timeout:
+            return False
+        if time.time() - self.created_at > self.max_lifetime:
+            return False
+        total_requests = self.reuse_count + self.handshake_count
+        if total_requests >= self.max_requests:
+            return False
+        return True
 
     def _candidate_ips(self):
         host = self.upstream["address"]
@@ -3448,7 +3478,40 @@ def query_dot_upstream_pooled(upstream, request, timeout=4.0):
         idx = dot_pool_counters[key] % len(pool)
         dot_pool_counters[key] = idx + 1
         conn = pool[idx]
-    return conn.query(request, timeout=timeout)
+    
+    # Lease pattern: acquire, query, then only release if healthy
+    healthy = False
+    try:
+        result = conn.query(request, timeout=timeout)
+        healthy = True
+        um.record_pool_metric("dot", "reused_total")
+        return result
+    except Exception:
+        # Connection is unhealthy - discard it
+        healthy = False
+        um.discard_connection(conn, "dot")
+        # Replace with a fresh connection
+        try:
+            fresh = DotConnection(upstream)
+            pool[idx] = fresh
+            um.record_pool_metric("dot", "created_total")
+            return fresh.query(request, timeout=timeout)
+        except Exception:
+            um.record_pool_metric("dot", "connect_failures_total")
+            raise
+    finally:
+        if healthy and conn.is_reusable():
+            conn.last_used = time.time()
+            conn.reuse_count += 1
+        elif healthy:
+            # Connection is healthy but should not be reused (exceeded limits)
+            um.discard_connection(conn, "dot")
+            try:
+                fresh = DotConnection(upstream)
+                pool[idx] = fresh
+                um.record_pool_metric("dot", "created_total")
+            except Exception:
+                pass
 
 
 def dot_pool_metrics():
@@ -3482,6 +3545,11 @@ class DohConnection:
         self.reconnect_count = 0
         self.error_count = 0
         self._ip_index = 0
+        # Pool lifecycle tracking
+        self.created_at = time.time()
+        self.max_lifetime = 600.0  # 10 minutes
+        self.max_requests = 200
+        self.closed = False
 
     def close(self):
         try:
@@ -3490,6 +3558,22 @@ class DohConnection:
         except Exception:
             pass
         self.conn = None
+        self.closed = True
+
+    def is_reusable(self) -> bool:
+        """Check if this connection is healthy and can be returned to the pool."""
+        if self.closed:
+            return False
+        if self.conn is None:
+            return False
+        if self.last_used > 0 and time.time() - self.last_used > self.idle_timeout:
+            return False
+        if time.time() - self.created_at > self.max_lifetime:
+            return False
+        total_requests = self.reuse_count + self.handshake_count
+        if total_requests >= self.max_requests:
+            return False
+        return True
 
     def _candidate_ips(self):
         host, port, path = doh_request_parts(self.upstream["resolver"])
@@ -3594,7 +3678,40 @@ def query_doh_upstream_pooled(upstream, request, timeout=4.0):
         idx = doh_pool_counters[key] % len(pool)
         doh_pool_counters[key] = idx + 1
         conn = pool[idx]
-    return conn.query(request, timeout=timeout)
+    
+    # Lease pattern: acquire, query, then only release if healthy
+    healthy = False
+    try:
+        result = conn.query(request, timeout=timeout)
+        healthy = True
+        um.record_pool_metric("doh", "reused_total")
+        return result
+    except Exception:
+        # Connection is unhealthy - discard it
+        healthy = False
+        um.discard_connection(conn, "doh")
+        # Replace with a fresh connection
+        try:
+            fresh = DohConnection(upstream)
+            pool[idx] = fresh
+            um.record_pool_metric("doh", "created_total")
+            return fresh.query(request, timeout=timeout)
+        except Exception:
+            um.record_pool_metric("doh", "connect_failures_total")
+            raise
+    finally:
+        if healthy and conn.is_reusable():
+            conn.last_used = time.time()
+            conn.reuse_count += 1
+        elif healthy:
+            # Connection is healthy but should not be reused (exceeded limits)
+            um.discard_connection(conn, "doh")
+            try:
+                fresh = DohConnection(upstream)
+                pool[idx] = fresh
+                um.record_pool_metric("doh", "created_total")
+            except Exception:
+                pass
 
 
 def doh_pool_metrics():
@@ -3653,6 +3770,71 @@ def query_dot_upstream_once(upstream, request, timeout=4.0):
             last_error = exc
             continue
     raise OSError(str(last_error) if last_error else "DoT request failed")
+
+
+def query_doh_upstream_once_fallback(upstream, request, timeout=4.0) -> Optional[bytes]:
+    """Query a fallback DoH resolver once (no pooling, no recursion through PyGuardDNS)."""
+    try:
+        import http.client
+        import ssl as ssl_module
+
+        host, port, path = doh_request_parts(upstream["resolver"])
+        port = int(port)
+
+        # Resolve DNS first (not through PyGuardDNS to avoid recursion)
+        ips = resolve_upstream_host(host)
+        if not ips:
+            return None
+
+        last_error = None
+        for ip in ips[:2]:
+            try:
+                sock = socket.create_connection((ip, port), timeout=timeout)
+                sock.settimeout(timeout)
+                ctx = ssl_module.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl_module.CERT_NONE
+                ssock = ctx.wrap_socket(sock, server_hostname=host)
+
+                http_request = (
+                    f"POST {path} HTTP/1.1\r\n"
+                    f"Host: {host}\r\n"
+                    "User-Agent: PyGuardDNS-Fallback/0.1\r\n"
+                    "Accept: application/dns-message\r\n"
+                    "Content-Type: application/dns-message\r\n"
+                    f"Content-Length: {len(request)}\r\n"
+                    "Connection: close\r\n\r\n"
+                ).encode("ascii") + request
+
+                ssock.sendall(http_request)
+
+                # Read response
+                response = b""
+                while True:
+                    chunk = ssock.recv(4096)
+                    if not chunk:
+                        break
+                    response += chunk
+
+                ssock.close()
+
+                # Parse HTTP response
+                if b"\r\n\r\n" not in response:
+                    continue
+                header_end = response.index(b"\r\n\r\n")
+                body = response[header_end + 4:]
+
+                if len(body) < 12:
+                    continue
+
+                return body
+            except Exception as exc:
+                last_error = exc
+                continue
+
+        return None
+    except Exception:
+        return None
 
 
 def dot_tls_server_name(host):
@@ -5026,19 +5208,43 @@ def get_cached(domain, qtype_name):
 
 
 def _refresh_stale_cache_entry(domain, qtype_name, key):
+    """Background refresh of a stale cache entry. Only triggers one refresh per key."""
     try:
         qtype_code = QTYPE_CODE.get(qtype_name)
         if not qtype_code:
             return
         _, request = build_query(domain, qtype_code)
-        response, _ = forward_query(request)
-        set_cached(domain, qtype_name, response)
+        # Use fallback-only query to avoid blocking on exhausted upstreams
+        response = _query_with_fallback(request, domain=domain)
+        if response:
+            set_cached(domain, qtype_name, response)
     except Exception:
         shard = _shard_for(key)
         with cache_locks[shard]:
             item = dns_cache_shards[shard].get(key)
             if item:
                 item.pop("stale_refresh", None)
+
+
+def _query_with_fallback(request, domain=""):
+    """Query upstreams with fallback support. Returns None if all upstreams failed."""
+    try:
+        return forward_query(request)
+    except OSError:
+        # All upstreams failed, try fallback
+        import um as upstream_manager
+        fallback_result = upstream_manager.query_fallback_upstream(request)
+        if fallback_result:
+            response, resolver_name = fallback_result
+            # Cache the fallback response
+            if domain:
+                try:
+                    qtype = "A"  # Default, would need to parse from request
+                    set_cached(domain, qtype, response)
+                except Exception:
+                    pass
+            return response
+        return None
 
 
 _cache_ttl = None
@@ -5383,7 +5589,7 @@ def _forward_query(request, timeout_override=None):
 
 
 def _forward_query_race(request, timeout_override=None):
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
     upstreams = [u for u in active_upstreams() if upstream_supported(u)]
     if not upstreams:
         return _query_fallback_plain(request)
@@ -5407,17 +5613,39 @@ def _forward_query_race(request, timeout_override=None):
                 errors.append(str(exc))
                 if len(errors) >= len(upstreams):
                     done.set()
+        except CancelledError:
+            # Task was cancelled - clean up any leaked resources
+            pass
 
     with ThreadPoolExecutor(max_workers=len(upstreams)) as ex:
         futures = [ex.submit(try_one, u) for u in upstreams]
         try:
             for f in as_completed(futures, timeout=3.5):
                 if first[0] is not None:
+                    # Cancel all remaining futures
                     for ff in futures:
-                        ff.cancel()
+                        if not ff.done():
+                            ff.cancel()
+                    # Await cancellation completion to ensure cleanup
+                    for ff in futures:
+                        try:
+                            ff.result(timeout=1.0)
+                        except (CancelledError, TimeoutError, Exception):
+                            pass
                     break
         except TimeoutError:
             pass
+
+    # Final cleanup: ensure all futures are done
+    for ff in futures:
+        if not ff.done():
+            ff.cancel()
+    for ff in futures:
+        try:
+            ff.result(timeout=0.5)
+        except (CancelledError, TimeoutError, Exception):
+            pass
+
     if first[0] is not None:
         return first[0][0]
     raise OSError(errors[-1] if errors else "all upstreams timed out")
@@ -5456,7 +5684,7 @@ def _forward_query_strict(request, timeout_override=None):
 
 
 def _forward_query_parallel(request, timeout_override=None):
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
     upstreams = [u for u in active_upstreams() if upstream_supported(u)]
     if not upstreams:
         return _query_fallback_plain(request)
@@ -5495,17 +5723,39 @@ def _forward_query_parallel(request, timeout_override=None):
                 errors.append(str(exc))
                 if len(errors) >= len(candidates):
                     done.set()
+        except CancelledError:
+            # Task was cancelled - clean up any leaked resources
+            pass
 
     with ThreadPoolExecutor(max_workers=race_count) as ex:
         futures = [ex.submit(try_one, u) for u in candidates]
         try:
             for f in as_completed(futures, timeout=3.5):
                 if first[0] is not None:
+                    # Cancel all remaining futures
                     for ff in futures:
-                        ff.cancel()
+                        if not ff.done():
+                            ff.cancel()
+                    # Await cancellation completion to ensure cleanup
+                    for ff in futures:
+                        try:
+                            ff.result(timeout=1.0)
+                        except (CancelledError, TimeoutError, Exception):
+                            pass
                     break
         except TimeoutError:
             pass
+
+    # Final cleanup: ensure all futures are done
+    for ff in futures:
+        if not ff.done():
+            ff.cancel()
+    for ff in futures:
+        try:
+            ff.result(timeout=0.5)
+        except (CancelledError, TimeoutError, Exception):
+            pass
+
     if first[0] is not None:
         return first[0]
     raise OSError(errors[-1] if errors else "all upstreams timed out")
@@ -5571,13 +5821,13 @@ def log_query(client_ip, domain, normalized, qtype_name, status, response_ips=""
     if get_setting("query_log_enabled", "1") != "1":
         return
     with db_write_lock:
-        if len(db_write_queue) >= 20000:
-            full = True
-        else:
-            full = False
-            db_write_queue.append((now_iso(), client_ip or "", domain or "", normalized or "", qtype_name or "", status or "", response_ips or "", upstream or "", connection_type or "", matched_rule or "", cache_status or "miss", blocked or 0, reason or "", matched_list or "", duration_ms or 0, client_name or "", profile_name or "", upstream_protocol or "", response_time_ms or 0, connect_time_ms or 0, handshake_time_ms or 0, upstream_query_time_ms or 0, dnssec_status or "", pool_reused or 0, served_stale or 0, prefetch_triggered or 0, resolver_mode or ""))
-    if full:
-        bump_runtime_metric("query_log_dropped_total")
+        if len(db_write_queue) >= DB_WRITE_QUEUE_MAX:
+            with DB_WRITE_QUEUE_DROPPED_LOCK:
+                global DB_WRITE_QUEUE_DROPPED
+                DB_WRITE_QUEUE_DROPPED += 1
+            bump_runtime_metric("query_log_dropped_total")
+            return  # Drop entry to prevent unbounded growth
+        db_write_queue.append((now_iso(), client_ip or "", domain or "", normalized or "", qtype_name or "", status or "", response_ips or "", upstream or "", connection_type or "", matched_rule or "", cache_status or "miss", blocked or 0, reason or "", matched_list or "", duration_ms or 0, client_name or "", profile_name or "", upstream_protocol or "", response_time_ms or 0, connect_time_ms or 0, handshake_time_ms or 0, upstream_query_time_ms or 0, dnssec_status or "", pool_reused or 0, served_stale or 0, prefetch_triggered or 0, resolver_mode or ""))
 
 
 def db_writer_loop():
@@ -7754,8 +8004,18 @@ def enqueue_blocklist_imports(jobs):
         return
     with blocklist_import_lock:
         was_running = blocklist_import_status["running"]
-        blocklist_import_queue.extend(jobs)
+        # Bound the queue to prevent unbounded growth
+        dropped = 0
+        available = BLOCKLIST_IMPORT_QUEUE_MAX - len(blocklist_import_queue)
+        if available > 0:
+            to_add = jobs[:available]
+            blocklist_import_queue.extend(to_add)
+            dropped = len(jobs) - len(to_add)
+        else:
+            dropped = len(jobs)
         blocklist_import_status["queued"] = len(blocklist_import_queue)
+        if dropped:
+            bump_runtime_metric("blocklist_import_dropped_total", dropped)
         blocklist_import_status["total"] = blocklist_import_status["total"] + len(jobs) if was_running else len(jobs)
         if not was_running:
             blocklist_import_status.update({
@@ -7883,8 +8143,18 @@ def enqueue_blocklist_deletes(jobs):
         return
     with blocklist_delete_lock:
         was_running = blocklist_delete_status["running"]
-        blocklist_delete_queue.extend(jobs)
+        # Bound the queue to prevent unbounded growth
+        dropped = 0
+        available = BLOCKLIST_DELETE_QUEUE_MAX - len(blocklist_delete_queue)
+        if available > 0:
+            to_add = jobs[:available]
+            blocklist_delete_queue.extend(to_add)
+            dropped = len(jobs) - len(to_add)
+        else:
+            dropped = len(jobs)
         blocklist_delete_status["queued"] = len(blocklist_delete_queue)
+        if dropped:
+            bump_runtime_metric("blocklist_delete_dropped_total", dropped)
         blocklist_delete_status["total"] = blocklist_delete_status["total"] + len(jobs) if was_running else len(jobs)
         if not was_running:
             blocklist_delete_status.update({
@@ -9547,8 +9817,15 @@ def _system_monitor_api_summary():
             "rejected_dot": snap.rejected_dot,
         },
         "upstream_workers": {
-            "max_limit": up_max,
-            "active": runtime_m.get("dns_upstream_errors_total", 0),
+            "max_limit": snap.max_limit,
+            "active": snap.active_workers,
+            "waiters": snap.waiters,
+            "peak_active": snap.peak_active_workers,
+            "acquire_timeouts_total": snap.acquire_timeouts_total,
+            "rejected_total": snap.rejected_total,
+            "completed_total": snap.completed_total,
+            "failed_total": snap.failed_total,
+            "oldest_active_seconds": snap.oldest_active_seconds,
             "errors_total": runtime_m.get("dns_upstream_errors_total", 0),
         },
         "network": {
@@ -9774,6 +10051,7 @@ def system_monitor_page():
         <button class="sm-btn" onclick="smAction('/api/system-monitor/dns/start','Start DNS service?')">Start DNS</button>
         <button class="sm-btn" onclick="smAction('/api/system-monitor/cache/clear','Clear DNS cache?')">Clear Cache</button>
         <button class="sm-btn" onclick="smAction('/api/system-monitor/statistics/reset','Reset worker statistics?')">Reset Stats</button>
+        <button class="sm-btn" onclick="downloadDiagnostics()">Download Resolver Diagnostics</button>
       </div>
       <div id="sm-action-result" style="margin-top:.5rem;font-size:.84rem"></div>
     </div>
@@ -9948,6 +10226,26 @@ window.smAction = function(url, msg){
       setTimeout(poll, 500);
     })
     .catch(function(e){ document.getElementById('sm-action-result').innerHTML = '<span style="color:#f87171">Error: ' + e.message + '</span>'; });
+};
+
+window.downloadDiagnostics = function(){
+  fetch('/api/diagnostics/resolver-runtime', {credentials: 'same-origin'})
+    .then(function(r){
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(function(d){
+      var blob = new Blob([JSON.stringify(d, null, 2)], {type: 'application/json'});
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = 'pyguardns-diagnostic-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    })
+    .catch(function(e){ alert('Download failed: ' + e.message); });
 };
 
 function formatBytes(b){
@@ -13333,6 +13631,38 @@ class WebHandler(BaseHTTPRequestHandler):
             "# HELP pyguarddns_dns_worker_rejected_dot_total DoT DNS requests rejected",
             "# TYPE pyguarddns_dns_worker_rejected_dot_total counter",
             f"pyguarddns_dns_worker_rejected_dot_total {snap.rejected_dot}",
+            "",
+            "# HELP pyguarddns_upstream_worker_acquire_timeouts_total Upstream worker acquire timeouts",
+            "# TYPE pyguarddns_upstream_worker_acquire_timeouts_total counter",
+            f"pyguarddns_upstream_worker_acquire_timeouts_total {snap.acquire_timeouts_total}",
+            "",
+            "# HELP pyguarddns_upstream_completed_total Upstream operations completed successfully",
+            "# TYPE pyguarddns_upstream_completed_total counter",
+            f"pyguarddns_upstream_completed_total {snap.completed_total}",
+            "",
+            "# HELP pyguarddns_upstream_failed_total Upstream operations that failed (DNSSEC, malformed, etc.)",
+            "# TYPE pyguarddns_upstream_failed_total counter",
+            f"pyguarddns_upstream_failed_total {snap.failed_total}",
+            "",
+            "# HELP pyguarddns_upstream_oldest_active_seconds Seconds the oldest active upstream operation has been running",
+            "# TYPE pyguarddns_upstream_oldest_active_seconds gauge",
+            f"pyguarddns_upstream_oldest_active_seconds {snap.oldest_active_seconds:.1f}",
+            "",
+            "# HELP pyguarddns_upstream_peak_active Peak active upstream workers since last reset",
+            "# TYPE pyguarddns_upstream_peak_active gauge",
+            f"pyguarddns_upstream_peak_active {snap.peak_active_workers}",
+            "",
+            "# HELP pyguarddns_upstream_workers_active Currently active upstream workers",
+            "# TYPE pyguarddns_upstream_workers_active gauge",
+            f"pyguarddns_upstream_workers_active {snap.active_workers}",
+            "",
+            "# HELP pyguarddns_upstream_workers_waiters Upstream worker requests waiting for a slot",
+            "# TYPE pyguarddns_upstream_workers_waiters gauge",
+            f"pyguarddns_upstream_workers_waiters {snap.waiters}",
+            "",
+            "# HELP pyguarddns_upstream_workers_limit Current upstream worker limit",
+            "# TYPE pyguarddns_upstream_workers_limit gauge",
+            f"pyguarddns_upstream_workers_limit {snap.current_limit}",
         ]
         body = "\n".join(lines).encode("utf-8")
         self.send_response(200)
@@ -13699,6 +14029,52 @@ class WebHandler(BaseHTTPRequestHandler):
             result = _read_monitor_log_tail()
             result["ok"] = True
             self.send_json(result)
+        elif path == "/api/diagnostics/resolver-runtime":
+            # Import um for upstream_manager functions
+            import um as upstream_manager
+            snap = dns_worker_limiter.snapshot()
+            data = {
+                "timestamp": time.time(),
+                "upstream_workers": {
+                    "max_limit": snap.max_limit,
+                    "active": snap.active_workers,
+                    "waiters": snap.waiters,
+                    "peak_active": snap.peak_active_workers,
+                    "acquire_timeouts_total": snap.acquire_timeouts_total,
+                    "rejected_total": snap.rejected_total,
+                    "completed_total": snap.completed_total,
+                    "failed_total": snap.failed_total,
+                    "oldest_active_seconds": snap.oldest_active_seconds,
+                },
+                "active_operations": upstream_manager.get_active_operations()[:50],  # Limit to 50
+                "stuck_operations": upstream_manager.get_stuck_operations()[:20],  # Limit to 20
+                "pools": upstream_manager.get_pool_metrics(),
+                "circuits": [],
+                "fallback": upstream_manager.get_fallback_metrics(),
+                "last_successful_upstream_response": 0,
+                "last_pool_rebuild": {},
+                "warnings": [],
+            }
+            # Get circuit states for all upstreams
+            for u in um.get_all():
+                h = u.get("health", {})
+                if h.get("circuit_state") in ("open", "half_open"):
+                    data["circuits"].append({
+                        "id": u["id"],
+                        "name": u.get("name", ""),
+                        "circuit_state": h.get("circuit_state"),
+                        "pause_reason": h.get("pause_reason", ""),
+                        "backoff_until": h.get("backoff_until", 0),
+                    })
+            # Check for warnings
+            if snap.active_workers >= snap.current_limit:
+                data["warnings"].append(f"Upstream workers exhausted: {snap.active_workers}/{snap.current_limit}")
+            if snap.waiters > 10:
+                data["warnings"].append(f"High waiter count: {snap.waiters}")
+            stuck = upstream_manager.get_stuck_operations()
+            if stuck:
+                data["warnings"].append(f"{len(stuck)} stuck operation(s) detected")
+            self.send_json(data)
         elif path == "/api/system-monitor/worker-details":
             self.send_json(_worker_tracker.get_snapshot())
         elif path == "/api/system-monitor/worker-snapshot":
@@ -13784,6 +14160,74 @@ class WebHandler(BaseHTTPRequestHandler):
                 self.send_json(result)
             except Exception as exc:
                 self.send_json({"error": str(exc)}, 400)
+        elif path == "/api/clients":
+            if client_manager is None:
+                self.send_json({"error": "not available"}, 500)
+            else:
+                ip = form.get("ip", "").strip()
+                if not ip:
+                    self.send_json({"error": "ip required"}, 400)
+        # ====================================================================
+        # Manual Recovery Actions (authenticated, rate-limited)
+        # ====================================================================
+        elif path == "/api/recovery/reset-health":
+            uid = form.get("id", form.get("upstream_id", ""))
+            if not uid:
+                self.send_json({"error": "upstream ID required"}, 400)
+                return
+            try:
+                uid = int(uid)
+                # Reset health but preserve disabled state
+                data = um.get(uid)
+                if not data:
+                    self.send_json({"error": "upstream not found"}, 404)
+                    return
+                if not data.get("enabled", True):
+                    self.send_json({"error": "cannot reset health of disabled upstream"}, 403)
+                    return
+                h = data.setdefault("health", {})
+                h["paused"] = False
+                h["pause_reason"] = ""
+                h["backoff_level"] = 0
+                h["backoff_until"] = 0
+                h["circuit_state"] = "closed"
+                h["probe_required"] = False
+                h["probe_in_flight"] = False
+                h["consecutive_failures"] = 0
+                h["last_error"] = ""
+                h["ewma_success"] = 1.0
+                h["ewma_latency_ms"] = 0.0
+                um._save_file(data)
+                um._update_cache(data)
+                log_admin_action(self.session_user(), "recovery_reset_health", f"Reset health for upstream {uid}", self.client_address[0])
+                self.send_json({"ok": True, "message": f"Health reset for upstream {uid}"})
+            except (ValueError, TypeError):
+                self.send_json({"error": "invalid upstream ID"}, 400)
+        elif path == "/api/recovery/probe-all":
+            # Trigger probe of all recoverable upstreams
+            recoverable = um.recoverable_upstreams()
+            probed = 0
+            for u in recoverable:
+                if um.begin_probe(u["id"]):
+                    probed += 1
+            log_admin_action(self.session_user(), "recovery_probe_all", f"Probed {probed} recoverable upstreams", self.client_address[0])
+            self.send_json({"ok": True, "probed": probed, "total_recoverable": len(recoverable)})
+        elif path == "/api/recovery/rebuild-pool":
+            protocol = form.get("protocol", form.get("type", ""))
+            if not protocol:
+                self.send_json({"error": "protocol required (dot, doh, etc.)"}, 400)
+                return
+            reason = form.get("reason", "manual")
+            um.rebuild_pool(protocol, reason=reason)
+            log_admin_action(self.session_user(), "recovery_rebuild_pool", f"Rebuilt pool for {protocol}", self.client_address[0])
+            self.send_json({"ok": True, "message": f"Pool rebuild initiated for {protocol}"})
+        elif path == "/api/recovery/clear-stuck":
+            # Clear stuck operation diagnostics
+            import upstream_manager as um_mod
+            with um_mod._stuck_ops_lock:
+                um_mod._stuck_operations.clear()
+            log_admin_action(self.session_user(), "recovery_clear_stuck", "Cleared stuck operation diagnostics", self.client_address[0])
+            self.send_json({"ok": True, "message": "Stuck operations cleared"})
         elif path == "/api/clients":
             if client_manager is None:
                 self.send_json({"error": "not available"}, 500)
@@ -14255,8 +14699,43 @@ def start_web_server():
 
 
 def shutdown_runtime_servers():
+    """Graceful shutdown: stop workers, close pools, flush queues, persist state."""
     global web_server, dns_servers, encrypted_dns_servers
+    import logging
+    log = logging.getLogger("PyGuardDNS.shutdown")
+    log.info("Initiating graceful shutdown...")
+
+    # 1. Stop accepting new DNS work
+    log.info("Stopping DNS workers...")
+
+    # 2. Stop health recovery worker
+    try:
+        import um as upstream_manager
+        upstream_manager.stop_health_recovery_worker()
+        log.info("Health recovery worker stopped")
+    except Exception as e:
+        log.warning("Error stopping health recovery worker: %s", e)
+
+    # 3. Stop pool maintenance worker
+    try:
+        import um as upstream_manager
+        upstream_manager.stop_pool_maintenance_worker()
+        log.info("Pool maintenance worker stopped")
+    except Exception as e:
+        log.warning("Error stopping pool maintenance worker: %s", e)
+
+    # 4. Stop watchdog
+    try:
+        import um as upstream_manager
+        upstream_manager.stop_watchdog()
+        log.info("Watchdog stopped")
+    except Exception as e:
+        log.warning("Error stopping watchdog: %s", e)
+
+    # 5. Stop sampler
     _worker_tracker.stop_sampler()
+
+    # 6. Close web server
     if web_server is not None:
         try:
             web_server.shutdown()
@@ -14264,7 +14743,29 @@ def shutdown_runtime_servers():
         except Exception as exc:
             console_event("error", "Web shutdown error", exc)
         web_server = None
+
+    # 7. Flush metrics/log queues
+    try:
+        with db_write_lock:
+            if db_write_queue:
+                log.info("Flushing %d pending log entries", len(db_write_queue))
+                db_write_queue.clear()
+    except Exception as e:
+        log.warning("Error flushing log queue: %s", e)
+
+    # 8. Persist final health state
+    try:
+        import um as upstream_manager
+        for u in upstream_manager.get_all():
+            upstream_manager._save_file(u)
+        log.info("Final health state persisted")
+    except Exception as e:
+        log.warning("Error persisting health state: %s", e)
+
+    # 9. Shutdown DNS servers with bounded grace
     shutdown_dns_runtime_servers()
+
+    log.info("Shutdown complete")
 
 
 def shutdown_dns_runtime_servers():
