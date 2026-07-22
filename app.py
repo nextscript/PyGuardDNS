@@ -5227,9 +5227,13 @@ def _refresh_stale_cache_entry(domain, qtype_name, key):
 
 
 def _query_with_fallback(request, domain=""):
-    """Query upstreams with fallback support. Returns None if all upstreams failed."""
+    """Query upstreams with fallback support. Returns bytes or None."""
     try:
-        return forward_query(request)
+        result = forward_query(request)
+        # forward_query returns (response_bytes, label)
+        if isinstance(result, tuple) and len(result) >= 1:
+            return result[0]
+        return result
     except OSError:
         # All upstreams failed, try fallback
         import um as upstream_manager
