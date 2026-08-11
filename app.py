@@ -230,7 +230,7 @@ upstream_concurrency = threading.BoundedSemaphore(int(os.environ.get("LOCALDNSGU
 tcp_connection_semaphore = threading.BoundedSemaphore(max(1, int(os.environ.get("LOCALDNSGUARD_MAX_TCP_CONNECTIONS", "128"))))
 dot_connection_semaphore = threading.BoundedSemaphore(max(1, int(os.environ.get("LOCALDNSGUARD_MAX_DOT_CONNECTIONS", "128"))))
 TCP_IDLE_TIMEOUT = max(1, int(os.environ.get("LOCALDNSGUARD_TCP_IDLE_TIMEOUT", "30")))
-DOT_IDLE_TIMEOUT = max(1, int(os.environ.get("LOCALDNSGUARD_DOT_IDLE_TIMEOUT", "30")))
+DOT_IDLE_TIMEOUT = max(1, int(os.environ.get("LOCALDNSGUARD_DOT_IDLE_TIMEOUT", "60")))
 
 _active_requests = {}
 _active_requests_lock = threading.Lock()
@@ -243,7 +243,7 @@ db_write_lock = threading.Lock()
 upstream_metric_last_write = {}
 upstream_queue_wait_samples = []
 upstream_queue_wait_lock = threading.Lock()
-DOT_POOL_SIZE = max(1, int(os.environ.get("LOCALDNSGUARD_DOT_POOL_SIZE", "4")))
+DOT_POOL_SIZE = max(1, int(os.environ.get("LOCALDNSGUARD_DOT_POOL_SIZE", "8")))
 dot_pools = {}
 dot_pool_counters = {}
 dot_pools_lock = threading.RLock()
@@ -2216,13 +2216,13 @@ def load_runtime_network_settings():
     except (ValueError, TypeError):
         TCP_IDLE_TIMEOUT = 30
     try:
-        DOT_IDLE_TIMEOUT = max(1, int(get_setting("dot_idle_timeout", "30") or "30"))
+        DOT_IDLE_TIMEOUT = max(1, int(get_setting("dot_idle_timeout", "60") or "60"))
     except (ValueError, TypeError):
-        DOT_IDLE_TIMEOUT = 30
+        DOT_IDLE_TIMEOUT = 60
     try:
-        dot_ps = max(1, int(get_setting("dot_pool_size", "4") or "4"))
+        dot_ps = max(1, int(get_setting("dot_pool_size", "8") or "8"))
     except (ValueError, TypeError):
-        dot_ps = 4
+        dot_ps = 8
     DOT_POOL_SIZE = dot_ps
     try:
         doh_ps = max(1, int(get_setting("doh_pool_size", "4") or "4"))
@@ -3411,15 +3411,28 @@ class DotConnection:
         raise OSError(str(last_error) if last_error else "DoT connect failed")
 
     def query(self, request: bytes, timeout=4.0) -> bytes:
-        with self.lock:
-            try:
+        """Send a DNS query over this DoT connection, reconnecting on failure.
+        
+        The send/receive is protected by self.lock. Reconnection happens
+        outside the lock so other threads aren't blocked during the (slow)
+        TLS handshake.
+        """
+        try:
+            with self.lock:
                 self._ensure_connected(timeout)
                 return self._send_and_receive(request, timeout)
-            except Exception:
-                self.error_count += 1
-                self.reconnect_count += 1
-                self.close()
+        except Exception:
+            self.error_count += 1
+            self.reconnect_count += 1
+            # Reconnect outside the lock so other threads can still use
+            # this connection slot (they'll get a fresh connection via the pool).
+            self.close()
+            try:
                 self.connect(timeout=timeout)
+            except Exception:
+                # Reconnect failed — leave conn=None, next query will try again
+                raise
+            with self.lock:
                 return self._send_and_receive(request, timeout)
 
     def _ensure_connected(self, timeout):
@@ -5520,7 +5533,7 @@ def upstream_queue_wait_metrics():
 
 def forward_query(request, timeout_override=None):
     wait_start = time.perf_counter()
-    if not upstream_concurrency.acquire(timeout=3.0):
+    if not upstream_concurrency.acquire(blocking=False):
         record_upstream_queue_wait(time.perf_counter() - wait_start)
         raise OSError("upstream busy")
     record_upstream_queue_wait(time.perf_counter() - wait_start)
@@ -10813,7 +10826,7 @@ def settings_page(message="", is_error=False, values=None):
         <div class="settings-subhead">Upstream &amp; Pool Limits</div>
         <div class="settings-field-grid">
           <div><label class="form-label">Max Upstream Workers</label><input class="form-control" name="max_upstream_workers" type="number" min="1" max="1024" value="{html_escape(value('max_upstream_workers', '16'))}"><div class="settings-help">Fixed upstream concurrency limit. More workers = more external DNS traffic.</div></div>
-          <div><label class="form-label">DoT Pool Size</label><input class="form-control" name="dot_pool_size" type="number" min="1" max="64" value="{html_escape(value('dot_pool_size', '4'))}"></div>
+          <div><label class="form-label">DoT Pool Size</label><input class="form-control" name="dot_pool_size" type="number" min="1" max="64" value="{html_escape(value('dot_pool_size', '8'))}"></div>
           <div><label class="form-label">DoH Pool Size</label><input class="form-control" name="doh_pool_size" type="number" min="1" max="64" value="{html_escape(value('doh_pool_size', '4'))}"></div>
         </div>
 
@@ -10822,7 +10835,7 @@ def settings_page(message="", is_error=False, values=None):
           <div><label class="form-label">Max TCP Connections</label><input class="form-control" name="max_tcp_connections" type="number" min="1" max="8192" value="{html_escape(value('max_tcp_connections', '128'))}"><div class="settings-help">Max concurrent TCP client connections. Separate from DNS worker slots.</div></div>
           <div><label class="form-label">Max DoT Connections</label><input class="form-control" name="max_dot_connections" type="number" min="1" max="8192" value="{html_escape(value('max_dot_connections', '128'))}"><div class="settings-help">Max concurrent DNS-over-TLS client connections.</div></div>
           <div><label class="form-label">TCP Idle Timeout (sec)</label><input class="form-control" name="tcp_idle_timeout" type="number" min="1" max="3600" value="{html_escape(value('tcp_idle_timeout', '30'))}"></div>
-          <div><label class="form-label">DoT Idle Timeout (sec)</label><input class="form-control" name="dot_idle_timeout" type="number" min="1" max="3600" value="{html_escape(value('dot_idle_timeout', '30'))}"></div>
+          <div><label class="form-label">DoT Idle Timeout (sec)</label><input class="form-control" name="dot_idle_timeout" type="number" min="1" max="3600" value="{html_escape(value('dot_idle_timeout', '60'))}"></div>
         </div>
 
         <div class="settings-subhead">Encrypted DNS Endpoints</div>
