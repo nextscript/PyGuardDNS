@@ -110,6 +110,10 @@ def test_sharded_cache_round_trip_and_stats_clear(monkeypatch):
         "prefetch_enabled": "0",
     }
     monkeypatch.setattr(app, "get_setting", lambda key, default="": settings.get(key, default))
+    # Cache enablement/TTLs are memoised globally; earlier tests may have
+    # memoised "cache disabled", so pin the values this test relies on.
+    monkeypatch.setattr(app, "_is_cache_enabled", lambda: True)
+    monkeypatch.setattr(app, "_get_cached_ttl_and_size", lambda: (300, 0, 0, 4194304))
 
     saved_dns = [dict(shard) for shard in app.dns_cache_shards]
     saved_neg = [dict(shard) for shard in app.negative_cache_shards]

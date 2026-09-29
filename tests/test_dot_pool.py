@@ -221,6 +221,9 @@ def test_query_dot_upstream_pooled_round_robins_connections():
 
     def fake_query(self, request, timeout=4.0):
         seen.append(id(self))
+        # Behave like a connected socket so the pool keeps the connection.
+        self.conn = object()
+        self.last_used = time.time()
         return b"\x00" * 12
 
     with patch.object(app.DotConnection, "query", fake_query):

@@ -481,10 +481,12 @@ def now_iso() -> str:
 
 
 class BlocklistManager:
-    def __init__(self, db, reload_callback=None):
+    def __init__(self, db, reload_callback=None, db_lock=None):
         self.db = db
         self.reload_callback = reload_callback
-        self._update_lock = threading.Lock()
+        # Guards every access to the shared SQLite connection. Must be
+        # re-entrant: add_from_text() calls delete() while holding it.
+        self._update_lock = db_lock if db_lock is not None else threading.RLock()
         self._status_lock = threading.Lock()
         self._update_status = {
             "running": False,
@@ -499,6 +501,10 @@ class BlocklistManager:
         }
 
     def init_schema(self):
+        with self._update_lock:
+            self._init_schema_locked()
+
+    def _init_schema_locked(self):
         self.db.executescript(SCHEMA_SQL)
         existing = [row["name"] for row in self.db.execute("PRAGMA table_info(blocklists)").fetchall()]
         migrations = {
@@ -853,29 +859,32 @@ class BlocklistManager:
         return True
 
     def get_all(self):
-        return [
-            dict(r) for r in self.db.execute(
+        with self._update_lock:
+            rows = self.db.execute(
                 "SELECT * FROM blocklists ORDER BY id ASC"
             ).fetchall()
-        ]
+        return [dict(r) for r in rows]
 
     def get_by_id(self, list_id: int) -> Optional[dict]:
         return self._get(list_id)
 
     def get_stats(self):
-        rows = self.db.execute(
-            "SELECT bl.id, bl.name, bl.list_type, bl.rule_count, bl.last_update, "
-            "bl.last_error, bl.enabled "
-            "FROM blocklists bl ORDER BY bl.id ASC"
-        ).fetchall()
+        with self._update_lock:
+            rows = self.db.execute(
+                "SELECT bl.id, bl.name, bl.list_type, bl.rule_count, bl.last_update, "
+                "bl.last_error, bl.enabled "
+                "FROM blocklists bl ORDER BY bl.id ASC"
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def _get(self, list_id: int) -> Optional[dict]:
-        row = self.db.execute("SELECT * FROM blocklists WHERE id=?", (list_id,)).fetchone()
+        with self._update_lock:
+            row = self.db.execute("SELECT * FROM blocklists WHERE id=?", (list_id,)).fetchone()
         return dict(row) if row else None
 
     def _delete_by_name(self, name: str):
-        existing = self.db.execute("SELECT id FROM blocklists WHERE name=?", (name,)).fetchone()
+        with self._update_lock:
+            existing = self.db.execute("SELECT id FROM blocklists WHERE name=?", (name,)).fetchone()
         if existing:
             self.delete(existing["id"], notify_reload=False)
 
@@ -908,9 +917,10 @@ class BlocklistManager:
         return entries
 
     def load_into_engine(self, engine):
-        rows = self.db.execute(
-            "SELECT id, name, url FROM blocklists WHERE enabled = 1 ORDER BY id ASC"
-        ).fetchall()
+        with self._update_lock:
+            rows = self.db.execute(
+                "SELECT id, name, url FROM blocklists WHERE enabled = 1 ORDER BY id ASC"
+            ).fetchall()
         for bl in rows:
             list_id = str(bl["id"])
             cache = load_blocklist_cache(list_id)

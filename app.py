@@ -1671,7 +1671,7 @@ def init_db():
         run_migrations()
         global blocklist_manager
         if blocklist_manager is None:
-            blocklist_manager = BlocklistManager(db, reload_callback=reload_filter_engine)
+            blocklist_manager = BlocklistManager(db, reload_callback=reload_filter_engine, db_lock=db_lock)
             blocklist_manager.init_schema()
             _set_blocklist_dns_resolver(resolve_via_configured_dns)
             reload_filter_engine()
@@ -2200,7 +2200,7 @@ def load_runtime_network_settings():
     try:
         up_w = max(1, int(get_setting("max_upstream_workers", "16") or "16"))
     except (ValueError, TypeError):
-        up_w = 64
+        up_w = 16
     upstream_concurrency = threading.BoundedSemaphore(up_w)
     try:
         tcp_conn = max(1, int(get_setting("max_tcp_connections", "128") or "128"))
@@ -2318,12 +2318,28 @@ def _healthcheck_worker_pass():
         _healthcheck_last_run = time.time()
 
 
+def _recovery_probe(upstream):
+    """Recovery probe through the real resolver path (all transports)."""
+    if not upstream_supported(upstream):
+        return False
+    _, query = build_query(um._HEALTH_PROBE_DOMAIN, 1)
+    response, _ = _query_one_upstream(upstream, query, update_metrics=False, timeout_override=um._HEALTH_PROBE_TIMEOUT)
+    # Any well-formed answer (NOERROR/NXDOMAIN) proves the resolver is reachable.
+    return bool(response) and len(response) >= 12 and (response[3] & 0x0F) in (0, 3)
+
+
+um.set_probe_function(_recovery_probe)
+
+
 def rows(query, params=()):
-    return [dict(r) for r in db.execute(query, params).fetchall()]
+    with db_lock:
+        result = db.execute(query, params).fetchall()
+    return [dict(r) for r in result]
 
 
 def one(query, params=()):
-    row = db.execute(query, params).fetchone()
+    with db_lock:
+        row = db.execute(query, params).fetchone()
     return dict(row) if row else None
 
 
@@ -3352,13 +3368,18 @@ class DotConnection:
         self.max_requests = 200
         self.closed = False
 
-    def close(self):
+    def _reset_socket(self):
+        # Drop the current socket but keep the object usable; close() is for
+        # discarding the whole connection from its pool.
         try:
             if self.conn is not None:
                 self.conn.close()
         except Exception:
             pass
         self.conn = None
+
+    def close(self):
+        self._reset_socket()
         self.closed = True
 
     def is_reusable(self) -> bool:
@@ -3432,13 +3453,13 @@ class DotConnection:
                 # Reconnect while still holding the lock: swapping self.conn
                 # outside of it lets another thread send on the new socket at
                 # the same time, so responses can be read by the wrong query.
-                self.close()
+                self._reset_socket()
                 self.connect(timeout=timeout)
                 return self._send_and_receive(request, timeout)
 
     def _ensure_connected(self, timeout):
         if self.conn is None or time.time() - self.last_used > self.idle_timeout:
-            self.close()
+            self._reset_socket()
             self.connect(timeout=timeout)
         else:
             self.reuse_count += 1
@@ -3495,10 +3516,14 @@ def query_dot_upstream_pooled(upstream, request, timeout=4.0):
     
     # Lease pattern: acquire, query, then only release if healthy
     healthy = False
+    handshakes_before = conn.handshake_count
     try:
         result = conn.query(request, timeout=timeout)
         healthy = True
-        um.record_pool_metric("dot", "reused_total")
+        if conn.handshake_count == handshakes_before:
+            um.record_pool_metric("dot", "reused_total")
+        else:
+            um.record_pool_metric("dot", "created_total")
         return result
     except Exception:
         # Connection is unhealthy - discard it
@@ -3516,7 +3541,6 @@ def query_dot_upstream_pooled(upstream, request, timeout=4.0):
     finally:
         if healthy and conn.is_reusable():
             conn.last_used = time.time()
-            conn.reuse_count += 1
         elif healthy:
             # Connection is healthy but should not be reused (exceeded limits)
             um.discard_connection(conn, "dot")
@@ -3565,13 +3589,18 @@ class DohConnection:
         self.max_requests = 200
         self.closed = False
 
-    def close(self):
+    def _reset_socket(self):
+        # Drop the current socket but keep the object usable; close() is for
+        # discarding the whole connection from its pool.
         try:
             if self.conn is not None:
                 self.conn.close()
         except Exception:
             pass
         self.conn = None
+
+    def close(self):
+        self._reset_socket()
         self.closed = True
 
     def is_reusable(self) -> bool:
@@ -3635,13 +3664,13 @@ class DohConnection:
             except Exception:
                 self.error_count += 1
                 self.reconnect_count += 1
-                self.close()
+                self._reset_socket()
                 self.connect(timeout=timeout)
                 return self._send_and_receive(request, timeout)
 
     def _ensure_connected(self, timeout):
         if self.conn is None or time.time() - self.last_used > self.idle_timeout:
-            self.close()
+            self._reset_socket()
             self.connect(timeout=timeout)
         else:
             self.reuse_count += 1
@@ -3695,10 +3724,14 @@ def query_doh_upstream_pooled(upstream, request, timeout=4.0):
     
     # Lease pattern: acquire, query, then only release if healthy
     healthy = False
+    handshakes_before = conn.handshake_count
     try:
         result = conn.query(request, timeout=timeout)
         healthy = True
-        um.record_pool_metric("doh", "reused_total")
+        if conn.handshake_count == handshakes_before:
+            um.record_pool_metric("doh", "reused_total")
+        else:
+            um.record_pool_metric("doh", "created_total")
         return result
     except Exception:
         # Connection is unhealthy - discard it
@@ -3716,7 +3749,6 @@ def query_doh_upstream_pooled(upstream, request, timeout=4.0):
     finally:
         if healthy and conn.is_reusable():
             conn.last_used = time.time()
-            conn.reuse_count += 1
         elif healthy:
             # Connection is healthy but should not be reused (exceeded limits)
             um.discard_connection(conn, "doh")
@@ -5249,18 +5281,11 @@ def _query_with_fallback(request, domain=""):
             return result[0]
         return result
     except OSError:
-        # All upstreams failed, try fallback
-        import um as upstream_manager
-        fallback_result = upstream_manager.query_fallback_upstream(request)
+        # All upstreams failed, try fallback. The caller caches the answer
+        # under the correct query type.
+        fallback_result = um.query_fallback_upstream(request)
         if fallback_result:
             response, resolver_name = fallback_result
-            # Cache the fallback response
-            if domain:
-                try:
-                    qtype = "A"  # Default, would need to parse from request
-                    set_cached(domain, qtype, response)
-                except Exception:
-                    pass
             return response
         return None
 
@@ -5633,7 +5658,7 @@ def _forward_query(request, timeout_override=None):
 
 
 def _forward_query_race(request, timeout_override=None):
-    from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
+    from concurrent.futures import ThreadPoolExecutor, CancelledError
     upstreams = [u for u in active_upstreams() if upstream_supported(u)]
     if not upstreams:
         return _query_fallback_plain(request)
@@ -5651,7 +5676,7 @@ def _forward_query_race(request, timeout_override=None):
                 if first[0] is None:
                     first[0] = (result, upstream)
                     done.set()
-        except OSError as exc:
+        except Exception as exc:
             maybe_update_upstream_status(upstream, latency=None, error=str(exc))
             with lock:
                 errors.append(str(exc))
@@ -5661,38 +5686,20 @@ def _forward_query_race(request, timeout_override=None):
             # Task was cancelled - clean up any leaked resources
             pass
 
-    with ThreadPoolExecutor(max_workers=len(upstreams)) as ex:
-        futures = [ex.submit(try_one, u) for u in upstreams]
-        try:
-            for f in as_completed(futures, timeout=3.5):
-                if first[0] is not None:
-                    # Cancel all remaining futures
-                    for ff in futures:
-                        if not ff.done():
-                            ff.cancel()
-                    # Await cancellation completion to ensure cleanup
-                    for ff in futures:
-                        try:
-                            ff.result(timeout=1.0)
-                        except (CancelledError, TimeoutError, Exception):
-                            pass
-                    break
-        except TimeoutError:
-            pass
+    # No "with" block: leaving it would wait for every upstream, so the first
+    # answer would only be returned once the slowest one finished or timed out.
+    ex = ThreadPoolExecutor(max_workers=len(upstreams))
+    try:
+        for u in upstreams:
+            ex.submit(try_one, u)
+        done.wait(timeout=3.5)
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
 
-    # Final cleanup: ensure all futures are done
-    for ff in futures:
-        if not ff.done():
-            ff.cancel()
-    for ff in futures:
-        try:
-            ff.result(timeout=0.5)
-        except (CancelledError, TimeoutError, Exception):
-            pass
-
-    if first[0] is not None:
-        return first[0][0]
-    raise OSError(errors[-1] if errors else "all upstreams timed out")
+    with lock:
+        if first[0] is not None:
+            return first[0][0]
+        raise OSError(errors[-1] if errors else "all upstreams timed out")
 
 
 def _forward_query_fastest(request, timeout_override=None):
@@ -5728,7 +5735,7 @@ def _forward_query_strict(request, timeout_override=None):
 
 
 def _forward_query_parallel(request, timeout_override=None):
-    from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
+    from concurrent.futures import ThreadPoolExecutor, CancelledError
     upstreams = [u for u in active_upstreams() if upstream_supported(u)]
     if not upstreams:
         return _query_fallback_plain(request)
@@ -5761,7 +5768,7 @@ def _forward_query_parallel(request, timeout_override=None):
                 if first[0] is None:
                     first[0] = result
                     done.set()
-        except OSError as exc:
+        except Exception as exc:
             maybe_update_upstream_status(upstream, latency=None, error=str(exc))
             with lock:
                 errors.append(str(exc))
@@ -5771,38 +5778,20 @@ def _forward_query_parallel(request, timeout_override=None):
             # Task was cancelled - clean up any leaked resources
             pass
 
-    with ThreadPoolExecutor(max_workers=race_count) as ex:
-        futures = [ex.submit(try_one, u) for u in candidates]
-        try:
-            for f in as_completed(futures, timeout=3.5):
-                if first[0] is not None:
-                    # Cancel all remaining futures
-                    for ff in futures:
-                        if not ff.done():
-                            ff.cancel()
-                    # Await cancellation completion to ensure cleanup
-                    for ff in futures:
-                        try:
-                            ff.result(timeout=1.0)
-                        except (CancelledError, TimeoutError, Exception):
-                            pass
-                    break
-        except TimeoutError:
-            pass
+    # No "with" block: leaving it would wait for every upstream, so the first
+    # answer would only be returned once the slowest one finished or timed out.
+    ex = ThreadPoolExecutor(max_workers=race_count)
+    try:
+        for u in candidates:
+            ex.submit(try_one, u)
+        done.wait(timeout=3.5)
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
 
-    # Final cleanup: ensure all futures are done
-    for ff in futures:
-        if not ff.done():
-            ff.cancel()
-    for ff in futures:
-        try:
-            ff.result(timeout=0.5)
-        except (CancelledError, TimeoutError, Exception):
-            pass
-
-    if first[0] is not None:
-        return first[0]
-    raise OSError(errors[-1] if errors else "all upstreams timed out")
+    with lock:
+        if first[0] is not None:
+            return first[0]
+        raise OSError(errors[-1] if errors else "all upstreams timed out")
 
 
 def _forward_query_loadbalance(request, timeout_override=None):
@@ -5827,9 +5816,12 @@ def _forward_query_loadbalance(request, timeout_override=None):
 def maybe_update_upstream_status(upstream, latency=None, error=""):
     upstream_id = upstream["id"]
     now = time.time()
-    if now - upstream_metric_last_write.get(upstream_id, 0) < 5:
+    # Throttle successes and failures separately: with one shared window a
+    # recorded success swallowed the failures that followed it.
+    throttle_key = (upstream_id, bool(error))
+    if now - upstream_metric_last_write.get(throttle_key, 0) < 5:
         return
-    upstream_metric_last_write[upstream_id] = now
+    upstream_metric_last_write[throttle_key] = now
     try:
         um.maybe_update_latency(upstream_id, latency, error)
         if error:
@@ -6675,7 +6667,7 @@ def template(content, title="Dashboard"):
   {nav_item("/domain-test", "Domain Test", icon_search(), title)}
   <div class="sys-status">
     <div class="sys-row"><span class="dot-status"></span>All Systems Operational</div>
-    <div class="sys-row" style="color:var(--muted);font-size:.69rem">{APP_NAME} v1.0</div>
+    <div class="sys-row" style="color:var(--muted);font-size:.69rem">{APP_NAME} v1.5</div>
   </div>
 </aside>
 <main>{content}</main>
@@ -9842,7 +9834,7 @@ def _system_monitor_api_summary():
             "dot_port": DNS_TLS_PORT if get_setting("dns_over_tls_enabled", "0") == "1" else None,
             "doh_port": DNS_HTTPS_PORT if get_setting("dns_over_https_enabled", "0") == "1" else None,
             "doq_port": DNS_QUIC_PORT if get_setting("dns_over_quic_enabled", "0") == "1" else None,
-            "app_version": "1.0",
+            "app_version": "1.5",
         },
         "dns_workers": {
             "base_limit": snap.base_limit,
@@ -14249,13 +14241,21 @@ class WebHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": "invalid upstream ID"}, 400)
         elif path == "/api/recovery/probe-all":
             # Trigger probe of all recoverable upstreams
+            # Probes can take seconds each, so run them in the background.
+            # Each probe is always completed via finish_probe(); before, only
+            # begin_probe() ran and left upstreams stuck in half_open.
             recoverable = um.recoverable_upstreams()
-            probed = 0
-            for u in recoverable:
-                if um.begin_probe(u["id"]):
-                    probed += 1
-            log_admin_action(self.session_user(), "recovery_probe_all", f"Probed {probed} recoverable upstreams", self.client_address[0])
-            self.send_json({"ok": True, "probed": probed, "total_recoverable": len(recoverable)})
+
+            def _probe_all(upstreams=recoverable):
+                for u in upstreams:
+                    try:
+                        um.run_recovery_probe(u)
+                    except Exception:
+                        pass
+
+            threading.Thread(target=_probe_all, name="recovery-probe-all", daemon=True).start()
+            log_admin_action(self.session_user(), "recovery_probe_all", f"Probing {len(recoverable)} recoverable upstreams", self.client_address[0])
+            self.send_json({"ok": True, "probed": len(recoverable), "total_recoverable": len(recoverable)})
         elif path == "/api/recovery/rebuild-pool":
             protocol = form.get("protocol", form.get("type", ""))
             if not protocol:
@@ -15444,6 +15444,11 @@ def main():
         log.flush()
         threading.Thread(target=_healthcheck_worker, name="healthcheck", daemon=True).start()
         log.write(f"{now_iso()} healthcheck worker ready\n")
+        log.flush()
+        # Probes half_open upstreams every few seconds so they rejoin traffic
+        # without waiting for the 60s healthcheck.
+        um.start_health_recovery_worker()
+        log.write(f"{now_iso()} health recovery worker ready\n")
         log.flush()
         threading.Thread(target=_worker_limiter_maintenance_loop, name="worker-limiter-maintenance", daemon=True).start()
         log.write(f"{now_iso()} worker limiter maintenance ready\n")

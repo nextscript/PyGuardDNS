@@ -13,6 +13,9 @@ UPSTREAMS_DIR = os.path.join("data", "upstreams")
 _HEALTH_PROBE_INTERVAL = 10.0  # seconds
 _HEALTH_PROBE_TIMEOUT = 5.0    # seconds
 _HEALTH_PROBE_DOMAIN = "example.com"
+_HEALTH_PROBE_QNAME = b"".join(
+    bytes([len(label)]) + label.encode("ascii") for label in _HEALTH_PROBE_DOMAIN.split(".")
+) + b"\x00"
 
 # Worker state
 _health_recovery_thread: Optional[threading.Thread] = None
@@ -179,6 +182,12 @@ def should_allow_request(upstream_id: int, *, is_probe: bool = False) -> bool:
     return False
 
 
+def _probe_is_stale(h: dict) -> bool:
+    """A probe marked in flight for too long was never finished (e.g. restart)."""
+    started = float(h.get("probe_started_at", 0) or 0)
+    return time.time() - started > _HEALTH_PROBE_TIMEOUT * 4
+
+
 def begin_probe(upstream_id: int) -> bool:
     """Attempt to begin a recovery probe for a half_open upstream.
 
@@ -193,7 +202,7 @@ def begin_probe(upstream_id: int) -> bool:
     if h.get("circuit_state") != _CIRCUIT_HALF_OPEN:
         return False
 
-    if h.get("probe_in_flight"):
+    if h.get("probe_in_flight") and not _probe_is_stale(h):
         return False
 
     # Use per-upstream lock to prevent race conditions
@@ -210,7 +219,7 @@ def begin_probe(upstream_id: int) -> bool:
     if h.get("circuit_state") != _CIRCUIT_HALF_OPEN:
         lock.release()
         return False
-    if h.get("probe_in_flight"):
+    if h.get("probe_in_flight") and not _probe_is_stale(h):
         lock.release()
         return False
 
@@ -256,10 +265,9 @@ def finish_probe(upstream_id: int, *, success: bool, latency_ms: float = 0.0, er
         h["last_success"] = time.time()
         h["last_error"] = ""
 
-        # EWMA update
+        # Circuit closed again: start fresh instead of staying "degraded"
+        h["ewma_success"] = 1.0
         alpha = 0.2
-        old_ewma_success = h.get("ewma_success", 1.0)
-        h["ewma_success"] = alpha * 1.0 + (1 - alpha) * old_ewma_success
         old_ewma_latency = h.get("ewma_latency_ms", 0.0)
         h["ewma_latency_ms"] = alpha * latency_ms + (1 - alpha) * old_ewma_latency
     else:
@@ -337,7 +345,7 @@ _WATCHDOG_POOL_REBUILD_COOLDOWN = 300.0  # 5 minutes
 _FALLBACK_RESOLVERS = [
     {"name": "Cloudflare DoH", "address": "1.1.1.1", "port": 443, "resolver": "https://cloudflare-dns.com/dns-query", "transport": "doth", "enabled": True},
     {"name": "Quad9 DoH", "address": "9.9.9.9", "port": 443, "resolver": "https://dns.quad9.net/dns-query", "transport": "doth", "enabled": True},
-    {"name": "Google DoH", "address": "8.8.8.8", "port": 443, "resolver": "https://dns.google/resolve", "transport": "doth", "enabled": True},
+    {"name": "Google DoH", "address": "8.8.8.8", "port": 443, "resolver": "https://dns.google/dns-query", "transport": "doth", "enabled": True},
 ]
 
 # Fallback metrics
@@ -479,55 +487,58 @@ def _pool_maintenance_worker() -> None:
         _pool_maintenance_stop.wait(_POOL_MAINTENANCE_INTERVAL)
 
 
+def _app_module():
+    """Return the loaded app module that owns the connection pools.
+
+    "import app" would load app.py a second time when it runs as __main__
+    (python app.py), so look the module up in sys.modules instead.
+    """
+    import sys
+    for name in ("__main__", "app"):
+        mod = sys.modules.get(name)
+        if mod is not None and hasattr(mod, "dot_pools"):
+            return mod
+    return None
+
+
 def _perform_pool_maintenance() -> None:
     """Perform pool maintenance: remove expired/invalid connections."""
-    import app as app_module
+    app_module = _app_module()
+    if app_module is None:
+        return
 
-    now = time.time()
     discarded = {"dot": 0, "doh": 0}
-
-    # Maintain DoT pools
-    if hasattr(app_module, 'dot_pools') and hasattr(app_module, 'dot_pools_lock'):
-        with app_module.dot_pools_lock:
-            for key, pool in list(app_module.dot_pools.items()):
-                for conn in pool:
+    for proto, conn_cls in (("dot", "DotConnection"), ("doh", "DohConnection")):
+        pools = getattr(app_module, f"{proto}_pools", None)
+        pools_lock = getattr(app_module, f"{proto}_pools_lock", None)
+        if pools is None or pools_lock is None:
+            continue
+        with pools_lock:
+            for key, pool in list(pools.items()):
+                for idx, conn in enumerate(pool):
+                    # Skip connections that are busy with a query instead of
+                    # blocking every pool lookup while holding pools_lock.
+                    if not conn.lock.acquire(blocking=False):
+                        continue
                     try:
-                        with conn.lock:
-                            if not conn.is_reusable():
-                                # Connection is expired/invalid - discard
-                                conn.close()
-                                discarded["dot"] += 1
-                                um.record_pool_metric("dot", "expired_total")
-                                # Replace with fresh connection
-                                fresh = app_module.DotConnection(conn.upstream)
-                                idx = pool.index(conn)
-                                pool[idx] = fresh
-                                um.record_pool_metric("dot", "created_total")
+                        # Never-used connections have no socket yet; leave them.
+                        if conn.conn is None and not conn.closed:
+                            continue
+                        if conn.is_reusable():
+                            continue
+                        conn.close()
+                        discarded[proto] += 1
+                        record_pool_metric(proto, "expired_total")
+                        pool[idx] = getattr(app_module, conn_cls)(conn.upstream)
+                        record_pool_metric(proto, "created_total")
                     except Exception:
                         pass
+                    finally:
+                        conn.lock.release()
 
-    # Maintain DoH pools
-    if hasattr(app_module, 'doh_pools') and hasattr(app_module, 'doh_pools_lock'):
-        with app_module.doh_pools_lock:
-            for key, pool in list(app_module.doh_pools.items()):
-                for conn in pool:
-                    try:
-                        with conn.lock:
-                            if not conn.is_reusable():
-                                conn.close()
-                                discarded["doh"] += 1
-                                um.record_pool_metric("doh", "expired_total")
-                                fresh = app_module.DohConnection(conn.upstream)
-                                idx = pool.index(conn)
-                                pool[idx] = fresh
-                                um.record_pool_metric("doh", "created_total")
-                    except Exception:
-                        pass
-
-    # Record discarded metrics
     for proto, count in discarded.items():
         if count > 0:
-            um.record_pool_metric(proto, "discarded_total", count)
+            record_pool_metric(proto, "discarded_total", count)
 
 
 def start_pool_maintenance_worker() -> None:
@@ -729,7 +740,9 @@ def query_fallback_upstream(request: bytes, timeout: float = 5.0) -> Optional[tu
     Returns:
         Tuple of (response_bytes, resolver_name) on success, None on failure.
     """
-    import app as app_module
+    app_module = _app_module()
+    if app_module is None:
+        return None
 
     limiter = _get_fallback_limiter()
     if not limiter.acquire(timeout=2.0):
@@ -765,79 +778,47 @@ def query_fallback_upstream(request: bytes, timeout: float = 5.0) -> Optional[tu
 def rebuild_pool(protocol: str, reason: str = "manual") -> None:
     """Rebuild a connection pool for a given protocol.
 
-    Atomically swaps in a new pool, marks old pool as draining,
-    allows active operations a grace period, then closes remaining.
+    Detaches the current pools so new queries lazily create fresh ones,
+    gives in-flight queries a grace period, then closes the old connections.
     Rate-limited to prevent loops.
     """
-    import app as app_module
-    import time as _time
+    app_module = _app_module()
+    if app_module is None:
+        return
 
-    now = _time.time()
-    key = f"{protocol}_pool_rebuilds"
+    now = time.time()
+    rebuild_key = f"{protocol}_pool_rebuilds"
 
-    # Rate-limit: cooldown between rebuilds
     with _pool_rebuilds_lock:
-        last_rebuild = _pool_rebuilds.get(key, {}).get("timestamp", 0)
+        last_rebuild = _pool_rebuilds.get(rebuild_key, {}).get("timestamp", 0)
         if now - last_rebuild < _WATCHDOG_POOL_REBUILD_COOLDOWN:
             return  # Too soon, skip
 
-    # Perform rebuild
-    pool_attr = f"{protocol}_pools"
-    counter_attr = f"{protocol}_pool_counters"
-    lock_attr = f"{protocol}_pools_lock"
-
-    if not hasattr(app_module, pool_attr):
+    pools = getattr(app_module, f"{protocol}_pools", None)
+    pool_lock = getattr(app_module, f"{protocol}_pools_lock", None)
+    if pools is None or pool_lock is None:
         return  # Pool not configured
+    counters = getattr(app_module, f"{protocol}_pool_counters", {})
 
-    pool_lock = getattr(app_module, lock_attr)
     with pool_lock:
-        pools = getattr(app_module, pool_attr)
-        counters = getattr(app_module, counter_attr, {})
+        old_connections = [conn for pool in pools.values() for conn in pool]
+        pools.clear()
+        counters.clear()
 
-        for key, pool in list(pools.items()):
-            # Mark pool as draining
-            for conn in pool:
-                try:
-                    conn.closed = True
-                except Exception:
-                    pass
+    grace_end = time.monotonic() + 5.0
+    for conn in old_connections:
+        remaining = max(0.0, grace_end - time.monotonic())
+        acquired = conn.lock.acquire(timeout=remaining) if hasattr(conn, "lock") else False
+        try:
+            conn.close()
+        except Exception:
+            pass
+        finally:
+            if acquired:
+                conn.lock.release()
 
-            # Close remaining connections after grace
-            import time as _t
-            grace_end = _t.monotonic() + 5.0  # 5 second grace
-            while _t.monotonic() < grace_end:
-                # Wait for active operations to complete
-                import threading
-                all_done = True
-                for conn in pool:
-                    if hasattr(conn, 'lock'):
-                        if not conn.lock.acquire(blocking=False):
-                            all_done = False
-                            break
-                        conn.lock.release()
-                if all_done:
-                    break
-                _t.sleep(0.1)
-
-            # Close all connections
-            for conn in pool:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-
-            # Replace with fresh pool
-            fresh_pool = []
-            for upstream_data in getattr(app_module, '_get_upstreams_for_protocol', lambda p: []) (protocol):
-                if protocol == "dot":
-                    fresh_pool.append(app_module.DotConnection(upstream_data))
-                elif protocol == "doh":
-                    fresh_pool.append(app_module.DohConnection(upstream_data))
-            pools[key] = fresh_pool
-
-    # Record rebuild
     with _pool_rebuilds_lock:
-        _pool_rebuilds[key] = {
+        _pool_rebuilds[rebuild_key] = {
             "timestamp": now,
             "reason": reason,
             "protocol": protocol,
@@ -1033,6 +1014,10 @@ def update_health(upstream_id: int, success: bool, latency_ms: float = 0.0, erro
 
         # Only reset if not manually paused
         if not is_manual_pause:
+            if was_paused or h.get("circuit_state") in (_CIRCUIT_OPEN, _CIRCUIT_HALF_OPEN):
+                # Recovered from an automatic pause: the old failure streak
+                # must not keep the resolver in "degraded"/"down".
+                h["ewma_success"] = 1.0
             h["paused"] = False
             h["pause_reason"] = ""
             h["backoff_level"] = 0
@@ -1326,6 +1311,38 @@ def maybe_update_latency(upstream_id: int, latency_ms: float, error: str = ""):
 # Health Recovery Worker
 # ==============================================================================
 
+def run_recovery_probe(upstream: dict) -> Optional[bool]:
+    """Run one recovery probe for a recoverable upstream.
+
+    Moves an expired health backoff to half_open first, then executes the
+    probe and always completes it with finish_probe(). Returns the probe
+    result, or None if no probe was started (not recoverable / already running).
+    """
+    uid = upstream["id"]
+    data = get(uid)
+    if not data:
+        return None
+    data, changed = refresh_backoff_state(data)
+    if changed:
+        _save_file(data)
+        _update_cache(data)
+        upstream = {**upstream, **data}
+    if not begin_probe(uid):
+        return None
+    try:
+        probe_success = _execute_health_probe(upstream)
+    except Exception:
+        finish_probe(uid, success=False, latency_ms=0.0, error="Health probe exception")
+        return False
+    finish_probe(
+        uid,
+        success=probe_success,
+        latency_ms=0.0,
+        error="" if probe_success else "Health probe failed",
+    )
+    return probe_success
+
+
 def _health_recovery_worker() -> None:
     """Background worker that periodically checks and recovers unavailable upstreams.
 
@@ -1333,45 +1350,28 @@ def _health_recovery_worker() -> None:
     seconds, executes exactly one bounded health probe per upstream, and updates circuit
     state based on probe results.
     """
-    import socket
-
     while not _health_recovery_stop.is_set():
         try:
-            # Get recoverable upstreams
-            recoverable = recoverable_upstreams()
-
-            for upstream in recoverable:
+            for upstream in recoverable_upstreams():
                 if _health_recovery_stop.is_set():
                     break
-
-                uid = upstream["id"]
-                h = upstream.get("health", {})
-                circuit = h.get("circuit_state", "closed")
-
-                # Try to begin a probe
-                if not begin_probe(uid):
-                    continue
-
-                try:
-                    # Execute a bounded health probe
-                    probe_success = _execute_health_probe(upstream)
-
-                    # Finish probe with result
-                    finish_probe(
-                        uid,
-                        success=probe_success,
-                        latency_ms=0.0,
-                        error="" if probe_success else "Health probe failed",
-                    )
-                except Exception:
-                    # Probe failed due to exception
-                    finish_probe(uid, success=False, latency_ms=0.0, error="Health probe exception")
-
+                run_recovery_probe(upstream)
         except Exception:
             pass  # Ignore worker-level errors
 
         # Wait for next interval or stop signal
         _health_recovery_stop.wait(_HEALTH_PROBE_INTERVAL)
+
+
+# Optional probe callback registered by the app. It queries an upstream through
+# the real resolver code path, so every transport (DoT, DoH, DoQ, ...) is covered.
+_probe_function = None
+
+
+def set_probe_function(fn) -> None:
+    """Register fn(upstream: dict) -> bool used for recovery probes."""
+    global _probe_function
+    _probe_function = fn
 
 
 def _execute_health_probe(upstream: dict) -> bool:
@@ -1380,104 +1380,62 @@ def _execute_health_probe(upstream: dict) -> bool:
     Uses a fixed domain (example.com) with strict timeout, no DNS cache,
     no filtering, no recursive use of PyGuardDNS itself.
     """
+    if _probe_function is not None:
+        try:
+            return bool(_probe_function(upstream))
+        except Exception:
+            return False
+
     import socket
     import struct
 
     address = upstream.get("address", "")
-    port = upstream.get("port", 53)
+    port = int(upstream.get("port", 53) or 0)
     transport = upstream.get("transport", "udp")
 
     if not address or port == 0:
+        return False
+    if transport not in ("udp", "plain_udp", "tcp"):
+        # Encrypted transports need the app's resolver code (set_probe_function).
         return False
 
     # Build a simple DNS query for example.com A record
     txn_id = os.urandom(2)
     query_header = txn_id + struct.pack("!HHHHHH", 0x0100, 1, 1, 0, 0, 0)
-    # Query name: example.com
-    qname = b"\x0bexample\x03com\x00"
-    query_body = qname + struct.pack("!HH", 1, 1)  # A record, IN class
-    query = query_header + query_body
+    qname = _HEALTH_PROBE_QNAME
+    query = query_header + qname + struct.pack("!HH", 1, 1)  # A record, IN class
+    family = socket.AF_INET6 if ":" in address else socket.AF_INET
 
     try:
-        if transport in ("udp", "plain_udp", "tcp"):
-            if transport == "tcp":
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if transport == "tcp":
+            with socket.socket(family, socket.SOCK_STREAM) as sock:
                 sock.settimeout(_HEALTH_PROBE_TIMEOUT)
                 sock.connect((address, port))
-                # TCP length prefix
-                length = len(query).to_bytes(2, "big")
-                sock.sendall(length + query)
-                # Read response
+                sock.sendall(len(query).to_bytes(2, "big") + query)
                 len_bytes = sock.recv(2)
                 if len(len_bytes) != 2:
-                    sock.close()
                     return False
                 response_len = int.from_bytes(len_bytes, "big")
                 response = b""
                 while len(response) < response_len:
                     chunk = sock.recv(response_len - len(response))
                     if not chunk:
-                        sock.close()
                         return False
                     response += chunk
-                sock.close()
-            else:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        else:
+            with socket.socket(family, socket.SOCK_DGRAM) as sock:
                 sock.settimeout(_HEALTH_PROBE_TIMEOUT)
                 sock.sendto(query, (address, port))
                 response, _ = sock.recvfrom(4096)
-                sock.close()
-
-            # Validate response header
-            if len(response) < 12:
-                return False
-            resp_txn_id = response[:2]
-            resp_flags = struct.unpack("!H", response[2:4])[0]
-            qr = (resp_flags >> 15) & 1  # QR bit
-            if qr != 1:
-                return False  # Not a response
-            rcode = resp_flags & 0x0F
-            if rcode != 0:
-                return False  # Non-zero RCODE
-            return True
-        elif transport == "doth":
-            # DoT health probe (simplified)
-            try:
-                import ssl
-                sock = socket.create_connection((address, port or 853), timeout=_HEALTH_PROBE_TIMEOUT)
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                ssock = ctx.wrap_socket(sock, server_hostname=address)
-                # DoT: length-prefixed DNS message
-                length = len(query).to_bytes(2, "big")
-                ssock.sendall(length + query)
-                len_bytes = ssock.recv(2)
-                if len(len_bytes) != 2:
-                    ssock.close()
-                    return False
-                response_len = int.from_bytes(len_bytes, "big")
-                response = b""
-                while len(response) < response_len:
-                    chunk = ssock.recv(response_len - len(response))
-                    if not chunk:
-                        ssock.close()
-                        return False
-                    response += chunk
-                ssock.close()
-                if len(response) < 12:
-                    return False
-                resp_flags = struct.unpack("!H", response[2:4])[0]
-                qr = (resp_flags >> 15) & 1
-                rcode = resp_flags & 0x0F
-                return qr == 1 and rcode == 0
-            except Exception:
-                return False
-        else:
-            # Unsupported transport for health probe
-            return False
-    except (socket.timeout, socket.error, OSError, ssl.SSLError, Exception):
+    except Exception:
         return False
+
+    if len(response) < 12 or response[:2] != txn_id:
+        return False
+    resp_flags = struct.unpack("!H", response[2:4])[0]
+    qr = (resp_flags >> 15) & 1
+    rcode = resp_flags & 0x0F
+    return qr == 1 and rcode == 0
 
 
 def start_health_recovery_worker() -> None:
