@@ -227,6 +227,7 @@ dns_worker_limiter = DynamicDNSWorkerLimiter(
 )
 DNS_WORKER_ACQUIRE_TIMEOUT = max(0.0, float(os.environ.get("LOCALDNSGUARD_DNS_WORKER_ACQUIRE_TIMEOUT", "0.05")))
 upstream_concurrency = threading.BoundedSemaphore(int(os.environ.get("LOCALDNSGUARD_MAX_UPSTREAM_WORKERS", "16")))
+UPSTREAM_SLOT_WAIT_SECONDS = max(0.0, float(os.environ.get("LOCALDNSGUARD_UPSTREAM_SLOT_WAIT", "2.0")))
 tcp_connection_semaphore = threading.BoundedSemaphore(max(1, int(os.environ.get("LOCALDNSGUARD_MAX_TCP_CONNECTIONS", "128"))))
 dot_connection_semaphore = threading.BoundedSemaphore(max(1, int(os.environ.get("LOCALDNSGUARD_MAX_DOT_CONNECTIONS", "128"))))
 TCP_IDLE_TIMEOUT = max(1, int(os.environ.get("LOCALDNSGUARD_TCP_IDLE_TIMEOUT", "30")))
@@ -2750,7 +2751,12 @@ def rules_reload_worker(reason: str = "Rule changes"):
             try:
                 console_event("work", "Reloading filter engine", reason)
                 reload_filter_engine()
-                clear_dns_cache()
+                # Filtering runs before the cache lookup, so cached answers stay
+                # valid under the new rules. Only answers with CNAME chains need
+                # to go (their targets are checked once, before caching). A full
+                # flush would turn every client query into a simultaneous
+                # upstream miss and overload the upstream right after a save.
+                purge_cname_cache_entries()
                 console_event("ok", "Filter engine reloaded", reason)
             except Exception as exc:
                 console_event("error", "Rule reload failed", exc)
@@ -3412,27 +3418,22 @@ class DotConnection:
 
     def query(self, request: bytes, timeout=4.0) -> bytes:
         """Send a DNS query over this DoT connection, reconnecting on failure.
-        
-        The send/receive is protected by self.lock. Reconnection happens
-        outside the lock so other threads aren't blocked during the (slow)
-        TLS handshake.
+
+        Connect, reconnect and send/receive all run under self.lock so a
+        socket is never shared by two in-flight queries.
         """
-        try:
-            with self.lock:
+        with self.lock:
+            try:
                 self._ensure_connected(timeout)
                 return self._send_and_receive(request, timeout)
-        except Exception:
-            self.error_count += 1
-            self.reconnect_count += 1
-            # Reconnect outside the lock so other threads can still use
-            # this connection slot (they'll get a fresh connection via the pool).
-            self.close()
-            try:
-                self.connect(timeout=timeout)
             except Exception:
-                # Reconnect failed — leave conn=None, next query will try again
-                raise
-            with self.lock:
+                self.error_count += 1
+                self.reconnect_count += 1
+                # Reconnect while still holding the lock: swapping self.conn
+                # outside of it lets another thread send on the new socket at
+                # the same time, so responses can be read by the wrong query.
+                self.close()
+                self.connect(timeout=timeout)
                 return self._send_and_receive(request, timeout)
 
     def _ensure_connected(self, timeout):
@@ -5371,6 +5372,26 @@ def clear_dns_cache():
     return {"ok": True, "entries": 0, "bytes_used": 0}
 
 
+def purge_cname_cache_entries():
+    """Drop cached positive answers that contain CNAME records.
+
+    CNAME targets are only checked against the filter engine before an answer
+    is cached, so those entries must be re-resolved after a rule change. All
+    other entries are still filtered by decide() before the cache lookup.
+    """
+    removed = 0
+    for shard in range(CACHE_SHARDS):
+        with cache_locks[shard]:
+            shard_cache = dns_cache_shards[shard]
+            stale_keys = [key for key, item in shard_cache.items() if extract_cname_targets(item.get("response", b""))]
+            for key in stale_keys:
+                evicted = shard_cache.pop(key, None)
+                if evicted:
+                    cache_bytes_used[shard] -= len(evicted.get("response", b""))
+                    removed += 1
+    return removed
+
+
 def is_local_reverse_lookup(normalized, qtype_name):
     return qtype_name == "PTR" and normalized in {
         "1.0.0.127.in-addr.arpa",
@@ -5533,14 +5554,20 @@ def upstream_queue_wait_metrics():
 
 def forward_query(request, timeout_override=None):
     wait_start = time.perf_counter()
-    if not upstream_concurrency.acquire(blocking=False):
+    # Wait briefly for a free slot instead of failing immediately: bursts of
+    # cache misses (e.g. right after a cache flush) would otherwise be answered
+    # with SERVFAIL "upstream busy" even though slots free up within milliseconds.
+    # Bind the semaphore locally so acquire/release always hit the same object
+    # even if load_runtime_network_settings() swaps the global meanwhile.
+    semaphore = upstream_concurrency
+    if not semaphore.acquire(timeout=UPSTREAM_SLOT_WAIT_SECONDS):
         record_upstream_queue_wait(time.perf_counter() - wait_start)
         raise OSError("upstream busy")
     record_upstream_queue_wait(time.perf_counter() - wait_start)
     try:
         return _forward_query(request, timeout_override=timeout_override)
     finally:
-        upstream_concurrency.release()
+        semaphore.release()
 
 
 def _query_one_upstream(upstream, request, update_metrics=True, timeout_override=None):
@@ -11632,7 +11659,7 @@ def create_rule_from_querylog(form) -> dict:
             current += "\n"
         current += pg_rule + "\n"
         write_rules(current)
-        invalidate_rules_cache()
+        enqueue_rules_reload("Rule added from query log")
         return {"ok": True, "scope": "global", "action": action, "pattern": domain, "rule": pg_rule}
     if scope == "profile":
         if client_manager is None:
